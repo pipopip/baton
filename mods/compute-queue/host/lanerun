@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Run a staged command with bounded disk usage prerequisites and stable caches.
+set -eu
+if (( $# < 3 )) || [[ $2 != -- ]]; then echo 'lanerun: expected WORK -- COMMAND' >&2; exit 2; fi
+work=$1; shift 2
+base=$(realpath -e -- "$HOME/.local/share/baton/staging") || exit 2
+work=$(realpath -e -- "$work") || exit 2
+case "$work/" in "$base/"*) ;; *) echo 'lanerun: work directory outside staging' >&2; exit 2;; esac
+if [[ ! -d $work ]]; then echo 'lanerun: work is not a directory' >&2; exit 2; fi
+free=$(df -Pk -- "$HOME" | awk 'END {print $4}')
+if [[ ! $free =~ ^[0-9]+$ ]]; then echo 'lanerun: cannot determine free space' >&2; exit 2; fi
+if (( free < 10485760 )); then echo 'lanerun: less than 10 GiB free' >&2; exit 75; fi
+export PATH="$HOME/toolchains/go1.27.2/bin:$HOME/.elan/bin:$HOME/.local/bin:$HOME/bin:$PATH"
+export GOTOOLCHAIN=local
+export GOCACHE="$HOME/tmp/cache/go-build" GOMODCACHE="$HOME/tmp/cache/go-mod"
+mkdir -p -- "$GOCACHE" "$GOMODCACHE"
+cd -- "$work"
+exec "$@"

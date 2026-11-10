@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Cooperatively hold K of the user's heavy-work slots for the command lifetime.
+set -eu
+slots=${HEAVY_SLOTS:-1}
+if [[ ! $slots =~ ^[0-9]+$ ]] || (( ${#slots} > 2 )); then echo 'heavy: invalid HEAVY_SLOTS' >&2; exit 2; fi
+slots=$((10#$slots))
+if (( slots < 1 || slots > 32 )); then echo 'heavy: HEAVY_SLOTS must be 1..32' >&2; exit 2; fi
+need=1
+if [[ ${1:-} == -n ]]; then
+  if (( $# < 2 )) || [[ ! $2 =~ ^[0-9]+$ ]] || (( ${#2} > 2 )); then echo 'heavy: invalid -n' >&2; exit 2; fi
+  need=$((10#$2)); shift 2
+fi
+if [[ ${1:-} == -- ]]; then shift; fi
+if (( need < 1 || need > slots || $# == 0 )); then echo 'heavy: invalid demand or missing command' >&2; exit 2; fi
+if [[ ! -d "$HOME/q" || -L "$HOME/q" ]]; then echo 'heavy: missing safe queue directory' >&2; exit 2; fi
+while :; do
+  if [[ -L "$HOME/q/.heavy.gate" ]]; then echo 'heavy: unsafe gate' >&2; exit 2; fi
+  exec {gate}>>"$HOME/q/.heavy.gate"
+  flock -x "$gate"
+  held=()
+  for ((i=0; i<slots && ${#held[@]}<need; i++)); do
+    if [[ -L "$HOME/q/.heavy.$i" ]]; then echo 'heavy: unsafe slot' >&2; exit 2; fi
+    exec {fd}>>"$HOME/q/.heavy.$i"
+    if flock -n -x "$fd"; then held+=("$fd"); else exec {fd}>&-; fi
+  done
+  if (( ${#held[@]} == need )); then
+    flock -u "$gate"; exec {gate}>&-
+    exec "$@"
+  fi
+  for fd in "${held[@]}"; do exec {fd}>&-; done
+  flock -u "$gate"; exec {gate}>&-
+  sleep 0.1
+done

@@ -1,0 +1,9 @@
+# One account per provider: no alternate account is configured for auto-switching.
+[claude.main]
+config_dir = "~/.claude"
+
+[codex.main]
+home = "~/.codex"
+
+[policy]
+keepalive = false

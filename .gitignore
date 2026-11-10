@@ -1,0 +1,12 @@
+.state/
+.baton/
+.claude/
+.codex/
+.env
+.env.*
+!.env.example
+runtime.local.json
+*.local.toml
+__pycache__/
+*.pyc
+cycle.log
