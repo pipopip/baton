@@ -56,7 +56,106 @@ def _read(path):
         return None
 
 
-def summarize(state, now=None):
+# The status line. Device words: UPPERCASE for a host that is down, stale or paused (somebody can act); lowercase for
+# a limit that is working as designed (a RAM floor, the legacy queue holding the host). A device that is merely full
+# shows its numbers alone. Lifetime or 24 h totals of failures and missing artifacts are not in the line: they never
+# clear. They stay in `alerts` for the fleet view.
+DISPLAY_ORDER = ('ember', 'hearth', 'laptop')
+LINE_WIDTH = 100
+_ACTIVE = ('queued', 'launching', 'running')
+
+
+def _worktree_key(job):
+    top = job.get('top') if isinstance(job.get('top'), str) and job.get('top') else job.get('root')
+    if not isinstance(top, str) or not top:
+        return None
+    return top.replace(chr(92), '/').rstrip('/').lower()[:300]
+
+
+def _reason_word(reason):
+    r = (reason or '').lower()
+    if 'paus' in r:
+        return 'PAUSED'
+    if 'probe unavailable' in r or 'offline' in r:
+        return 'DOWN'
+    if 'stale' in r:
+        return 'STALE'
+    if 'legacy' in r or 'draining' in r:
+        return 'legacy busy'
+    if 'ram' in r or 'memory' in r or 'commit' in r:
+        return 'RAM floor'
+    if 'load' in r:
+        return 'load cap'
+    if 'unknown size' in r:
+        return 'size unknown'
+    if 'cpu slots' in r:
+        return ''
+    return 'blocked'
+
+
+def _label(host, d):
+    """(text, attention) for one device; text None when the cache never reported it."""
+    if d.get('present') is False:
+        return None, None
+    name = ' '.join(str(d.get('name') or host).split())[:12].strip() or host
+    if d.get('stale'):
+        return f'{name} STALE', f'{name} stale'
+    if d.get('up') is False:
+        return f'{name} DOWN', f'{name} down'
+    used, total = d.get('slots_used'), d.get('slots_total')
+    text = f"{name} {'?' if used is None else used}/{'?' if total is None else total}"
+    if d.get('eligible') is False:
+        full = used is not None and total is not None and used >= total
+        word = _reason_word(d.get('reason')) if d.get('reason') else ('' if full else 'unavailable')
+        if word in ('PAUSED', 'DOWN', 'STALE'):
+            return f'{text} {word}', f'{name} {word.lower()}'
+        if word:
+            text += ' ' + word
+    return text, None
+
+
+def _compose(devices, order, counts, tops, sessions, truncated, started=0):
+    """The line and its structured parts, from device facts and live job records. ``started`` counts the jobs whose
+    record still says 'launching' while their host reports them running (a fleet job keeps that status for its
+    whole run): they are running work, not waiting work."""
+    started = max(0, min(started, counts['launching']))
+    running = counts['running'] + started
+    waiting = counts['queued'] + counts['launching'] - started  # a registered overnight job waits as 'launching'
+    labels, attention = [], []
+    for host in order:
+        text, attn = _label(host, devices[host])
+        if text is not None:
+            labels.append(text)
+        if attn:
+            attention.append(attn)
+    fresh = [d for d in devices.values() if d.get('present') is not False and not d.get('stale')]
+
+    def can_take(d):
+        used, total = d.get('slots_used'), d.get('slots_total')
+        full = used is not None and total is not None and used >= total
+        return d.get('up') is not False and (d.get('eligible') is not False or full)
+    blocked = waiting > 0 and bool(fresh) and not any(can_take(d) for d in fresh)
+    if blocked:
+        attention.append('dispatch blocked')
+    activity = {'running': running, 'waiting': waiting, 'worktrees': len(tops), 'sessions': len(sessions)}
+
+    def build(run, queued, tree):
+        wt = '' if not tops else f" · {len(tops)} {tree if len(tops) != 1 else tree.rstrip('s')}"
+        work = f'{running} {run} · {waiting} {queued}{wt}' if running or waiting else 'idle'
+        parts = list(labels) or ['no capacity data']
+        parts.append(work)
+        if blocked:
+            parts.append('DISPATCH BLOCKED')
+        if truncated:
+            parts.append('truncated')
+        return ' · '.join(parts)
+    line = build('running', 'queued', 'worktrees')
+    if len(line) > LINE_WIDTH:
+        line = build('run', 'queued', 'wt')
+    return line, activity, attention, blocked
+
+
+def summarize(state, now=None, _collect=None):
     """Read a bounded snapshot. Output contains no commands, reasons or job IDs."""
     state = Path(state)
     now = _time(now) if now is not None else time.time()
@@ -94,7 +193,8 @@ def summarize(state, now=None):
         name = raw.get('name')
         name = ''.join(c if c.isprintable() else ' ' for c in name)[:80] if isinstance(name, str) else host
         devices[host] = {'name': name, 'up': up, 'eligible': raw.get('eligible') if isinstance(raw.get('eligible'), bool) else None,
-                         'stale': stale, 'slots_used': used, 'slots_total': total}
+                         'stale': stale, 'slots_used': used, 'slots_total': total,
+                         'present': isinstance(raw_devices.get(host), dict)}
         # Older caches do not establish a configured pool or a reserve. Do not
         # infer a reserve from a host label or make an old sample look fresh.
         for key in ('slots_configured', 'slots_reserved'):
@@ -109,6 +209,8 @@ def summarize(state, now=None):
             alert('blocked')
 
     counts = {status: 0 for status in STATUSES}
+    started = 0
+    tops, sessions = set(), set()
     try:
         paths = sorted((state / 'jobs').glob('*.json'))
     except OSError:
@@ -122,6 +224,14 @@ def summarize(state, now=None):
         if not isinstance(status, str) or status not in counts:
             continue
         counts[status] += 1
+        if status == 'launching' and job.get('deferred_phase') == 'running':
+            started += 1
+        if status in _ACTIVE:
+            key = _worktree_key(job)
+            if key:
+                tops.add(key)
+            if isinstance(job.get('session'), str) and job['session']:
+                sessions.add(job['session'])
         submitted = _time(job.get('t_submitted'))
         finished = _time(job.get('t_finished'))
         recent = finished is None or 0 <= now - finished <= RECENT_SECONDS
@@ -142,21 +252,14 @@ def summarize(state, now=None):
         peak, cap = metrics.get('peak_memory_bytes'), job.get('memory_max_gb')
         if _number(peak) and _number(cap) and cap > 0 and peak > cap * 1024 ** 3:
             alert('overrun')
-    fragments = []
-    for host in ordered:
-        label = labels.get(host, host + ':')
-        d = devices[host]
-        used = '?' if d['slots_used'] is None else d['slots_used']
-        total = '?' if d['slots_total'] is None else d['slots_total']
-        fragments.append(f'{label}{used}/{total}')
-    # Host-registered overnight jobs remain 'launching' until command start;
-    # they are waiting work, even though the local placement decision is done.
-    line = 'CQ ' + ' '.join(fragments) + f" · q{counts['queued'] + counts['launching']}"
-    if alerts:
-        line += ' · ' + ' '.join(f'{key}:{value}' for key, value in sorted(alerts.items()))
-    if truncated:
-        line += ' · truncated'
-    return {'line': line, 'devices': devices, 'counts': counts, 'alerts': alerts, 'truncated': truncated}
+    if _collect is not None:
+        _collect['tops'] |= tops
+        _collect['sessions'] |= sessions
+    order = [h for h in DISPLAY_ORDER if h in devices] + sorted(set(devices) - set(DISPLAY_ORDER))
+    line, activity, attention, blocked = _compose(devices, order, counts, tops, sessions, truncated, started)
+    return {'line': line, 'devices': devices, 'counts': counts, 'alerts': alerts, 'truncated': truncated,
+            'activity': activity, 'attention': attention, 'dispatch_blocked': blocked, 'alerts_window_s': RECENT_SECONDS,
+            'started': started}
 
 
 def summarize_generations(queue_state, now=None):
@@ -174,7 +277,8 @@ def summarize_generations(queue_state, now=None):
     except OSError:
         valid_v2 = False
     roots = [queue_state / 'fleet'] + ([v2 / 'fleet'] if valid_v2 else [])
-    summaries = [summarize(root, timestamp) for root in roots]
+    collect = {'tops': set(), 'sessions': set()}
+    summaries = [summarize(root, timestamp, collect) for root in roots]
     capacities = [_read(root / 'capacity.json') or {} for root in roots]
     raw = [c.get('devices') if isinstance(c.get('devices'), dict) else {} for c in capacities]
     counts = {name: sum(s['counts'][name] for s in summaries) for name in STATUSES}
@@ -220,7 +324,9 @@ def summarize_generations(queue_state, now=None):
             return t if t is not None else (_time(capacities[index].get('at')) or float('-inf'))
         chosen = max(range(len(roots)), key=sample_time)
         d = dict(summaries[chosen]['devices'].get(host) or {'name': host, 'up': None, 'eligible': None,
-                 'stale': True, 'slots_used': None, 'slots_total': None})
+                 'stale': True, 'slots_used': None, 'slots_total': None, 'present': False})
+        if host in unknown or host in active:
+            d['present'] = True
         if host in unknown:
             d['slots_used'] = None
             d['eligible'] = False
@@ -238,21 +344,12 @@ def summarize_generations(queue_state, now=None):
                            and d['slots_used'] > d['slots_total'])):
             if yes:
                 alerts[name] = alerts.get(name, 0) + 1
-    labels = dict(HOSTS)
-    order = [host for host, _ in HOSTS if host in devices] + sorted(set(devices) - set(labels))
-    fragments = []
-    for host in order:
-        d = devices[host]
-        used = '?' if d.get('slots_used') is None else d['slots_used']
-        total = '?' if d.get('slots_total') is None else d['slots_total']
-        fragments.append(f"{labels.get(host, host + ':')}{used}/{total}")
-    line = 'CQ ' + ' '.join(fragments) + f" · q{counts['queued'] + counts['launching']}"
-    if alerts:
-        line += ' · ' + ' '.join(f'{key}:{value}' for key, value in sorted(alerts.items()))
     truncated = any(s['truncated'] for s in summaries)
-    if truncated:
-        line += ' · truncated'
-    return {'line': line, 'devices': devices, 'counts': counts, 'alerts': alerts, 'truncated': truncated}
+    order = [h for h in DISPLAY_ORDER if h in devices] + sorted(set(devices) - set(DISPLAY_ORDER))
+    line, activity, attention, blocked = _compose(devices, order, counts, collect['tops'], collect['sessions'], truncated,
+                                                  sum(s.get('started', 0) for s in summaries))
+    return {'line': line, 'devices': devices, 'counts': counts, 'alerts': alerts, 'truncated': truncated,
+            'activity': activity, 'attention': attention, 'dispatch_blocked': blocked, 'alerts_window_s': RECENT_SECONDS}
 
 
 @contextmanager

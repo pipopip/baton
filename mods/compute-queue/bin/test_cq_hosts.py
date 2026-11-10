@@ -124,7 +124,7 @@ class HostContracts(Base):
         partial = {'alive': False, 'started': None, 'launched': None, 'exit': None}
         cq.reap_host(self.remote, cq.load_job(self.remote, jid), partial, self.clock[0], [])
         self.assertEqual(cq.load_job(self.remote, jid)['status'], 'launching')
-        cancelled = cq.cmd_cancel(self.remote, {'job': jid})
+        cancelled = cq.cmd_cancel(self.remote, {'job': jid, 'root': self.repo, 'session': 'sess-A'})
         self.assertEqual(cancelled['status'], 'launching')
         self.assertTrue(cq.load_job(self.remote, jid)['cancel_requested'])
         # Even an explicit retry retains the old execution identity.

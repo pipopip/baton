@@ -79,7 +79,7 @@ class RamQueueTests(Base):
         job['memory_max_gb'] = cq.RAM_BUDGET_GB - 0.5
         cq.save_job(self.ctx, job)
         self.assertTrue(cq.dispatch(self.ctx, {'job': first, 'where': 'host'})['ok'])
-        cq.cmd_cancel(self.ctx, {'job': first})
+        self.cancel(first)
         second = self.ram_job()
         self.assertFalse(cq.dispatch(self.ctx, {'job': second, 'where': 'host'})['ok'])
         with mock.patch.object(cq, 'RAM_JOBS', False):
@@ -151,7 +151,7 @@ class RamQueueTests(Base):
     def test_cancel_before_worker_does_not_launch_or_release_early(self):
         jid = self.ram_job()
         cq.dispatch(self.ctx, {'job': jid, 'where': 'host'})
-        result = cq.cmd_cancel(self.ctx, {'job': jid})
+        result = self.cancel(jid)
         self.assertEqual(result['status'], 'launching')
         cq.launch(self.ctx, jid)
         self.assertEqual(self.host.launches, [])
@@ -168,7 +168,7 @@ class RamQueueTests(Base):
         remoterun = self.ctx.run_remoterun
 
         def race(argv, cwd):
-            cq.cmd_cancel(self.ctx, {'job': jid})
+            self.cancel(jid)
             return remoterun(argv, cwd)
         self.ctx.run_remoterun = race
         cq.launch(self.ctx, jid)

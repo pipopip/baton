@@ -134,6 +134,7 @@ def _submit(ctx, req):
     command, root = req.get('command'), req.get('root')
     if not isinstance(command, str) or not command.strip() or '\0' in command:
         _error('command is required')
+    e.require_request_identity(req, 'submission')
     if not isinstance(root, str) or not os.path.isdir(root):
         _error('root must be a worktree directory')
     if req.get('host_id') is not None:
@@ -1523,8 +1524,9 @@ def _probes_for_reserve(ctx, busy):
 def _cancel(ctx, req):
     e = _engine()
     jid = req.get('job')
-    root, session = req.get('root'), req.get('session')
-    if not isinstance(root, str) or not os.path.isdir(root) or not isinstance(session, str) or not session:
+    e.require_request_identity(req, 'cancellation')
+    root, session = req['root'], req['session']
+    if not os.path.isdir(root):
         _error('fleet cancellation requires the current worktree root and owner session')
     top = e._top_of(root)
     with e.owner_lock(top), ctx.qlock():
@@ -1657,7 +1659,10 @@ def augment(ctx, command, req, result):
         watch['queued'] = watch.get('queued', 0) + sum(j.get('status') == 'queued' for j in jobs)
         owner = e.read_json(os.path.join(top, '.baton', 'owner.json')) if top else None
         if isinstance(owner, dict) and owner.get('session_id') == session:
-            watch['to_notify'] = list(watch.get('to_notify') or []) + [e.notice_data(j) for j in mine if j.get('status') in TERMINAL and j.get('notify', True) and not j.get('notified')]
+            pending = [j for j in mine if j.get('status') in TERMINAL and j.get('notify', True) and not j.get('notified')]
+            watch['to_notify'] = list(watch.get('to_notify') or []) + [e.notice_data(j) for j in pending]
+            extra = e.attention_counts(pending)
+            watch['mine_attention'] = {k: (watch.get('mine_attention') or {}).get(k, 0) + extra[k] for k in extra}
         result['watch'] = watch
     return result
 

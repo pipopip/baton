@@ -135,7 +135,7 @@ class DeferredTests(Base):
         jid = self.deferred()
         cq.dispatch(self.ctx, {'job': jid, 'where': 'host'})
         with mock.patch.object(cq, 'deferred_control', return_value={'error': 'offline'}):
-            self.assertEqual(cq.cmd_cancel(self.ctx, {'job': jid})['status'], 'launching')
+            self.assertEqual(self.cancel(jid)['status'], 'launching')
             cq.reap_deferred(self.ctx, self.job(jid), None, self.clock[0], [])
         self.assertTrue(self.job(jid)['cancel_requested'])
         self.assertEqual(self.job(jid)['status'], 'launching')

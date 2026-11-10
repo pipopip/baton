@@ -37,7 +37,7 @@ class RetentionRecoveryTests(Base):
                    finished=self.clock[0], alive=False, src=True, pid=123)
         def fetch(*args, **kwargs):
             with mock.patch.object(cq, 'kill_running', return_value=True):
-                result = cq.cmd_cancel(self.ctx, {'job': jid})
+                result = self.cancel(jid)
             self.assertEqual(result['status'], 'running')
             return [], []
         with mock.patch.object(cq, 'fetch_results', side_effect=fetch):

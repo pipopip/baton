@@ -387,7 +387,7 @@ describe('the leader loop', () => {
     const w = world(on)
     w.answers.tick = leaderTick({ can_start: false })
     await start($, w)
-    expect(w.statuses.at(-1)).toBe('cq · host 1/4 · laptop free · queued 1 · mine 1/2')
+    expect(w.statuses.at(-1)).toBe('ember 1/4 · laptop free · 1 queued · mine 1/2')
   })
 
   test('a failing cq.py shows in the status line and does not stop the loop', async ($, on) => {
@@ -397,14 +397,40 @@ describe('the leader loop', () => {
     expect(w.statuses.at(-1)).toContain('LockTimeout')
     w.answers.tick = leaderTick({ can_start: false })
     await w.clock.advance(15_000)
-    expect(w.statuses.at(-1)).toContain('cq · host')
+    expect(w.statuses.at(-1)).toContain('ember 1/4')
   })
 
   test('fleet snapshot is used for the native slot indicator', async ($, on) => {
     const w = world(on)
-    w.answers.tick = leaderTick({ can_start: false, fleet: { line: 'CQ L0/4 H2/6 E3/14 · q2' } } as never)
+    w.answers.tick = leaderTick({ can_start: false, fleet: { line: 'ember 3/14 · hestia 2/6 · laptop 0/4 · 3 running · 2 queued · 2 worktrees' } } as never)
     await start($, w)
-    expect(w.statuses.at(-1)).toBe('CQ L0/4 H2/6 E3/14 · q2 · mine 1/2')
+    expect(w.statuses.at(-1)).toBe('ember 3/14 · hestia 2/6 · laptop 0/4 · 3 running · 2 queued · 2 worktrees · mine 1/2')
+  })
+
+  test('the status line asks for attention only for what is current and can be acted on', async ($, on) => {
+    const w = world(on)
+    const fleet = { line: 'ember 3/14 · hestia DOWN · 1 running · 0 queued · 1 worktree', alerts: { failure: 31, artifact_missing: 29 } }
+    const watch = { mine_running: 0, mine_queued: 0, queued: 0, to_notify: [], top: 'C:/Work/wt/lane_t', mine_attention: { failed: 2, missing: 1 } }
+    w.answers.tick = leaderTick({ can_start: false, fleet, watch } as never)
+    await start($, w)
+    // the lifetime totals in the snapshot are not in the line; this worktree's undelivered failures are
+    expect(w.statuses.at(-1)).toBe('ember 3/14 · hestia DOWN · 1 run · 0 queued · 1 wt · mine 0/0 · needs you: 2 failed, 1 missing artifacts') // over 100: shortened
+    expect(w.statuses.at(-1)).not.toContain('31')
+    // once the notices are delivered the queue reports none and the line is quiet again
+    w.answers.tick = leaderTick({ can_start: false, fleet, watch: { ...watch, mine_attention: { failed: 0, missing: 0 } } } as never)
+    await w.clock.advance(15_000)
+    expect(w.statuses.at(-1)).toBe('ember 3/14 · hestia DOWN · 1 running · 0 queued · 1 worktree · mine 0/0')
+    // an unacknowledged disk alert is a paused dispatch
+    w.answers.tick = leaderTick({ can_start: false, fleet, alert: { at: '2026-11-10T10:00:00Z', msg: 'disk low', job: 'cq-1' } } as never)
+    await w.clock.advance(15_000)
+    expect(w.statuses.at(-1)).toContain('mine 1/2 · ember DISPATCH PAUSED')
+  })
+
+  test('without a fleet line the legacy wording is used, with the same attention', async ($, on) => {
+    const w = world(on)
+    w.answers.tick = leaderTick({ can_start: false, fleet: { alerts: {} } } as never)
+    await start($, w)
+    expect(w.statuses.at(-1)).toBe('ember 1/4 · laptop free · 1 queued · mine 1/2')
   })
 
   test('session.end hands the leadership over at once', async ($, on) => {

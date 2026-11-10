@@ -61,7 +61,7 @@
       "output_sha256": "a036d953d86a646dfad0ac86209be67129a023492ea9f0754bf8b33692363599"
     },
     "baton/cycle.py": {
-      "output_sha256": "49b283f5c8d253d814305398a0915dd49434ccc80985b60e1e98a05cfb6e79f5"
+      "output_sha256": "2ca1018338ec3211dcadba4f1ebfb87de955e11a730921230398491b6a92b935"
     },
     "baton/doctor.py": {
       "output_sha256": "59c0d3523a2a6c981944eaebeaad4ddd2177a3f6395ab8f4470aa0fcbf256e1c"
@@ -157,22 +157,22 @@
       "output_sha256": "c76f018b5b6854850a3e978e39849f1fb560ddbc20d180a1220d34d7b47061fc"
     },
     "mods/compute-queue/bin/cq.py": {
-      "output_sha256": "3173ed879db43d148fcff6c6f597def8b4f134829911918f8d4ceddee4686641"
+      "output_sha256": "c8f060909073d74ddc106554fb0249895542f2196d1a76671b1a5a5e959bcb0c"
     },
     "mods/compute-queue/bin/cq_stats.py": {
       "output_sha256": "c5966338926633ca5395cf15d7ae6c535792e167e162df6c6575bb1519c6244a"
     },
     "mods/compute-queue/bin/fleet_queue.py": {
-      "output_sha256": "b9e4a4d13a7d3b979dd96d7e87e4f1155e78350c8c903c1a32f674b997c06fe1"
+      "output_sha256": "9afce1f19fc851189cff26d093290e11a807716f1e3717a87fd64d4d07d678de"
     },
     "mods/compute-queue/bin/fleet_telemetry.py": {
-      "output_sha256": "222ef2a3ce986c102b48f3abdea8e359067f4660897bec823dd99b6b3498b712"
+      "output_sha256": "456640c919656a5196b838ba7450852172f07e1ed331ac76e0ad7a3f6a2db8c6"
     },
     "mods/compute-queue/bin/host_stop.py": {
       "output_sha256": "f10c0762636e96980356bd1e16695111d2d6af4665818b25683d474e30c350b6"
     },
     "mods/compute-queue/bin/multi_host.py": {
-      "output_sha256": "d8ce84a6f981c46caa468b72f8802f0e1b46573a6eaf2cf4a04e3ef24fc42e57"
+      "output_sha256": "bab19c9328035ce446ceb9df16bd6546b1a06f22c6de31734c07c623f8ecc488"
     },
     "mods/compute-queue/bin/policy.mjs": {
       "output_sha256": "f36d2dd2f28896306d126f53b5e368f57fa4e689a6edbfe61b8708e257d0b55d"
@@ -181,7 +181,7 @@
       "output_sha256": "5cb86c2f758601fb3ab4b8fcf0ac5dc9da075be7a1fbe9eb031ae278966ad0cd"
     },
     "mods/compute-queue/bin/queue_generations.py": {
-      "output_sha256": "48bb6f726bbe2740946373fae05621509290d3341bd218de13b71bc242672505"
+      "output_sha256": "80bc9e9a604c472ccc7a687dac8b67b997d88d43a3502d7bf607b13dc79d58c7"
     },
     "mods/compute-queue/bin/queue_paths.py": {
       "output_sha256": "b943bbc531b72da530dabefd4cf93f451c93be4bb1bd77811332de0b8b6a5cfa"
@@ -208,37 +208,37 @@
       "output_sha256": "0ac79c81a5fecadae20c04fafd7f3fb1ebb177032211e429cd73d87b270bfbb9"
     },
     "mods/compute-queue/bin/test_cq.py": {
-      "output_sha256": "f5da3296cd33bcb284a785588d88288610505e2120be5c068b82815816024eee"
+      "output_sha256": "ed9a22baa35f39de87ee1efc141b0a7d848bb622fc22f87b5803ae45cb5bb83d"
     },
     "mods/compute-queue/bin/test_cq_deferred.py": {
-      "output_sha256": "10d852197a6fc10543a1cce0d2eb8c2a7cb8c537c08492dc1436aeec45563923"
+      "output_sha256": "0f25273ee7857ff588ab9307c1e4a4ed3eac89cad5baeb550cd4d0a4bf44f638"
     },
     "mods/compute-queue/bin/test_cq_hosts.py": {
-      "output_sha256": "9c4b0ebca7da3570289e6d29fa7e150e6ad6eb8c8f783112d62c18896d2cf2ac"
+      "output_sha256": "96a883c514a2c8408e1710ecbcf5c0ba02e28ad42b2576a833263f47bedc29a2"
     },
     "mods/compute-queue/bin/test_cq_paths.py": {
       "output_sha256": "ea083aae5c53e576374d224d57d0ca63656bd59228b730c8c2ea2043b059f36f"
     },
     "mods/compute-queue/bin/test_cq_ram.py": {
-      "output_sha256": "042af6f1420b9125ce2966a7f630061d0efef8b47736799f51a3a98f51431d3e"
+      "output_sha256": "e580f6744a96978b29961a0ba959fcef2450d7b712a233ed5c99a36039dd0f6e"
     },
     "mods/compute-queue/bin/test_cq_stats.py": {
       "output_sha256": "c7a907762dd6b9f64ffa00dd011866dcba1dc64d28cc8aedc86c9bd33fea9355"
     },
     "mods/compute-queue/bin/test_fleet_contract.py": {
-      "output_sha256": "355ae41bb024c70ec88fe3c5c55d3cb6ecfb8ded70bc77b7b8e7afdc3d9a3f1e"
+      "output_sha256": "77821e16b1b92c36f12e32b099311e4fc85d936e397712bbdd07fbe400012304"
     },
     "mods/compute-queue/bin/test_fleet_queue.py": {
-      "output_sha256": "c80cc3fad050c25a47e2aea924c151d4211432dd4684b845233d0fdbaa5f8d5b"
+      "output_sha256": "dc83b980119cddb8e9323d3032b535b1d3247ff097d9c165b8695b570204e52a"
     },
     "mods/compute-queue/bin/test_fleet_telemetry.py": {
-      "output_sha256": "558676f2531bbf127799e102462f36daefda0b4121797f03822e59bfe2832c44"
+      "output_sha256": "c88e0e258cbbd5a428f9b7cfbcff368a1ac2eac5d4fbf95d9b91a10e88cf5e35"
     },
     "mods/compute-queue/bin/test_host_stop.py": {
-      "output_sha256": "276c4ffff9e301a94f4ecd504abf528a2c71864222dbdb12230985a9e89ad065"
+      "output_sha256": "5f69b6e1b3460a09eb399b6464b409c92346f0bdd91b050daa775b87cd4b745a"
     },
     "mods/compute-queue/bin/test_multi_host.py": {
-      "output_sha256": "a184d77d3ddbd7a0c20a273ea7aeb202316bd26c4c3d5c3198ea9d3958740ff4"
+      "output_sha256": "96bab109dbc77d501515c95e4cfc3486a933f926e8aba72979637d22632b670a"
     },
     "mods/compute-queue/bin/test_policy_contract.py": {
       "output_sha256": "d39c17c4986e1f5533cab85fc9147b4016a7d993d3026b67300181b9a63d76e3"
@@ -247,7 +247,7 @@
       "output_sha256": "c61b89a71c1ec16d15cc837a84a0c1e99d535c1fb9a05050f856f75040739ff3"
     },
     "mods/compute-queue/bin/test_queue_generations.py": {
-      "output_sha256": "e663ce2255dbfea444e58287080dff6104a71e6b7375d7cc8424b946cd24b220"
+      "output_sha256": "4b3db8e4d5067a1a5d630adf3657a3b5d3dd6e5cfccf2036344ec23ab72df73c"
     },
     "mods/compute-queue/bin/test_queue_paths.py": {
       "output_sha256": "cfc13d8c98915c0250815b1aff914f067856f617fca269e4e3ac0c2ddd028c96"
@@ -262,7 +262,7 @@
       "output_sha256": "3e941cf99a169f54f1b0d92c128351b7893ee620d21947c6d091fc8e9b6ea541"
     },
     "mods/compute-queue/bin/test_retention_recovery.py": {
-      "output_sha256": "74fd78be088b6820acfcf5c8951df8acc660e270ae30c77f90b7bef0dc0ca177"
+      "output_sha256": "a6246856b8039358bc86c6861fd53b670c6a6a370a5c13c5dc9f59ad109e03f1"
     },
     "mods/compute-queue/bin/test_rpc_workers.py": {
       "output_sha256": "9ba61bbd093c272978b9c60a6592ded794d59a7c86ff366e0036acf49714ad4c"
@@ -295,10 +295,10 @@
       "output_sha256": "529fd7aa9b22d012870c0a106899b65f6a37eac022c7ffb77898042038e03167"
     },
     "mods/compute-queue/hooks/notice.test.ts": {
-      "output_sha256": "ae7e32f768c2dba2ba8c2f76035dde7c3dfbe3a3a78265cd4f72c3fc25104182"
+      "output_sha256": "feac3e39230b104def61ade518dc4c7b87301129966ef164d0f0ecad702bb13e"
     },
     "mods/compute-queue/hooks/notice.ts": {
-      "output_sha256": "a4094259cb23a3834bb8d8913a9e48c44ee5bb77168dbe058740d3f3b29a4800"
+      "output_sha256": "e4de8cb35f2050f67986a16dee5be614095fc1e7b6ac949240b6a4e647ede539"
     },
     "mods/compute-queue/hooks/plan.test.ts": {
       "output_sha256": "30fb13193bfd319121b2c64d590390e7d37a4c5da7353b3219222731fb36213d"
@@ -307,10 +307,10 @@
       "output_sha256": "0aa4ed9c7103aab5c1a93a5ab73770af467c8f7017fdeb172a9414548e24ed7b"
     },
     "mods/compute-queue/hooks/register.test.ts": {
-      "output_sha256": "dd1dd2c240cbbb323ef575fae35cd6de5396572c4b464d0a2fba3829da49c521"
+      "output_sha256": "590ddf23c187954d53b56471955c5185f60950153c2dea5fc02f2c25bd7bedff"
     },
     "mods/compute-queue/hooks/register.tsx": {
-      "output_sha256": "f06184b9f9626889368709edda5b5297e957bff233f9113617069068568231ff"
+      "output_sha256": "60fe352dd7f71a146fd4e98f42c23d92a60b892e4d3a58575c1e16d49945ac36"
     },
     "mods/compute-queue/host/bootstrap.py": {
       "output_sha256": "83fb5c56ae430191e1fda2d2c9cda2a2c2f8da6a9e124a033d50fe0075db51e4"
@@ -361,5 +361,5 @@
       "output_sha256": "5f593b9cb13fa3e73a51771c4ff6e505224c21421c44f02f170e0a7e65f1d8bc"
     }
   },
-  "source_head": "5a77946cec1347f8e0c00ebe2729c3862c72dbb6"
+  "source_head": "4786d47d1dd7d3185b7bf0aae4cb647919ab7eb4"
 }

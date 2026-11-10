@@ -26,7 +26,16 @@ class Shards(unittest.TestCase):
             return {'ok': True, 'leader': host == 'hearth', 'can_start': True}
         return {'ok': True, 'host': host}
     def run_cmd(self, command, req):
+        if command in ('submit', 'cancel'):  # the shard router refuses a request that does not name its worktree and session
+            req = {'root': str(self.root), 'session': 'sess-A', **req}
         return mh.execute(cq, self.ctx, command, req, self.leaf)
+    def test_submit_and_cancel_require_root_and_session(self):
+        jid = 'cq-hearth-20261107T123456-1234'
+        for command, req in (('submit', {'command': 'x', 'host_id': 'hearth'}), ('cancel', {'job': jid})):
+            for partial in ({}, {'root': str(self.root)}, {'session': 'sess-A'}):
+                with self.assertRaisesRegex(cq.CqError, '(submission|cancellation) requires'):
+                    mh.execute(cq, self.ctx, command, dict(req, **partial), self.leaf)
+        self.assertEqual(self.calls, [])
     def test_submit_selector(self):
         self.assertEqual(self.run_cmd('submit', {'where': 'any'})['host'], 'ember')
         self.assertEqual(self.run_cmd('submit', {'host_id': 'ember'})['host'], 'ember')

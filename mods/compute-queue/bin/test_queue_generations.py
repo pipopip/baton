@@ -81,12 +81,19 @@ class Generations(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][2]['ids'], [self.legacy])
         self.assertEqual(calls[1][2]['ids'], [self.new])
+        who = {'root': str(self.root), 'session': 'sess-A'}
         for req, expected in (({'where': 'fleet'}, 2), ({'gets': ['out']}, 2),
                               ({'artifact_total_mb': 10}, 2), ({'where': 'host'}, 1)):
-            generations.execute(cq, self.ctx, 'submit', req, leaf)
+            generations.execute(cq, self.ctx, 'submit', dict(req, **who), leaf)
             self.assertEqual(calls[-1][0].endswith('queue-v2'), expected == 2)
-        generations.execute(cq, self.ctx, 'cancel', {'job': self.new}, leaf)
+        generations.execute(cq, self.ctx, 'cancel', dict({'job': self.new}, **who), leaf)
         self.assertTrue(calls[-1][0].endswith('queue-v2'))
+        count = len(calls)
+        for command, req in (('submit', {'where': 'fleet'}), ('cancel', {'job': self.new})):
+            for partial in ({}, {'root': str(self.root)}, {'session': 'sess-A'}):
+                with self.assertRaisesRegex(cq.CqError, '(submission|cancellation) requires'):
+                    generations.execute(cq, self.ctx, command, dict(req, **partial), leaf)
+        self.assertEqual(len(calls), count)
 
     def test_views_merge_and_flag_generation_errors(self):
         generations.context(cq, self.ctx, 2)
@@ -125,6 +132,33 @@ class Generations(unittest.TestCase):
             return {'ok': True}
         generations.execute(cq, v2, 'tick', {}, leaf)
         self.assertEqual(calls, [(v2.state, 'tick')])
+
+    def test_a_snapshot_that_cannot_be_built_does_not_fail_the_tick(self):
+        # the tick also schedules the queue and delivers notices; the status line is the only thing that may suffer
+        generations.context(cq, self.ctx, 2)   # generation two exists, so the combined view is asked for
+        def leaf(ctx, cmd, req):
+            return {'ok': True, 'watch': {'queued': 1, 'to_notify': [{'id': 'cq-1'}]}, 'fleet': {'line': 'own generation'}}
+        with mock.patch.object(fleet_telemetry, 'summarize_generations', side_effect=KeyError('devices'), create=True):
+            result = generations.execute(cq, self.ctx, 'tick', {}, leaf)
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['fleet'], {'line': 'own generation'})
+        self.assertEqual(result['fleet_warning'], 'combined fleet snapshot unavailable: KeyError')
+        self.assertEqual([j['id'] for j in result['watch']['to_notify']][:1], ['cq-1'])
+
+    def test_tick_and_status_carry_one_fleet_view_of_both_generations_and_merged_attention(self):
+        v2 = generations.context(cq, self.ctx, 2)
+        def leaf(ctx, cmd, req):
+            old = not ctx.state.endswith('queue-v2')
+            return {'ok': True, 'watch': {'queued': 1, 'to_notify': [], 'mine_attention': {'failed': 1 if old else 0, 'missing': 0 if old else 2}},
+                    'fleet': {'line': 'older generation only' if old else 'newer generation only'}}
+        with mock.patch.object(fleet_telemetry, 'summarize_generations', return_value={'line': 'combined'}, create=True) as summary:
+            for command in ('tick', 'watch', 'status'):
+                result = generations.execute(cq, self.ctx, command, {}, leaf)
+                # the primary result's own fleet block is the older generation's, whose cache is no longer written
+                self.assertEqual(result['fleet'], {'line': 'combined'}, command)
+                self.assertEqual(result['generations']['v2']['fleet'], {'line': 'newer generation only'})
+                if command != 'status':
+                    self.assertEqual(result['watch'].get('mine_attention'), {'failed': 1, 'missing': 2})
 
     def test_fleet_view_uses_aggregated_telemetry(self):
         with mock.patch.object(fleet_telemetry, 'summarize_generations', return_value={'combined': True}, create=True) as summary:

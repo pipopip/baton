@@ -280,6 +280,9 @@ class Base(unittest.TestCase):
         self.assertTrue(r["ok"], r)
         return r["job"]
 
+    def cancel(self, jid, **kw):
+        return cq.cmd_cancel(self.ctx, {"job": jid, "root": self.repo, "session": "sess-A", **kw})
+
     def job(self, jid):
         return cq.load_job(self.ctx, jid)
 
@@ -691,9 +694,9 @@ class StartOrderTests(Base):
         self.assertEqual([e["job"] for e in cq.fallback_entries([long_, short], cap(free=2), None, 5000.0)], ["short", "long"])
 
     def test_queued_jobs_position_follows_start_order(self):
-        a = cq.cmd_submit(self.ctx, {"command": "long", "root": self.repo, "est_minutes": 60})
+        a = cq.cmd_submit(self.ctx, {"command": "long", "root": self.repo, "session": "sess-A", "est_minutes": 60})
         self.advance(1)
-        b = cq.cmd_submit(self.ctx, {"command": "short", "root": self.repo, "est_minutes": 5})
+        b = cq.cmd_submit(self.ctx, {"command": "short", "root": self.repo, "session": "sess-A", "est_minutes": 5})
         self.assertEqual(b["position"], 1)
         self.assertEqual([j["id"] for j in cq.queued_jobs(self.ctx)], [b["job"], a["job"]])
 
@@ -1563,6 +1566,34 @@ class SubmitTests(Base):
         cq.save_job(self.ctx, job)
         self.assertEqual(cq.cmd_cancel(self.ctx, req)['status'], 'cancelled')
 
+    def test_submit_without_session_or_root_is_refused_and_queues_nothing(self):
+        for missing in ('session', 'root'):
+            for value in (None, ''):
+                req = {'command': 'echo hi', 'root': self.repo, 'session': 'sess-A'}
+                if value is None:
+                    del req[missing]
+                else:
+                    req[missing] = value
+                with self.subTest(missing=missing, value=value):
+                    for call in (lambda: cq.cmd_submit(self.ctx, req), lambda: cq.execute(self.ctx, 'submit', req)):
+                        with self.assertRaisesRegex(cq.CqError, 'submission requires ' + missing):
+                            call()
+        self.assertEqual(cq.queued_jobs(self.ctx), [])
+
+    def test_cancel_requires_root_and_session_and_keeps_the_job_queued(self):
+        jid = self.submit()
+        for req in ({'job': jid}, {'job': jid, 'root': self.repo}, {'job': jid, 'session': 'sess-A'}):
+            for call in (lambda: cq.cmd_cancel(self.ctx, req), lambda: cq.execute(self.ctx, 'cancel', req)):
+                with self.assertRaisesRegex(cq.CqError, 'cancellation requires'):
+                    call()
+            self.assertEqual(self.job(jid)['status'], 'queued')
+        with self.assertRaisesRegex(cq.CqError, 'does not match'):
+            self.cancel(jid, root=self.tmp)
+        with self.assertRaisesRegex(cq.CqError, 'owner'):
+            self.cancel(jid, session='sess-other')
+        self.assertEqual(self.job(jid)['status'], 'queued')
+        self.assertEqual(self.cancel(jid)['status'], 'cancelled')
+
     def test_standalone_protocol_two_notified_returns_acknowledged_ids(self):
         jid = self.submit()
         job = self.job(jid)
@@ -1583,18 +1614,18 @@ class SubmitTests(Base):
 
     def test_S18_part_without_split_refused(self):
         with self.assertRaisesRegex(cq.CqError, r"\{part\}"):
-            cq.cmd_submit(self.ctx, {"command": "mutate.py --part {part}", "root": self.repo})
+            cq.cmd_submit(self.ctx, {"command": "mutate.py --part {part}", "root": self.repo, "session": "sess-A"})
 
     def test_S18_split_without_part_refused(self):
         with self.assertRaisesRegex(cq.CqError, r"\{part\}"):
-            cq.cmd_submit(self.ctx, {"command": "go test ./...", "root": self.repo, "split": {"max_parts": 3}})
+            cq.cmd_submit(self.ctx, {"command": "go test ./...", "root": self.repo, "session": "sess-A", "split": {"max_parts": 3}})
 
     def test_validation_errors(self):
         for bad in ({"slots": 5}, {"slots": -1}, {"where": "s22"}, {"priority": "urgent"}, {"subdir": "../x"},
                     {"gets": ["/etc/passwd"]}, {"self_heavy": True, "slots": 0}, {"timeout_minutes": 481},
                     {"where": "laptop", "slots": 2}, {"split": {"max_parts": 9}}, {"source": "not-a-sha!"}):
             with self.assertRaises(cq.CqError, msg=str(bad)):
-                cq.cmd_submit(self.ctx, {"command": "echo {part}" if "split" in bad else "echo hi", "root": self.repo, **bad})
+                cq.cmd_submit(self.ctx, {"command": "echo {part}" if "split" in bad else "echo hi", "root": self.repo, "session": "sess-A", **bad})
 
     def test_defaults_and_record(self):
         jid = self.submit("go test ./pkg")
@@ -1609,11 +1640,11 @@ class SubmitTests(Base):
         self.assertEqual(self.job(self.submit("x", est_minutes=500))["timeout_minutes"], 480)
 
     def test_position_follows_priority_then_fifo(self):
-        a = cq.cmd_submit(self.ctx, {"command": "a", "root": self.repo})
+        a = cq.cmd_submit(self.ctx, {"command": "a", "root": self.repo, "session": "sess-A"})
         self.advance(1)
-        b = cq.cmd_submit(self.ctx, {"command": "b", "root": self.repo, "priority": "verify"})
+        b = cq.cmd_submit(self.ctx, {"command": "b", "root": self.repo, "session": "sess-A", "priority": "verify"})
         self.advance(1)
-        c = cq.cmd_submit(self.ctx, {"command": "c", "root": self.repo})
+        c = cq.cmd_submit(self.ctx, {"command": "c", "root": self.repo, "session": "sess-A"})
         self.assertEqual((a["position"], b["position"], c["position"]), (1, 1, 3))
 
     def test_S7_snapshot_is_the_dirty_state_at_submit_and_leaves_the_worktree_alone(self):
@@ -1713,17 +1744,17 @@ class SubmitTests(Base):
         with open(big, "wb") as f:
             f.write(b"x" * (cq.CARRY_MAX_BYTES + 1))
         with self.assertRaisesRegex(cq.CqError, r"over 2048 KiB"):
-            cq.cmd_submit(self.ctx, {"command": "x", "root": self.repo})
+            cq.cmd_submit(self.ctx, {"command": "x", "root": self.repo, "session": "sess-A"})
         os.remove(big)
         with open(big, "wb") as f:
             f.write(b"x" * (cq.CARRY_MAX_BYTES - 10))
-        self.assertTrue(cq.cmd_submit(self.ctx, {"command": "x", "root": self.repo})["ok"])  # under the cap in all
+        self.assertTrue(cq.cmd_submit(self.ctx, {"command": "x", "root": self.repo, "session": "sess-A"})["ok"])  # under the cap in all
         os.remove(big)
         open(os.path.join(d, "link.sh"), "w").write("x")  # symlinks need a privilege on Windows: the link is simulated
         real = os.path.islink
         with mock.patch("os.path.islink", side_effect=lambda p: p.endswith("link.sh") or real(p)):
             with self.assertRaisesRegex(cq.CqError, r"not a regular file"):
-                cq.cmd_submit(self.ctx, {"command": "x", "root": self.repo})
+                cq.cmd_submit(self.ctx, {"command": "x", "root": self.repo, "session": "sess-A"})
         self.assertEqual(sh(self.repo, "for-each-ref", "refs/cq").count("refs/cq"), 1)  # only the accepted one holds a ref
 
 
@@ -2269,6 +2300,25 @@ class DispatchTests(Base):
         cq.cmd_notified(self.ctx, {"ids": [a]})
         self.assertEqual(self.tick("sess-B")["watch"]["to_notify"], [])
 
+    def test_watch_counts_only_undelivered_failures_and_missing_artifacts_as_attention(self):
+        failed, missing, fine = self.submit("go test ./a"), self.submit("go test ./b"), self.submit("go test ./c")
+        for jid, status, extra in ((failed, "failed", {}), (missing, "done", {"artifact_missing": [{"path": "x"}]}), (fine, "done", {})):
+            job = self.job(jid)
+            job.update(status=status, exit=1 if status == "failed" else 0, **extra)
+            cq.save_job(self.ctx, job)
+        watch = cq.watch(self.ctx, self.repo, self.clock[0], "sess-A")
+        self.assertEqual(watch["mine_attention"], {"failed": 1, "missing": 1})
+        # a result the owner has been handed no longer asks for attention
+        cq.cmd_notified(self.ctx, {"ids": [failed]})
+        self.assertEqual(cq.watch(self.ctx, self.repo, self.clock[0], "sess-A")["mine_attention"], {"failed": 0, "missing": 1})
+        cq.cmd_notified(self.ctx, {"ids": [missing, fine]})
+        self.assertEqual(cq.watch(self.ctx, self.repo, self.clock[0], "sess-A")["mine_attention"], {"failed": 0, "missing": 0})
+        # nor does a session that is not the worktree's owner see them (it could not deliver them)
+        job = self.job(failed)
+        job.update(notified=False)
+        cq.save_job(self.ctx, job)
+        self.assertEqual(cq.watch(self.ctx, self.repo, self.clock[0], "sess-other")["mine_attention"], {"failed": 0, "missing": 0})
+
     def test_vendor_handoff_leaves_completion_for_current_codex_owner(self):
         job_id = self.submit("go test ./pkg")
         job = self.job(job_id)
@@ -2528,14 +2578,14 @@ class DispatchTests(Base):
         a = self.submit("a")
         b = self.submit("b", slots=2)
         self.tick()
-        self.assertEqual(cq.cmd_cancel(self.ctx, {"job": a})["status"], "cancelled")
+        self.assertEqual(self.cancel(a)["status"], "cancelled")
         self.assertEqual(self.job(a)["status"], "cancelled")
         self.assertNotIn(a, [q["id"] for q in self.tick()["queued"]])
         cq.cmd_apply(self.ctx, {"plan": {"start": [{"job": b, "where": "host", "slots": 2}]}})
         self.assertEqual(self.job(b)["status"], "running")
         t = self.tick()
         self.assertEqual(t["capacity"]["host"]["pending"], 2)  # launched, not yet holding its slots
-        cq.cmd_cancel(self.ctx, {"job": b})
+        self.cancel(b)
         self.assertEqual(self.job(b)["status"], "running")
         self.assertTrue(self.job(b)['cancel_requested'])
         self.assertIn(b, self.host.kills)
@@ -2544,13 +2594,13 @@ class DispatchTests(Base):
         self.host.set_done(b, 0)
         self.assertEqual(self.tick()["capacity"]["host"]["free"], 4)
         self.assertEqual(self.job(b)['status'], 'cancelled')
-        self.assertTrue(cq.cmd_cancel(self.ctx, {"job": b})["ok"])  # idempotent
+        self.assertTrue(self.cancel(b)["ok"])  # idempotent
 
     def test_S11_cancel_a_split_parent_cancels_the_parts(self):
         a = self.submit("x {part}", split={"max_parts": 3})
         self.tick()
         cq.cmd_apply(self.ctx, {"plan": {"start": [{"job": a, "where": "host", "slots": 1, "parts": 3}]}})
-        cq.cmd_cancel(self.ctx, {"job": a})
+        self.cancel(a)
         children = self.job(a)['children']
         self.assertTrue(all(self.job(c)['cancel_requested'] for c in children))
         self.assertEqual({self.job(c)['status'] for c in children}, {'running'})
@@ -2714,7 +2764,7 @@ class DispatchTests(Base):
 
     def test_an_explicit_cancel_is_not_announced_back(self):
         a = self.submit()
-        cq.cmd_cancel(self.ctx, {"job": a})
+        self.cancel(a)
         self.assertEqual(self.tick()["watch"]["to_notify"], [])
 
 
@@ -3087,7 +3137,7 @@ class FixBatchTests(Base):
 
         def export_then_cancel(top, sha, dest):
             r = real_export(top, sha, dest)
-            cq.cmd_cancel(self.ctx, {"job": a})  # the cancel arrives while the tree is exported
+            self.cancel(a)  # the cancel arrives while the tree is exported
             return r
 
         with mock.patch.object(cq, "checkout_tree", export_then_cancel), \
@@ -3257,8 +3307,9 @@ class RobustnessTests(Base):
         self.assertTrue(s["ok"])
         st = run("status", {})
         self.assertEqual([q["id"] for q in st["queue"]], [s["job"]])
-        self.assertTrue(run("cancel", {"job": s["job"]})["ok"])
-        self.assertFalse(run("submit", {"command": "echo {part}", "root": self.repo})["ok"])
+        self.assertFalse(run("cancel", {"job": s["job"]})["ok"])  # a bare job id names no worktree or owner
+        self.assertTrue(run("cancel", {"job": s["job"], "root": self.repo, "session": "sess-A"})["ok"])
+        self.assertFalse(run("submit", {"command": "echo {part}", "root": self.repo, "session": "sess-A"})["ok"])
         self.assertFalse(run("nonsense", {})["ok"])
 
     def test_wait_returns_the_job_when_it_ends_or_at_the_timeout(self):
@@ -3549,10 +3600,10 @@ class StatusTests(Base):
 
     def test_the_submit_note_gets_the_hint_only_when_one_applies(self):
         jid = self.submit()
-        note = cq.cmd_submit(self.ctx, {"command": "echo x", "root": self.repo})["note"]
+        note = cq.cmd_submit(self.ctx, {"command": "echo x", "root": self.repo, "session": "sess-A"})["note"]
         self.assertEqual(note, f"queued at position 2 of 2; at {self.job(jid)['sha'][:12]}")
         self.history([self.hrow(2.0, 10)] * 8)
-        note = cq.cmd_submit(self.ctx, {"command": "echo y", "root": self.repo, "est_minutes": 10})["note"]
+        note = cq.cmd_submit(self.ctx, {"command": "echo y", "root": self.repo, "session": "sess-A", "est_minutes": 10})["note"]
         self.assertTrue(note.endswith("; history: lane_x jobs ran a median 0.20x of their declared estimate (n=8), you declared 10 min"), note)
 
     def test_a_job_behind_a_head_that_takes_the_free_slots_does_not_say_fits_now(self):
@@ -3629,14 +3680,14 @@ class StatusTests(Base):
         plain = self.submit("go test ./...", est_minutes=40)
         self.assertNotIn("est_sched", self.job(plain))
         self.history([self.crow(5.0, 10)] * 3)
-        res = cq.cmd_submit(self.ctx, {"command": "go test ./...", "root": self.repo, "est_minutes": 40})
+        res = cq.cmd_submit(self.ctx, {"command": "go test ./...", "root": self.repo, "session": "sess-A", "est_minutes": 40})
         job = self.job(res["job"])
         self.assertEqual((job["est_minutes"], job["est_sched"]), (40, 20))
         self.assertIn("; ordered as 20 min: the last 3 runs of this command in lane_x took a median 0.50x of their estimates", res["note"])
         self.assertNotIn("clamped", res["note"])
         self.assertEqual(cq.job_summary(job, self.clock[0])["est_sched"], 20)
         self.history([self.crow(0.1, 10)] * 8)
-        note = cq.cmd_submit(self.ctx, {"command": "go test ./...", "root": self.repo, "est_minutes": 40})["note"]
+        note = cq.cmd_submit(self.ctx, {"command": "go test ./...", "root": self.repo, "session": "sess-A", "est_minutes": 40})["note"]
         self.assertIn("took a median 0.01x of their estimates (scale clamped to 0.25x)", note)
 
     def test_finish_records_the_cmd_key_that_calibration_reads(self):
@@ -3676,7 +3727,7 @@ class StatusTests(Base):
 
     def test_an_estimate_hint_that_raises_leaves_the_submit_note_intact(self):
         with mock.patch.object(cq, "est_hint", side_effect=RuntimeError("bad history")):
-            r = cq.cmd_submit(self.ctx, {"command": "echo x", "root": self.repo})
+            r = cq.cmd_submit(self.ctx, {"command": "echo x", "root": self.repo, "session": "sess-A"})
         self.assertTrue(r["ok"])
         self.assertTrue(r["note"].startswith("queued at position 1 of 1; at "), r["note"])
         self.assertEqual(self.job(r["job"])["status"], "queued")
@@ -3730,8 +3781,8 @@ class StatusTests(Base):
     def test_the_submit_note_gives_no_kind_hint_to_a_laptop_job(self):
         self.history([self.krow(0.5)] * 8)  # host runs of this kind used half a core, so 1 slot (1.5 vCPU) is over-reserved
         with mock.patch.object(cq, "SLOT_VCPU", 1.5):
-            host = cq.cmd_submit(self.ctx, {"command": "go test ./pkg", "root": self.repo, "slots": 1, "est_minutes": 10})
-            laptop = cq.cmd_submit(self.ctx, {"command": "go test ./pkg", "root": self.repo, "slots": 1, "where": "laptop",
+            host = cq.cmd_submit(self.ctx, {"command": "go test ./pkg", "root": self.repo, "session": "sess-A", "slots": 1, "est_minutes": 10})
+            laptop = cq.cmd_submit(self.ctx, {"command": "go test ./pkg", "root": self.repo, "session": "sess-A", "slots": 1, "where": "laptop",
                                               "est_minutes": 10})
         self.assertIn("; history: 8 recent 'go test' runs used p75 0.5 cores", host["note"])
         self.assertNotIn("history:", laptop["note"])
@@ -3740,10 +3791,10 @@ class StatusTests(Base):
         self.history([self.krow(1.0)] * 8, raw=["{not json", "[1, 2]", json.dumps(self.krow("x")), json.dumps(self.krow(0)),
                                                 '{"kind": "go test", "where": "host", "status": "done", "cores": NaN}'])
         with mock.patch.object(cq, "SLOT_VCPU", 1.5):
-            r = cq.cmd_submit(self.ctx, {"command": "go test ./pkg", "root": self.repo, "slots": 4, "est_minutes": 10})
+            r = cq.cmd_submit(self.ctx, {"command": "go test ./pkg", "root": self.repo, "session": "sess-A", "slots": 4, "est_minutes": 10})
         self.assertTrue(r["note"].endswith("; history: 8 recent 'go test' runs used p75 1.0 cores, you reserved 4 slots (~6 vCPU): about 1 slots fits"), r["note"])
         with mock.patch.object(cq, "kind_hint", side_effect=RuntimeError("bad history")):
-            r = cq.cmd_submit(self.ctx, {"command": "go test ./pkg", "root": self.repo, "slots": 4, "est_minutes": 10})
+            r = cq.cmd_submit(self.ctx, {"command": "go test ./pkg", "root": self.repo, "session": "sess-A", "slots": 4, "est_minutes": 10})
         self.assertTrue(r["ok"])
         self.assertTrue(r["note"].startswith("queued at position 2 of 2; at "), r["note"])
 

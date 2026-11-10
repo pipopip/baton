@@ -106,11 +106,13 @@ class HostStopTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             ssh = mock.Mock(return_value=(255, '', 'unavailable'))
             ctx = cq.Ctx(state=os.path.join(root, 'state'), now=lambda: 2000, ssh=ssh)
+            os.makedirs(os.path.join(root, '.git'))  # a worktree marker: the cancel names its root and owner session
+            cq.write_json(os.path.join(root, '.baton', 'owner.json'), {'vendor': 'claude', 'session_id': 'sess-A'})
             job = {'id': 'cq-fixture', 'status': 'running', 'placed_where': 'host',
-                   'top': root, 'slots': 2}
+                   'top': root, 'slots': 2, 'worktree_identity': cq.worktree_identity(root)}
             cq.save_job(ctx, job)
             with mock.patch.object(cq, 'drop_ref') as drop:
-                result = cq.cmd_cancel(ctx, {'job': job['id']})
+                result = cq.cmd_cancel(ctx, {'job': job['id'], 'root': root, 'session': 'sess-A'})
                 drop.assert_not_called()
             self.assertEqual(result['status'], 'running')
             self.assertTrue(cq.load_job(ctx, job['id'])['cancel_requested'])

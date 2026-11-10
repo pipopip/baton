@@ -44,7 +44,8 @@ class FleetContractTests(unittest.TestCase):
         with patch.object(cq, 'real_ssh') as ssh, patch.object(fleet_queue, 'ensure_controller') as wake:
             result = cq.execute(self.ctx, 'status', {'view': 'fleet'})
         self.assertTrue(result['ok'])
-        self.assertIn('CQ ', result['fleet']['line'])
+        # nothing has been probed in this fixture: the line says so instead of showing empty numbers
+        self.assertEqual(result['fleet']['line'], 'no capacity data · idle')
         ssh.assert_not_called()
         wake.assert_not_called()
 

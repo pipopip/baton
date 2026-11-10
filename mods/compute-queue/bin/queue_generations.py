@@ -156,6 +156,11 @@ def _merge_watch(primary, secondary):
     for key in ('mine_running', 'mine_queued', 'mine_unverified', 'queued'):
         watch[key] = watch.get(key, 0) + other.get(key, 0)
     watch['to_notify'] = list(watch.get('to_notify') or []) + list(other.get('to_notify') or [])
+    mine = dict(watch.get('mine_attention') or {})
+    for key, value in (other.get('mine_attention') or {}).items():
+        mine[key] = mine.get(key, 0) + value
+    if mine:
+        watch['mine_attention'] = mine
     primary['watch'] = watch
 
 
@@ -173,6 +178,9 @@ def _apply_v2(engine, ctx, req, result, leaf):
 
 
 def execute(engine, ctx, command, request, leaf):
+    # One refusal for every route (single host, shard, generation, fleet): who submits or cancels is always named.
+    if command in ('submit', 'cancel'):
+        engine.require_request_identity(request, 'submission' if command == 'submit' else 'cancellation')
     # Internal detached controllers are already pinned to their generation.
     if queue_paths.is_generation2(ctx.state):
         return leaf(ctx, command, request)
@@ -239,5 +247,14 @@ def execute(engine, ctx, command, request, leaf):
             primary[key] = list(primary.get(key) or []) + list(secondary.get(key) or [])
     elif command in ('watch', 'tick'):
         _merge_watch(primary, secondary)
+    if command in ('watch', 'tick', 'status') and ('fleet' in primary or 'fleet' in secondary):
+        # The primary result carries the older generation's snapshot alone: its capacity cache is no longer written
+        # once generation two runs, so a status line read from it showed a stale, unchanging fleet. One view of both.
+        # The tick also schedules the queue and delivers notices: a snapshot that cannot be built must not fail it.
+        try:
+            import fleet_telemetry
+            primary['fleet'] = fleet_telemetry.summarize_generations(queue_paths.config_state(ctx.state), ctx.now())
+        except Exception as exc:
+            primary['fleet_warning'] = 'combined fleet snapshot unavailable: ' + type(exc).__name__
     primary['generations'] = {'v2': {k: secondary[k] for k in ('capacity', 'summary', 'fleet', 'per_host', 'apply') if k in secondary}}
     return primary

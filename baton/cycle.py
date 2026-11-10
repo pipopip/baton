@@ -934,8 +934,11 @@ def run_cycle(root: Path, old_session: str, old_pid: int | None, tokens: int, tr
     if ws.lower() != lead.lower():
         summary = (f"{ws} cycled by the baton cycle hook at {tokens} tokens: session {harvest.id8(old_session)} -> "
                    f"{harvest.id8(new_session)} (same name, resumes from now.md).")
-        rc, out = _workflow("notify", "--sender", ws, "--recipient", lead, "--commit", _head(root), "--node", "baton_cycle",
-                            "--kind", "info", "--update-key", f"cycle-{new_session[:8]}", "--summary", summary)
+        # session-workflow binds a sender to its registered session: the notice is sent as the new session, which is
+        # registered for this workstream by now, and named explicitly because this process has no session environment.
+        rc, out = _workflow("notify", "--sender", ws, "--thread", new_session, "--recipient", lead, "--commit", _head(root),
+                            "--node", "baton_cycle", "--kind", "info", "--update-key", f"cycle-{new_session[:8]}",
+                            "--summary", summary)
         echo(f"[cycle] notify {lead}: rc={rc} {out[:200]}")
     return 0
 

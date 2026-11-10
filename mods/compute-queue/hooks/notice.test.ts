@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { alertText, cutTail, MAX_LINE, MAX_NOTICE_LINES, noticeText, statusLine, statusText } from './notice'
+import { alertText, cutTail, fleetStatusLine, MAX_LINE, MAX_NOTICE_LINES, noticeText, statusLine, statusText } from './notice'
 import type { NoticeJob } from './notice'
 import type { Capacity } from './plan'
 
@@ -140,15 +140,39 @@ describe('the lead alert and the status line', () => {
     laptop: { heavy_busy: busy, free_ram_gb: 12 },
   })
 
-  test('cq · host held/4 · laptop free|busy · queued n · mine running/queued', () => {
+  test('device used/total · laptop free|busy · n queued · mine running/queued', () => {
     const w = { mine_running: 2, mine_queued: 1, queued: 5 }
-    expect(statusLine(cap(), w, 1_000_000)).toBe('cq · host 2/4 · laptop free · queued 5 · mine 2/1')
+    expect(statusLine(cap(), w, 1_000_000)).toBe('ember 2/4 · laptop free · 5 queued · mine 2/1')
     expect(statusLine(cap({}, true), w, 1_000_000)).toContain('laptop busy')
-    expect(statusLine(cap({ up: false }), w, 1_000_000)).toContain('host down')
-    expect(statusLine(cap({ paused: true }), w, 1_000_000)).toContain('host paused')
-    expect(statusLine(cap({ paused: true, pause: 'host.conf.json' }), w, 1_000_000)).toContain('host paused (host.conf.json)')
-    expect(statusLine(cap(), w, 1_000_000 + 200_000)).toContain('host ?') // the leader has not written for 90 s
+    expect(statusLine(cap({ up: false }), w, 1_000_000)).toContain('ember DOWN')
+    expect(statusLine(cap({ paused: true }), w, 1_000_000)).toContain('ember PAUSED')
+    expect(statusLine(cap({ paused: true, pause: 'host.conf.json' }), w, 1_000_000)).toContain('ember PAUSED (host.conf.json)')
+    expect(statusLine(cap(), w, 1_000_000 + 200_000)).toContain('ember STALE') // the leader has not written for 90 s
     expect(statusLine(null, w, 1)).toBe('cq · waiting for the leader')
+  })
+
+  test("this session's finished jobs that need attention are named, and only until they are delivered", () => {
+    const w = { mine_running: 0, mine_queued: 0, queued: 0, mine_attention: { failed: 1, missing: 2 } }
+    expect(statusLine(cap(), w, 1_000_000)).toContain('mine 0/0 · needs you: 1 failed, 2 missing artifacts')
+    expect(statusLine(cap(), { ...w, mine_attention: { failed: 0, missing: 0 } }, 1_000_000)).not.toContain('needs you')
+    expect(statusLine(cap(), { ...w, mine_attention: undefined }, 1_000_000)).not.toContain('needs you')
+  })
+
+  test("the fleet line gets this session's part; a missing or empty line gives nothing to show", () => {
+    const w = { mine_running: 1, mine_queued: 0, queued: 3 }
+    const line = 'ember 10/14 · hestia 1/6 legacy busy · 5 running · 8 queued · 4 worktrees'
+    const long = 'ember 10/14 · hestia 1/6 legacy busy · laptop 0/4 RAM floor · 5 running · 8 queued · 4 worktrees'
+    expect(fleetStatusLine({ line }, w)).toBe(`${line} · mine 1/0`)
+    expect(fleetStatusLine({ line }, null)).toBe(`${line} · mine 0/0`)
+    expect(fleetStatusLine({ line }, { ...w, mine_attention: { failed: 1 } }, ['ember DISPATCH PAUSED'])).toBe(
+      'ember 10/14 · hestia 1/6 legacy busy · 5 run · 8 queued · 4 wt · mine 1/0 · needs you: 1 failed · ember DISPATCH PAUSED')
+    // past 100 characters the long words are shortened, nothing else is dropped
+    expect(fleetStatusLine({ line: long }, { ...w, mine_running: 12, mine_queued: 10 })).toBe(
+      'ember 10/14 · hestia 1/6 legacy busy · laptop 0/4 RAM floor · 5 run · 8 queued · 4 wt · mine 12/10')
+    expect(fleetStatusLine(undefined, w)).toBeNull()
+    expect(fleetStatusLine({ line: '' }, w)).toBeNull()
+    expect(fleetStatusLine({ line: 42 }, w)).toBeNull()
+    expect(fleetStatusLine({ line: 'a\nb' }, w)).toBe('a b · mine 1/0')
   })
 
   test('/cq text lists the queue and the leader', () => {
@@ -167,13 +191,13 @@ describe('the lead alert and the status line', () => {
   test('explicit remote capacity is visible without replacing the primary queue', () => {
     const capacity = cap()
     capacity.hosts = { hearth: { ...capacity.host, held: 3, total: 8, sample_at: 1000 } }
-    expect(statusLine(capacity, null, 1_000_000)).toContain('host 2/4 · hearth 3/8')
-    expect(statusLine(capacity, null, 1_200_000)).toContain('hearth ?')
+    expect(statusLine(capacity, null, 1_000_000)).toContain('ember 2/4 · hearth 3/8')
+    expect(statusLine(capacity, null, 1_200_000)).toContain('hearth STALE')
   })
   test('a renamed host displays its name while retaining the queue identity', () => {
     const capacity = cap()
     capacity.hosts = { hearth: { ...capacity.host, name: 'hestia', held: 3, total: 8, sample_at: 1000 } }
     expect(statusLine(capacity, null, 1_000_000)).toContain('hestia 3/8')
-    expect(statusLine(capacity, null, 1_200_000)).toContain('hestia ?')
+    expect(statusLine(capacity, null, 1_200_000)).toContain('hestia STALE')
   })
 })

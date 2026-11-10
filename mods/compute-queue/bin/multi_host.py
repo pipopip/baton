@@ -162,6 +162,8 @@ def execute(engine, ctx, command, req, leaf_execute):
     aliases = {}
     registry = _registry(engine, ctx, aliases)
     req = dict(req)
+    if command in ('submit', 'cancel'):
+        engine.require_request_identity(req, 'submission' if command == 'submit' else 'cancellation')
     if isinstance(req.get('host_id'), str):
         req['host_id'] = aliases.get(req['host_id'], req['host_id'])
     if command == 'notified' and req.get('job') and not req.get('ids'):

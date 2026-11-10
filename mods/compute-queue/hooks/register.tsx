@@ -3,7 +3,7 @@ import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import { computeAllowed, suggestRule } from './allow'
 import { classifyBash } from './classify'
-import { alertText, noticeText, statusLine, statusText } from './notice'
+import { alertText, fleetStatusLine, noticeText, statusLine, statusText } from './notice'
 import type { Alert, NoticeJob } from './notice'
 import { buildRequest, gate, parseReply, snapshotKey } from './plan'
 import type { Capacity, LeaderMemory, Median, Plan, QueuedJob, RunningJob } from './plan'
@@ -24,7 +24,8 @@ type Tick = Reply & {
   can_start?: boolean
   alert?: Alert | null
   per_host?: Record<string, Tick>
-  watch?: { mine_running: number; mine_queued: number; queued: number; to_notify: NoticeJob[]; top?: string }
+  watch?: { mine_running: number; mine_queued: number; queued: number; to_notify: NoticeJob[]; top?: string; mine_attention?: { failed?: number; missing?: number } }
+  fleet?: { line?: unknown }
 }
 
 // Per-process state. A hot reload runs register again and starts these over; the queue itself lives in cq.py's state dir.
@@ -251,7 +252,10 @@ async function tick($: EngineInterface) {
         if (remote.alert) notifyAlert($, { ...remote.alert, host_id })
       }
     }
-    $.ui.status(t.fleet?.line ? `${String(t.fleet.line)} · mine ${w?.mine_running ?? 0}/${w?.mine_queued ?? 0}` : statusLine(t.capacity, w, await $.clock.now()))
+    // an unacknowledged disk alert pauses dispatch on its host: the one fleet-wide condition the snapshot cannot show
+    const paused = [t.alert ? (t.alert.host_id ?? 'ember') : '', ...Object.entries(t.per_host ?? {}).map(([id, r]) => (r.alert ? id : ''))].filter(id => id !== '')
+    const alerts = [...new Set(paused)].map(id => `${id} DISPATCH PAUSED`)
+    $.ui.status(fleetStatusLine(t.fleet, w, alerts) ?? statusLine(t.capacity, w, await $.clock.now(), alerts))
   } finally {
     S.busy = false
   }

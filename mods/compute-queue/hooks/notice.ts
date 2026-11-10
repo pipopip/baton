@@ -145,19 +145,45 @@ export function alertText(a: Alert): string {
   return `[compute-queue] ${a.host_id ?? 'host'} dispatch paused: ${a.msg} (job ${a.job ?? '?'}, ${a.at}). Free disk in the build user's home on that host, then dispatch resumes on its own at the next probe.`
 }
 
-export type WatchCounts = { mine_running: number; mine_queued: number; queued: number }
+export type WatchCounts = {
+  mine_running: number
+  mine_queued: number
+  queued: number
+  // this worktree's finished jobs that still wait for their notice and failed or lack artifacts (not a lifetime total)
+  mine_attention?: { failed?: number; missing?: number }
+}
 
-export function statusLine(cap: Capacity | null | undefined, w: WatchCounts | null | undefined, now: number): string {
+// What this session itself has to look at, and a pause of dispatch: the parts of the line somebody can act on.
+// Uppercase words are the ones to act on (a host down, stale or paused, dispatch paused); the rest is information.
+function mineText(w: WatchCounts | null | undefined, alerts: readonly string[] = []): string {
+  const parts = [`mine ${w?.mine_running ?? 0}/${w?.mine_queued ?? 0}`]
+  const need: string[] = []
+  if (w?.mine_attention?.failed) need.push(`${w.mine_attention.failed} failed`)
+  if (w?.mine_attention?.missing) need.push(`${w.mine_attention.missing} missing artifacts`)
+  if (need.length > 0) parts.push(`needs you: ${need.join(', ')}`)
+  for (const a of alerts) parts.push(a)
+  return parts.join(' · ')
+}
+
+const STATUS_WIDTH = 100
+
+// The line from the fleet snapshot (devices and live job counts, built by fleet_telemetry) with this session's part.
+export function fleetStatusLine(fleet: { line?: unknown } | null | undefined, w: WatchCounts | null | undefined, alerts: readonly string[] = []): string | null {
+  const line = typeof fleet?.line === 'string' ? fleet.line.replace(CONTROL, ' ').trim().slice(0, 400) : ''
+  if (line === '') return null
+  const full = `${line} · ${mineText(w, alerts)}`
+  // over a status bar's width: the long words give way (the counts stay)
+  return full.length > STATUS_WIDTH ? full.replace(' running', ' run').replace(/ worktrees?/, ' wt') : full
+}
+
+// The same wording for a queue that has no fleet snapshot (one host, one laptop).
+export function statusLine(cap: Capacity | null | undefined, w: WatchCounts | null | undefined, now: number, alerts: readonly string[] = []): string {
   if (!cap || !cap.host) return 'cq · waiting for the leader'
-  const stale = cap.at !== undefined && now / 1000 - cap.at > 90
-  const h = cap.host
-  const host = stale ? 'host ?' : !h.up ? 'host down' : h.paused ? (h.pause === 'host.conf.json' ? 'host paused (host.conf.json)' : 'host paused') : `host ${h.held}/${h.total}`
+  const device = (name: string, h: Capacity['host'], sampleAt: number | undefined) =>
+    (sampleAt !== undefined ? now / 1000 - sampleAt > 90 : false) ? `${name} STALE` :
+      !h.up ? `${name} DOWN` : h.paused ? `${name} PAUSED${h.pause === 'host.conf.json' ? ' (host.conf.json)' : ''}` : `${name} ${h.held}/${h.total}`
+  const host = device(cap.host.name || 'ember', cap.host, cap.at)
+  const extra = Object.entries(cap.hosts ?? {}).map(([id, remote]) => device(remote.name || id, remote, remote.sample_at))
   const laptop = cap.laptop.heavy_busy ? 'busy' : 'free'
-  const mine = w ? `${w.mine_running}/${w.mine_queued}` : '0/0'
-  const extra = Object.entries(cap.hosts ?? {}).map(([id, remote]) => {
-    const name = remote.name || id
-    return remote.sample_at !== undefined && now / 1000 - remote.sample_at > 90 ? `${name} ?` :
-      !remote.up ? `${name} down` : remote.paused ? `${name} paused` : `${name} ${remote.held}/${remote.total}`
-  })
-  return `cq · ${[host, ...extra].join(' · ')} · laptop ${laptop} · queued ${w?.queued ?? 0} · mine ${mine}`
+  return [host, ...extra, `laptop ${laptop}`, `${w?.queued ?? 0} queued`, mineText(w, alerts)].join(' · ')
 }

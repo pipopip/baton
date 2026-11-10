@@ -397,6 +397,13 @@ def require_worktree_owner(top, session):
         raise CqError("operation requires the current worktree owner session")
 
 
+def require_request_identity(req, action):
+    """A submission or cancellation always names the worktree root and the owner session; the engine then verifies both."""
+    missing = [name for name in ("root", "session") if not isinstance(req.get(name), str) or not req.get(name)]
+    if missing:
+        raise CqError(f"{action} requires {' and '.join(missing)}: the current worktree root and owner session")
+
+
 def owner_lock(top):
     """Baton's persistent owner.lock; acquire before queue.lock, never in reverse."""
     return FileLock(os.path.join(top, ".baton", "owner.lock"), 2.0)
@@ -1163,6 +1170,7 @@ def cmd_submit(ctx, req):
     command = req.get("command")
     if not isinstance(command, str) or not command.strip():
         raise CqError("command is required")
+    require_request_identity(req, "submission")
     root = req.get("root")
     if not root or not os.path.isdir(root):
         raise CqError(f"root {root!r} is not a directory")
@@ -1252,8 +1260,7 @@ def cmd_submit(ctx, req):
     identity = worktree_identity(top)
     if identity is None:
         raise CqError("cannot identify the submitting worktree")
-    if "session" in req:
-        require_worktree_owner(top, req["session"])
+    require_worktree_owner(top, req["session"])
     now = ctx.now()
     job_id = new_id(now, ctx.host_id) if ctx.host_id else new_id(now)
     if load_job(ctx, job_id):
@@ -1279,11 +1286,10 @@ def cmd_submit(ctx, req):
         job["est_sched"] = max(1, round(est * cal[0]))
     receipt_file = None
     try:
-        with (owner_lock(top) if "session" in req else contextlib.nullcontext()), ctx.qlock():
+        with owner_lock(top), ctx.qlock():
             if identity != worktree_identity(top):
                 raise CqError("submitting worktree changed before acceptance")
-            if "session" in req:
-                require_worktree_owner(top, req["session"])
+            require_worktree_owner(top, req["session"])
             # Clock ties are common in concurrent sessions and deterministic tests.
             sequence_path = ctx.p("queue-sequence.json")
             if load_job(ctx, job_id):
@@ -1502,22 +1508,21 @@ def read_pid(path):
 
 def cmd_cancel(ctx, req):
     job_id = req.get("job", "")
-    agent_request = "root" in req or "session" in req
-    root, session = req.get("root"), req.get("session")
-    if agent_request and (not isinstance(root, str) or not os.path.isdir(root)):
+    require_request_identity(req, "cancellation")
+    root, session = req["root"], req["session"]
+    if not os.path.isdir(root):
         raise CqError("cancellation requires the current worktree root and owner session")
-    top = _top_of(root) if agent_request else None
-    with (owner_lock(top) if agent_request else contextlib.nullcontext()), ctx.qlock():
+    top = _top_of(root)
+    with owner_lock(top), ctx.qlock():
         job = load_job(ctx, job_id)
         if not job:
             raise CqError(f"no such job {job_id!r}")
-        if agent_request:
-            if not same_path(os.path.realpath(top), os.path.realpath(job.get("top") or "")):
-                raise CqError("cancellation worktree does not match the job")
-            identity = worktree_identity(top)
-            if identity is None or job.get("worktree_identity") is None or identity != job["worktree_identity"]:
-                raise CqError("cancellation worktree identity changed or is unavailable")
-            require_worktree_owner(top, session)
+        if not same_path(os.path.realpath(top), os.path.realpath(job.get("top") or "")):
+            raise CqError("cancellation worktree does not match the job")
+        identity = worktree_identity(top)
+        if identity is None or job.get("worktree_identity") is None or identity != job["worktree_identity"]:
+            raise CqError("cancellation worktree identity changed or is unavailable")
+        require_worktree_owner(top, session)
         if job["status"] in TERMINAL:
             return {"ok": True, "job": job_id, "status": job["status"], "note": "already finished"}
         targets = [job]
@@ -4398,6 +4403,14 @@ def notice_owner_matches(top, session, vendor="claude"):
     return isinstance(owner, dict) and owner.get("vendor") == vendor and owner.get("session_id") == session
 
 
+def attention_counts(jobs):
+    """Finished jobs of one worktree that still wait for their notice and went wrong: failed or timed out, or done
+    with missing artifacts. A delivered notice clears them; nothing here is a lifetime total."""
+    failed = sum(1 for j in jobs if j.get("status") in ("failed", "timeout"))
+    missing = sum(1 for j in jobs if j.get("status") not in ("failed", "timeout") and j.get("artifact_missing"))
+    return {"failed": failed, "missing": missing}
+
+
 def watch(ctx, root, now, session=""):
     """What one session sees: its own jobs' counts and the unnotified finished ones; the queue totals."""
     top = _top_of(root) if root and os.path.isdir(root) else root
@@ -4409,16 +4422,17 @@ def watch(ctx, root, now, session=""):
     uncertain = [j for j in jobs if not j.get("parent") and identity is not None and
                  j.get("worktree_identity") is None and j.get("session") != session and
                  same_path(j.get("top", ""), top) and j.get("status") in ("running", "launching", "queued")]
-    done = [notice_data(j) for j in mine if j.get("status") in TERMINAL and j.get("notify", True) and not j.get("notified")]
+    pending = [j for j in mine if j.get("status") in TERMINAL and j.get("notify", True) and not j.get("notified")]
+    done = [notice_data(j) for j in pending]
     # A predecessor's timer can finish a tick during any handoff, including
     # Claude-to-Claude. Never offer its result to a non-owner or unknown owner.
     if not notice_owner_matches(top, session):
-        done = []
+        done, pending = [], []
     queued = [j for j in jobs if j.get("status") == "queued" and not j.get("parent")]
     return {"mine_running": sum(1 for j in mine + uncertain if j["status"] in ("running", "launching")),
             "mine_queued": sum(1 for j in mine + uncertain if j["status"] == "queued"),
             "mine_unverified": len(uncertain),
-            "queued": len(queued), "to_notify": done, "top": top}
+            "queued": len(queued), "to_notify": done, "top": top, "mine_attention": attention_counts(pending)}
 
 
 def cmd_watch(ctx, req):

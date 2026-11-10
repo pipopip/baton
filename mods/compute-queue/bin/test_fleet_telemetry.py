@@ -36,7 +36,8 @@ class FleetTelemetryTests(unittest.TestCase):
         self.job('c', status='failed', t_finished=self.now-10, reason='out of memory', artifact_missing=True)
         self.job('d', status='failed', t_finished=self.now-86401, reason='OOM')
         summary = ft.summarize(self.state, now=self.now)
-        self.assertTrue(summary['line'].startswith('CQ L1/4 H0/8 E17/16 · q1'))
+        # the old line was 'CQ L1/4 H0/8 E17/16 · q1 · <lifetime alerts>'; the new one is device names, live work, nothing lifetime
+        self.assertEqual(summary['line'], 'ember 17/16 · hearth STALE · laptop 1/4 · 1 running · 1 queued')
         self.assertEqual(summary['alerts'], {'stale': 1, 'down': 1, 'overrun': 2, 'queue_delay': 1,
                          'uncertain': 1, 'cancel_pending': 1, 'artifact_missing': 1, 'failure': 1, 'oom': 1})
         self.assertNotIn('secret', json.dumps(summary))
@@ -47,7 +48,7 @@ class FleetTelemetryTests(unittest.TestCase):
             'at': self.now, 'up': True, 'name': 'Desk\nRemote', 'slots_used': 1, 'slots_total': 5}}}), encoding='utf-8')
         result = ft.summarize(self.state, self.now)
         self.assertEqual(result['devices']['zephyr']['name'], 'Desk Remote')
-        self.assertIn('zephyr:1/5', result['line'])
+        self.assertIn('Desk Remote 1/5', result['line'])
 
     def test_generation_summary_preserves_active_legacy_and_shared_capacity(self):
         legacy = self.state / 'fleet'
@@ -67,7 +68,7 @@ class FleetTelemetryTests(unittest.TestCase):
         self.assertEqual(summary['counts']['running'], 2)
         self.assertEqual(summary['devices']['ember']['slots_total'], 8)
         self.assertEqual(summary['devices']['ember']['slots_used'], 5)
-        self.assertIn('E5/8', summary['line'])
+        self.assertIn('ember 5/8', summary['line'])
         for root in (legacy, current):
             cap = json.loads((root / 'capacity.json').read_text(encoding='utf-8'))
             cap['devices']['ember']['at'] = self.now - 301
@@ -90,7 +91,7 @@ class FleetTelemetryTests(unittest.TestCase):
         job('night2', status='launching', host_id='ember', slots=4, deferred_registered=True, deferred_phase='queued')
         summary = ft.summarize_generations(self.state, self.now)
         self.assertEqual(summary['devices']['ember']['slots_used'], 12)
-        self.assertIn('E12/14', summary['line'])
+        self.assertIn('ember 12/14', summary['line'])
         self.assertNotIn('overrun', summary['alerts'])
         # an unconfirmed staging, and a deferred job that has started, still count
         job('staging', status='launching', host_id='ember', slots=2, deferred_registered=False, deferred_phase='staging_pending')
@@ -109,7 +110,7 @@ class FleetTelemetryTests(unittest.TestCase):
         self.assertTrue(result['truncated'])
         self.assertEqual(result['counts']['queued'], 0)
         self.assertEqual(result['alerts']['stale'], 3)
-        self.assertIn('L?/?', result['line'])
+        self.assertIn('no capacity data', result['line'])
 
     def test_events_are_allowlisted_bounded_and_rotated(self):
         event = {'type': 'started', 'id': 'cq-1', 'at': 10, 'command': 'secret', 'reason': 'secret', 'slots': 1}
@@ -149,6 +150,155 @@ class FleetTelemetryTests(unittest.TestCase):
         self.assertEqual(ft.estimate_memory([base], 'p', 'c', 'linux', 'hearth', 2, 8)['memory_gb'], 8)
         self.assertEqual(ft.estimate_memory([], *args)['memory_gb'], 1)
         self.assertEqual(ft.estimate_memory([base], None, 'c', 'linux', 'hearth', 2, 1)['method'], 'default')
+
+
+class StatusLineTests(unittest.TestCase):
+    """The status line: devices with a reason when they cannot take work, live work by worktree, current attention only."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = Path(self.tmp.name)
+        (self.state / 'jobs').mkdir()
+        self.now = 1700000000
+
+    def capacity(self, **devices):
+        base = {'at': self.now, 'up': True, 'eligible': True, 'slots_used': 0, 'slots_total': 4, 'reason': ''}
+        (self.state / 'capacity.json').write_text(json.dumps({'at': self.now, 'devices': {
+            host: {**base, **values} for host, values in devices.items()}}), encoding='utf-8')
+
+    def job(self, name, **values):
+        (self.state / 'jobs' / (name + '.json')).write_text(json.dumps(values), encoding='utf-8')
+
+    def line(self):
+        return ft.summarize(self.state, self.now)['line']
+
+    def test_busy_idle_ineligible_and_stale_devices_read_in_words(self):
+        self.capacity(
+            ember={'name': 'ember', 'slots_used': 10, 'slots_total': 14},
+            hearth={'name': 'hestia', 'slots_used': 1, 'slots_total': 6, 'eligible': False, 'reason': 'legacy work active or waiting'},
+            laptop={'name': 'laptop', 'slots_total': 4, 'eligible': False, 'reason': 'physical or commit RAM floor'})
+        self.assertEqual(self.line(), 'ember 10/14 · hestia 1/6 legacy busy · laptop 0/4 RAM floor · idle')
+        # a device that is only full, or idle and fine, shows its numbers and nothing else
+        self.capacity(ember={'slots_used': 14, 'slots_total': 14, 'eligible': False, 'reason': 'CPU slots unavailable'},
+                      laptop={'slots_used': 0})
+        self.assertEqual(self.line(), 'ember 14/14 · laptop 0/4 · idle')
+        # down, paused and stale are the words that ask for action
+        self.capacity(ember={'up': False}, hearth={'eligible': False, 'reason': 'host paused'},
+                      laptop={'at': self.now - 400})
+        summary = ft.summarize(self.state, self.now)
+        self.assertEqual(summary['line'], 'ember DOWN · hearth 0/4 PAUSED · laptop STALE · idle')
+        self.assertEqual(summary['attention'], ['ember down', 'hearth paused', 'laptop stale'])
+        self.capacity(ember={'eligible': False, 'reason': 'host load cap'}, laptop={'eligible': False, 'reason': 'RAM floor'})
+        self.assertEqual(self.line(), 'ember 0/4 load cap · laptop 0/4 RAM floor · idle')
+
+    def test_running_and_queued_with_distinct_worktrees_from_live_job_records(self):
+        self.capacity(ember={'slots_used': 3, 'slots_total': 14})
+        base = 'C:/Work/r/.claude/worktrees/'
+        self.job('a', status='running', top=base + 'one', session='s1')
+        self.job('b', status='running', top=base + 'one', session='s1')
+        self.job('c', status='queued', top=base + 'Two', session='s2')
+        self.job('d', status='queued', top=(base + 'two').replace('/', chr(92)), session='s3')  # the same worktree, spelled differently
+        self.job('e', status='launching', top=base + 'three', session='s4', deferred_registered=True, deferred_phase='queued')
+        self.job('f', status='done', top=base + 'four', session='s5', t_finished=self.now - 5)  # finished work is not live
+        summary = ft.summarize(self.state, self.now)
+        self.assertEqual(summary['line'], 'ember 3/14 · 2 running · 3 queued · 3 worktrees')
+        self.assertEqual(summary['activity'], {'running': 2, 'waiting': 3, 'worktrees': 3, 'sessions': 4})
+        # a fleet job keeps the status 'launching' for its whole run: once its host reports it running, it is running
+        self.job('e', status='launching', top=base + 'three', session='s4', deferred_registered=True, deferred_phase='running')
+        started = ft.summarize(self.state, self.now)
+        self.assertEqual(started['line'], 'ember 3/14 · 3 running · 2 queued · 3 worktrees')
+        self.assertEqual((started['activity']['running'], started['activity']['waiting'], started['counts']['launching']), (3, 2, 1))
+        self.job('e', status='launching', top=base + 'three', session='s4', deferred_registered=True, deferred_phase='queued')
+        # the numbers move as work moves
+        self.job('a', status='done', top=base + 'one', t_finished=self.now)
+        self.job('b', status='done', top=base + 'one', t_finished=self.now)
+        self.assertEqual(self.line(), 'ember 3/14 · 0 running · 3 queued · 2 worktrees')
+        # a record with no worktree is still work, and no worktree count is invented for it
+        for name in 'cde':
+            self.job(name, status='done', t_finished=self.now)
+        self.job('g', status='running')
+        self.assertEqual(self.line(), 'ember 3/14 · 1 running · 0 queued')
+
+    def test_lifetime_totals_of_failures_and_missing_artifacts_are_not_in_the_line(self):
+        self.capacity(ember={'slots_used': 1})
+        for i in range(30):
+            self.job(f'f{i}', status='failed', t_finished=self.now - 60, artifact_missing=[{'path': 'x'}], reason='out of memory')
+        summary = ft.summarize(self.state, self.now)
+        self.assertEqual(summary['line'], 'ember 1/4 · idle')
+        for word in ('fail', 'artifact', 'oom', 'memory', '30'):
+            self.assertNotIn(word, summary['line'])
+        # the fleet view keeps the totals, and every key it had
+        self.assertEqual(summary['alerts'], {'artifact_missing': 30, 'failure': 30, 'oom': 30})
+        self.assertEqual(summary['counts']['failed'], 30)
+        for key in ('line', 'devices', 'counts', 'alerts', 'truncated'):
+            self.assertIn(key, summary)
+        self.assertEqual(summary['attention'], [])
+
+    def test_attention_is_for_current_conditions(self):
+        # work waits and no device can take it: dispatch is blocked
+        self.capacity(ember={'eligible': False, 'reason': 'legacy work active or waiting'},
+                      laptop={'eligible': False, 'reason': 'physical or commit RAM floor'})
+        self.job('q', status='queued', top='D:/x/one')
+        summary = ft.summarize(self.state, self.now)
+        self.assertTrue(summary['dispatch_blocked'])
+        self.assertEqual(summary['attention'], ['dispatch blocked'])
+        self.assertTrue(summary['line'].endswith('0 running · 1 queued · 1 worktree · DISPATCH BLOCKED'), summary['line'])
+        # one device that can take it, or an empty queue, and nothing is blocked
+        self.capacity(ember={'eligible': True}, laptop={'eligible': False, 'reason': 'RAM floor'})
+        self.assertFalse(ft.summarize(self.state, self.now)['dispatch_blocked'])
+        self.capacity(ember={'eligible': False, 'reason': 'CPU slots unavailable', 'slots_used': 4})  # full, not blocked
+        self.assertFalse(ft.summarize(self.state, self.now)['dispatch_blocked'])
+        self.job('q', status='done', t_finished=self.now)
+        self.capacity(ember={'eligible': False, 'reason': 'legacy work active or waiting'})
+        summary = ft.summarize(self.state, self.now)
+        self.assertEqual((summary['dispatch_blocked'], summary['attention']), (False, []))
+
+    def test_a_stale_snapshot_says_so_and_the_work_counts_still_move(self):
+        self.capacity(ember={'at': self.now - 1000, 'slots_used': 9}, hearth={'at': self.now - 1000}, laptop={'at': self.now - 1000})
+        self.job('q', status='queued', top='D:/x/one')
+        self.job('r', status='running', top='D:/x/two')
+        summary = ft.summarize(self.state, self.now)
+        self.assertEqual(summary['line'], 'ember STALE · hearth STALE · laptop STALE · 1 running · 1 queued · 2 worktrees')
+        self.assertNotIn('9', summary['line'])  # a stale sample's numbers are not shown as current
+        self.assertFalse(summary['dispatch_blocked'])  # nothing fresh to judge by; the STALE words carry it
+        # nothing at all in the cache
+        (self.state / 'capacity.json').unlink()
+        self.assertEqual(self.line(), 'no capacity data · 1 running · 1 queued · 2 worktrees')
+
+    def test_the_line_stays_short(self):
+        self.capacity(ember={'name': 'ember', 'slots_used': 13, 'slots_total': 14},
+                      hearth={'name': 'hestia-build', 'slots_used': 1, 'slots_total': 6, 'eligible': False, 'reason': 'legacy work active or waiting'},
+                      laptop={'name': 'laptop', 'eligible': False, 'reason': 'physical or commit RAM floor'})
+        for i in range(17):
+            self.job(f'r{i}', status='running' if i < 12 else 'queued', top=f'C:/Work/r/.claude/worktrees/w{i}')
+        line = self.line()
+        self.assertLessEqual(len(line), ft.LINE_WIDTH, line)
+        self.assertIn('hestia-build 1/6 legacy busy', line)
+        self.assertIn('12 run', line)
+        self.assertIn('17 wt', line)
+        # an ordinary line, with all devices usable, is well inside the width
+        self.capacity(ember={'slots_used': 13, 'slots_total': 14}, hearth={'name': 'hestia', 'slots_total': 6}, laptop={})
+        self.assertLessEqual(len(self.line()), 100)
+        # a name is cut and cleaned
+        self.capacity(ember={'name': 'a very long device name\nwith a break'})
+        self.assertTrue(self.line().startswith('a very long 0/4'), self.line())
+
+    def test_both_generations_count_one_set_of_worktrees(self):
+        legacy, current = self.state / 'fleet', self.state / 'queue-v2' / 'fleet'
+        for root in (legacy, current):
+            (root / 'jobs').mkdir(parents=True)
+        (self.state / 'queue-v2' / '.generation').write_bytes(b'baton-queue-generation-2\n')
+        (legacy / 'jobs' / 'a.json').write_text(json.dumps(dict(status='running', host_id='ember', slots=2, top='D:/x/one')), encoding='utf-8')
+        (current / 'jobs' / 'b.json').write_text(json.dumps(dict(status='running', host_id='ember', slots=1, top='D:/x/one')), encoding='utf-8')
+        (current / 'jobs' / 'c.json').write_text(json.dumps(dict(status='queued', top='D:/x/two')), encoding='utf-8')
+        # the older generation's cache is old; only the live one is current
+        for root, at in ((legacy, self.now - 3000), (current, self.now)):
+            (root / 'capacity.json').write_text(json.dumps({'at': at, 'devices': {'ember': {
+                'at': at, 'up': True, 'eligible': True, 'slots_used': 1, 'slots_total': 14, 'name': 'ember'}}}), encoding='utf-8')
+        summary = ft.summarize_generations(self.state, self.now)
+        self.assertEqual(summary['line'], 'ember 3/14 · 2 running · 1 queued · 2 worktrees')
+        self.assertEqual(summary['activity']['worktrees'], 2)
 
 
 if __name__ == '__main__':

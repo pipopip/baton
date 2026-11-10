@@ -274,6 +274,30 @@ class FleetTests(unittest.TestCase):
         self.assertEqual(self.job(jid), original)
         self.assertFalse((run / 'cancel').exists())
 
+    def test_fleet_submit_and_cancel_name_their_worktree_and_session(self):
+        jobs = self.state / 'fleet' / 'jobs'
+        before = sorted(p.name for p in jobs.glob('*.json')) if jobs.exists() else []
+        for drop in ('session', 'root'):
+            req = dict(where='fleet', root=str(self.root), command='echo test', session='s1', slots=1)
+            del req[drop]
+            for call in (lambda: fq.execute(self.ctx, 'submit', req), lambda: cq.execute(self.ctx, 'submit', req)):
+                with self.assertRaisesRegex(cq.CqError, 'submission requires ' + drop):
+                    call()
+        self.assertEqual(sorted(p.name for p in jobs.glob('*.json')) if jobs.exists() else [], before)
+        jid = self.submit()['job']
+        original = self.job(jid)
+        for req in (dict(job=jid), dict(job=jid, root=str(self.root)), dict(job=jid, session='s1')):
+            for call in (lambda: fq.execute(self.ctx, 'cancel', req), lambda: cq.execute(self.ctx, 'cancel', req)):
+                with self.assertRaisesRegex(cq.CqError, 'cancellation requires'):
+                    call()
+        other = self.state / 'other-worktree'; other.mkdir()
+        with patch.object(cq, '_top_of', return_value=str(other)), self.assertRaisesRegex(cq.CqError, 'does not match'):
+            fq.execute(self.ctx, 'cancel', dict(job=jid, root=str(other), session='s1'))
+        with self.assertRaisesRegex(cq.CqError, 'owner'):
+            fq.execute(self.ctx, 'cancel', dict(job=jid, root=str(self.root), session='not-owner'))
+        self.assertEqual(self.job(jid), original)
+        self.assertEqual(fq.execute(self.ctx, 'cancel', dict(job=jid, root=str(self.root), session='s1'))['status'], 'cancelled')
+
     def test_current_handoff_owner_can_cancel_predecessor_job(self):
         jid = self.submit()['job']
         (self.root / '.baton' / 'owner.json').write_text(json.dumps({'session_id': 's2', 'vendor': 'codex'}))
@@ -312,6 +336,24 @@ class FleetTests(unittest.TestCase):
             result = fq.augment(self.ctx, 'status', {}, {'ok': True, 'queue': [], 'recent': []})
         self.assertEqual(len(result['queue']), 1)
         self.assertEqual(result['fleet']['counts']['queued'], 1)
+
+    def test_watch_reports_this_worktrees_undelivered_failures_for_the_status_line(self):
+        jid = self.submit()['job']
+        req = {'root': str(self.root), 'watch_session': 's1'}
+        with patch.object(fq, '_probes', side_effect=AssertionError('unexpected network')), patch.object(fq, 'ensure_controller'):
+            queued = fq.augment(self.ctx, 'tick', req, {'ok': True})['watch']
+            job = cq.read_json(self.ctx.p('fleet', 'jobs', jid + '.json'))
+            job.update(status='failed', exit=1)
+            cq.write_json(self.ctx.p('fleet', 'jobs', jid + '.json'), job)
+            failed = fq.augment(self.ctx, 'tick', req, {'ok': True})['watch']
+            job.update(notified=True)
+            cq.write_json(self.ctx.p('fleet', 'jobs', jid + '.json'), job)
+            delivered = fq.augment(self.ctx, 'tick', req, {'ok': True})['watch']
+            stranger = fq.augment(self.ctx, 'tick', {**req, 'watch_session': 'someone-else'}, {'ok': True})['watch']
+        self.assertEqual(queued['mine_attention'], {'failed': 0, 'missing': 0})
+        self.assertEqual(failed['mine_attention'], {'failed': 1, 'missing': 0})
+        self.assertEqual(delivered['mine_attention'], {'failed': 0, 'missing': 0})
+        self.assertNotIn('mine_attention', stranger)
 
     def test_remote_probe_requires_protocol_and_identity(self):
         payload = dict(version=1, supported=True, safety_protocol='shared-heavy-gate-v1', machine_id='a'*32,
