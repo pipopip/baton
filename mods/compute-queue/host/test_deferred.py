@@ -96,6 +96,16 @@ class PolicyTests(unittest.TestCase):
             self.assertTrue(result['legacy_busy'])
             self.assertEqual(result['active_fleet_slots'], 2)
             self.assertEqual(result['reserved_memory_bytes'], 3 * deferred.GIB)
+            self.assertEqual(result['held_memory_bytes'], 0)
+            active[0]['held_memory_bytes'] = deferred.GIB
+            with mock.patch.object(deferred, 'read', return_value={'id': 'cq-a'}), \
+                 mock.patch.object(deferred, 'held_memory', return_value=2 * deferred.GIB):
+                self.assertEqual(deferred.fleet_probe()['held_memory_bytes'], deferred.GIB)
+                self.assertEqual(deferred.fleet_probe()['active_fleet'][0]['held_memory_bytes'], deferred.GIB)
+            with mock.patch.object(deferred, 'read', return_value={'id': 'cq-a'}), \
+                 mock.patch.object(deferred, 'held_memory', return_value=deferred.GIB // 2):
+                self.assertEqual(deferred.fleet_probe()['held_memory_bytes'], deferred.GIB // 2)  # the second look was lower
+            del active[0]['held_memory_bytes']
             self.assertTrue(result['active_fleet'][0]['src_exists'])
             self.assertEqual(result['capabilities'], ['linux', 'python', 'ffmpeg'])
             which.side_effect = lambda name: '/bin/python' if name == 'python' else None
@@ -104,11 +114,18 @@ class PolicyTests(unittest.TestCase):
             peaks = {'cq-valid': 1234, 'cq-zero': 0, 'cq-bool': True, 'cq-float': 1.5, 'cq-negative': -1}
             for jid in peaks:
                 (Path(temp) / jid).mkdir()
+            held = {'cq-valid': (99, 2), 'cq-zero': (99, 0), 'cq-bool': (True, 2), 'cq-float': (9.5, 2), 'cq-negative': (-1, 2)}
             def state(path):
-                return {'id': path.parent.name, 'fleet': True, 'phase': 'done',
-                        'memory_peak_bytes': peaks[path.parent.name]}
+                jid = path.parent.name
+                return {'id': jid, 'fleet': True, 'phase': 'done', 'memory_peak_bytes': peaks[jid],
+                        'memory_held_peak_bytes': held[jid][0], 'memory_held_samples': held[jid][1]}
             with mock.patch.object(deferred, 'safe'), mock.patch.object(deferred, 'read', side_effect=state):
                 rows = {row['id']: row for row in deferred.fleet_probe()['terminal_fleet']}
+            # what the job held, only as a whole number of bytes with at least one reading behind it
+            self.assertEqual((rows['cq-valid']['memory_held_peak_bytes'], rows['cq-valid']['memory_held_samples']), (99, 2))
+            for jid in ('cq-zero', 'cq-bool', 'cq-float', 'cq-negative'):
+                self.assertNotIn('memory_held_peak_bytes', rows[jid])
+                self.assertNotIn('memory_held_samples', rows[jid])
             self.assertEqual(rows['cq-valid']['memory_peak_bytes'], 1234)
             self.assertEqual(rows['cq-valid']['memory_kind'], 'cgroup_memory')
             self.assertEqual(rows['cq-zero']['memory_peak_bytes'], 0)
@@ -125,6 +142,157 @@ class PolicyTests(unittest.TestCase):
                  mock.patch.object(deferred, 'read', return_value=state):
                 with self.assertRaisesRegex(RuntimeError, 'invalid active fleet reservation'):
                     deferred.reservations()
+
+    def test_held_memory_is_the_running_units_anonymous_lists_within_its_cap(self):
+        gib = deferred.GIB
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(deferred, 'CGROUP', Path(temp)):
+            group = Path(temp) / 'user.slice' / 'cq-deferred-cq-a.service'
+            group.mkdir(parents=True)
+            stat = group / 'memory.stat'
+            # 3 GiB mapped anonymous, 2 of them freed lazily and so on the file lists with the page cache
+            stat.write_text(f'anon {3 * gib}\nfile {5 * gib}\nkernel {gib}\nshmem {gib // 2}\nanon_thp {gib}\n'
+                            f'inactive_anon {gib}\nactive_anon {gib // 2}\ninactive_file {6 * gib}\nactive_file {gib}\n'
+                            f'unevictable {gib}\n')
+            state = {'id': 'cq-a', 'phase': 'running', 'memory_bytes': 4 * gib,
+                     'control_group': '/user.slice/cq-deferred-cq-a.service'}
+            # not the lazily freed pages, the page cache, kernel or locked memory: MemAvailable counts some of those
+            self.assertEqual(deferred.held_memory(state), gib + gib // 2)
+            self.assertEqual(deferred.held_memory(None), 0)
+            self.assertEqual(deferred.held_memory({**state, 'memory_bytes': gib}), gib)  # never more than the cap
+            # Anything short of this job's own running unit is charged the whole cap.
+            for change in ({'phase': 'starting'}, {'control_group': None}, {'control_group': '/user.slice'},
+                           {'control_group': '/user.slice/../user.slice/cq-deferred-cq-a.service'},
+                           {'control_group': 'user.slice/cq-deferred-cq-a.service'},
+                           {'id': 'cq-b'}, {'memory_bytes': None}):
+                self.assertEqual(deferred.held_memory({**state, **change}), 0, change)
+            self.assertEqual(deferred.held_memory({k: v for k, v in state.items() if k != 'id'}), 0)
+            stat.write_text('active_anon many\ninactive_anon 1\n')
+            self.assertEqual(deferred.held_memory(state), 0)
+            stat.write_text(f'active_anon -{gib}\ninactive_anon {2 * gib}\n')
+            self.assertEqual(deferred.held_memory(state), 0)
+            stat.write_text(f'active_anon {gib}\n')   # one of the two figures alone credits nothing
+            self.assertEqual(deferred.held_memory(state), 0)
+            stat.write_text(f'anon {gib}\nshmem {gib}\n')   # a kernel without the list figures credits nothing
+            self.assertEqual(deferred.held_memory(state), 0)
+            stat.unlink()
+            self.assertEqual(deferred.held_memory(state), 0)
+
+    def test_the_sampler_keeps_the_largest_reading_of_the_anonymous_lists(self):
+        mib = 2 ** 20
+        with tempfile.TemporaryDirectory() as temp:
+            group = Path(temp)
+            self.assertIsNone(deferred.anon_lists(group))                      # no file
+            (group / 'memory.stat').write_text(f'anon {9 * mib}\nactive_anon {2 * mib}\n')
+            self.assertIsNone(deferred.anon_lists(group))                      # one of the two figures is missing
+            (group / 'memory.stat').write_text(f'active_anon {2 * mib}\ninactive_anon {mib}\nfile {50 * mib}\n')
+            self.assertEqual(deferred.anon_lists(group), 3 * mib)
+            readings = iter([3 * mib, None, 7 * mib, 5 * mib, 4 * mib])
+            stop = mock.Mock()
+            stop.wait.side_effect = [False, False, False, False, False, True]
+            result = {}
+            with mock.patch.object(deferred, 'anon_lists', side_effect=lambda path: next(readings)):
+                deferred.sample_held(group, stop, result)
+            self.assertEqual(result, {'samples': 4, 'peak': 7 * mib})          # the unreadable moment is not a reading
+            # it waits before every reading (the command has to exist first): closely at the start, then every 5 s
+            self.assertEqual([call.args[0] for call in stop.wait.call_args_list], [.2, .5, 1, 2, 5, 5])
+            ended_at_once = {}
+            stop = mock.Mock()
+            stop.wait.return_value = True
+            deferred.sample_held(group, stop, ended_at_once)
+            self.assertEqual(ended_at_once, {})                                # a job gone before the first wait: no reading
+            # the runner's two calls, with a real thread: readings arrive, it stops when told
+            (group / 'job').mkdir()
+            (group / 'job' / 'memory.stat').write_text(f'active_anon {2 * mib}\ninactive_anon {mib}\n')
+            with mock.patch.object(deferred, 'CGROUP', group), mock.patch.object(deferred, 'self_group', return_value='/job'), \
+                 mock.patch.object(deferred, 'HELD_SAMPLE_START', (.01,)), mock.patch.object(deferred, 'HELD_SAMPLE_S', .01):
+                sampled, stop, thread = deferred.start_sampler()
+                deadline = time.time() + 5
+                while sampled.get('samples', 0) < 2 and time.time() < deadline:
+                    time.sleep(.01)
+                peak, samples = deferred.finish_sampler(sampled, stop, thread)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(peak, 3 * mib)
+            self.assertGreaterEqual(samples, 2)
+            # a sampler that cannot start, or read nothing, or was caught half way, costs the job nothing
+            with mock.patch.object(deferred, 'self_group', side_effect=RuntimeError('no cgroup')):
+                sampled, stop, thread = deferred.start_sampler()
+            self.assertIsNone(thread)
+            self.assertIsNone(deferred.finish_sampler(sampled, stop, thread))
+            with mock.patch.object(deferred.threading, 'Thread', side_effect=ValueError('anything')):
+                self.assertIsNone(deferred.start_sampler()[2])
+            self.assertIsNone(deferred.finish_sampler({'samples': 1}, threading.Event(), None))
+            self.assertIsNone(deferred.finish_sampler({'peak': mib, 'samples': 0}, threading.Event(), None))
+            self.assertIsNone(deferred.finish_sampler(None, None, None))
+            self.assertEqual(deferred.finish_sampler({'peak': mib, 'samples': 3}, threading.Event(), None), (mib, 3))
+
+    def test_reservations_report_what_each_running_job_holds(self):
+        gib = deferred.GIB
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as groups:
+            for jid in ('cq-a', 'cq-b'):
+                (Path(temp) / jid).mkdir()
+                group = Path(groups) / ('cq-deferred-' + jid + '.service')
+                group.mkdir()
+                (group / 'memory.stat').write_text(f'active_anon {2 * gib}\ninactive_anon {gib}\n')
+            def state(path):
+                jid = path.parent.name
+                return {'id': jid, 'fleet': True, 'slots': 1, 'memory_bytes': 4 * gib,
+                        'phase': 'running' if jid == 'cq-a' else 'starting',
+                        'control_group': '/cq-deferred-' + jid + '.service'}
+            with mock.patch.object(deferred, 'Q', Path(temp)), mock.patch.object(deferred, 'CGROUP', Path(groups)), \
+                 mock.patch.object(deferred, 'safe'), mock.patch.object(deferred, 'read', side_effect=state):
+                active = {row['id']: row for row in deferred.reservations()[0]}
+            self.assertEqual(active['cq-a']['held_memory_bytes'], 3 * gib)
+            self.assertEqual(active['cq-b']['held_memory_bytes'], 0)  # not running yet: its whole cap is charged
+            self.assertEqual(active['cq-a']['reserved_memory_bytes'], 4 * gib)
+
+    def test_admission_charges_a_running_job_only_what_it_does_not_hold_yet(self):
+        gib = deferred.GIB
+        value = {'fleet': True, 'mode': 'immediate', 'load_cap': 8, 'ram_floor_gb': 2,
+                 'memory_max_gb': 3, 'pool_slots': 8, 'slots': 2}
+        def reason(held, available, later=None):
+            active = [{'id': 'cq-a', 'phase': 'running', 'slots': 2, 'reserved_memory_bytes': 4 * gib,
+                       'held_memory_bytes': held}]
+            order = []
+            def first():
+                order.append('held')
+                return active, False, False
+            def free():
+                order.append('available')
+                return available
+            def second(state):
+                order.append('held again')
+                return held if later is None else later
+            with mock.patch.object(deferred, 'reservations', side_effect=first), \
+                 mock.patch.object(deferred, 'legacy_busy', return_value=False), \
+                 mock.patch.object(deferred.os, 'getloadavg', return_value=(1, 0, 0), create=True), \
+                 mock.patch.object(deferred, 'available', side_effect=free), \
+                 mock.patch.object(deferred, 'read', return_value={'id': 'cq-a'}), \
+                 mock.patch.object(deferred, 'held_memory', side_effect=second):
+                result = deferred.fleet_reason(value)
+            # available memory is read between the two looks at what the job holds; a job holding nothing is not reread
+            self.assertEqual(order, ['held', 'available', 'held again'] if held else ['held', 'available'])
+            return result
+        # A 16 GiB host with 1 GiB in other use: 2 floor + 4 cap + 3 cap fit whatever the running job holds.
+        self.assertIn('memory', reason(0, 9 * gib - 1))       # holds nothing: floor 2 + its cap 4 + this cap 3
+        self.assertIsNone(reason(0, 9 * gib))
+        self.assertIsNone(reason(3 * gib, 6 * gib))           # holds 3 of its 4: available is 3 lower, and so is its charge
+        self.assertIn('memory', reason(3 * gib, 6 * gib - 1))
+        self.assertIsNone(reason(4 * gib, 5 * gib))           # holds all of it: floor 2 + this cap 3
+        # it let go of 2 GiB while available memory was read: that shows as available, so it is not credited too
+        self.assertIn('memory', reason(3 * gib, 6 * gib, later=gib))
+        self.assertIsNone(reason(3 * gib, 8 * gib, later=gib))
+        self.assertIn('memory', reason(3 * gib, 8 * gib - 1, later=gib))
+        self.assertIsNone(reason(3 * gib, 6 * gib, later=4 * gib))   # it grew: the earlier, smaller figure stands
+        # its record gone or unreadable at the second look: the whole cap is charged
+        with mock.patch.object(deferred, 'reservations', return_value=(
+                [{'id': 'cq-a', 'phase': 'running', 'slots': 2, 'reserved_memory_bytes': 4 * gib, 'held_memory_bytes': 3 * gib}],
+                False, False)), \
+             mock.patch.object(deferred, 'legacy_busy', return_value=False), \
+             mock.patch.object(deferred.os, 'getloadavg', return_value=(1, 0, 0), create=True), \
+             mock.patch.object(deferred, 'available', return_value=9 * gib - 1), \
+             mock.patch.object(deferred, 'read', side_effect=[None, RuntimeError('unsafe')]):
+            self.assertIn('memory', deferred.fleet_reason(value))
+            self.assertIn('memory', deferred.fleet_reason(value))
 
     def test_held_foreground_slots_and_required_headroom(self):
         def try_pool(pool, busy, need):

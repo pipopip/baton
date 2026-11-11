@@ -17,6 +17,8 @@ class FleetTelemetryTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        ft._JOB_CACHE.clear()
+        self.addCleanup(ft._JOB_CACHE.clear)
         self.state = Path(self.tmp.name)
         (self.state / 'jobs').mkdir()
         self.now = 1700000000
@@ -99,6 +101,94 @@ class FleetTelemetryTests(unittest.TestCase):
         summary = ft.summarize_generations(self.state, self.now)
         self.assertEqual(summary['devices']['ember']['slots_used'], 15)
         self.assertEqual(summary['alerts'].get('overrun'), 1)
+
+    def settle(self, name, seconds=60):
+        """Put a job file's times `seconds` into the past, as a file nothing has written for that long."""
+        import time
+        old = time.time() - seconds
+        os.utime(self.state / 'jobs' / (name + '.json'), (old, old))
+
+    def opened(self):
+        """A patch of _read that records the job files opened."""
+        names, real = [], ft._read
+
+        def counted(path, size=None):
+            if path.parent.name == 'jobs':
+                names.append(path.name)
+            return real(path, size)
+        patcher = patch.object(ft, '_read', counted)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return names
+
+    def test_a_settled_job_file_is_opened_once_however_often_the_snapshot_is_built(self):
+        self.job('a', status='running', host_id='ember', slots=2)
+        self.job('b', status='queued')
+        self.settle('a')
+        self.settle('b')
+        opened = self.opened()
+        first = ft.summarize(self.state, now=self.now)
+        self.assertEqual(sorted(opened), ['a.json', 'b.json'])
+        del opened[:]
+        self.assertEqual(ft.summarize(self.state, now=self.now), first)
+        self.assertEqual(ft._read_jobs(self.state / 'jobs')[0], 2)
+        self.assertEqual(opened, [])
+        self.assertEqual((first['counts']['running'], first['counts']['queued']), (1, 1))
+
+    def test_a_job_file_that_changed_is_read_again(self):
+        self.job('a', status='queued')
+        self.settle('a')
+        self.assertEqual(ft.summarize(self.state, now=self.now)['counts']['queued'], 1)
+        opened = self.opened()
+        self.job('a', status='running', host_id='ember', slots=1)  # written now: read on every call until it settles
+        for _ in range(2):
+            self.assertEqual(ft.summarize(self.state, now=self.now)['counts']['running'], 1)
+        self.assertEqual(opened, ['a.json', 'a.json'])
+        self.settle('a')
+        ft.summarize(self.state, now=self.now)
+        del opened[:]
+        ft.summarize(self.state, now=self.now)
+        self.assertEqual(opened, [])
+        with patch.object(ft, 'JOB_REFRESH_S', 0):  # and again once the refresh time has passed
+            ft.summarize(self.state, now=self.now)
+        self.assertEqual(opened, ['a.json'])
+
+    def test_a_removed_job_file_and_a_missing_directory_leave_nothing_behind(self):
+        self.job('a', status='queued')
+        self.job('b', status='queued')
+        self.settle('a')
+        self.settle('b')
+        ft.summarize(self.state, now=self.now)
+        (self.state / 'jobs' / 'a.json').unlink()
+        self.assertEqual(ft.summarize(self.state, now=self.now)['counts']['queued'], 1)
+        self.assertEqual(list(ft._JOB_CACHE[str(self.state / 'jobs')]), ['b.json'])
+        (self.state / 'jobs' / 'b.json').unlink()
+        (self.state / 'jobs').rmdir()
+        self.assertEqual(ft._read_jobs(self.state / 'jobs'), (0, []))
+        self.assertNotIn(str(self.state / 'jobs'), ft._JOB_CACHE)
+
+    def test_an_unreadable_job_file_is_tried_again_next_time(self):
+        (self.state / 'jobs' / 'a.json').write_text('{', encoding='utf-8')
+        self.settle('a')
+        opened = self.opened()
+        ft.summarize(self.state, now=self.now)
+        ft.summarize(self.state, now=self.now)
+        self.assertEqual(opened, ['a.json', 'a.json'])
+
+    def test_the_generation_summary_opens_each_job_file_once(self):
+        fleet = self.state / 'fleet'
+        (fleet / 'jobs').mkdir(parents=True)
+        for name in ('a', 'b', 'c'):
+            path = fleet / 'jobs' / (name + '.json')
+            path.write_text(json.dumps({'status': 'running', 'host_id': 'ember', 'slots': 1}), encoding='utf-8')
+            import time
+            old = time.time() - 60
+            os.utime(path, (old, old))
+        opened = self.opened()
+        result = ft.summarize_generations(self.state, now=self.now)
+        self.assertEqual(sorted(opened), ['a.json', 'b.json', 'c.json'])
+        self.assertEqual(result['counts']['running'], 3)
+        self.assertEqual(result['devices']['ember']['slots_used'], 3)
 
     def test_missing_corrupt_oversize_and_bounded_input(self):
         (self.state / 'capacity.json').write_text('{', encoding='utf-8')

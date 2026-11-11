@@ -25,6 +25,16 @@ import queue_policy
 
 E = None
 ACTIVE = ('queued', 'launching', 'running')
+RESTAGE_AFTER_S = 900  # an unconfirmed staging attempt this old that left no directory on its host is made again
+HISTORY_S = 30 * 86400  # the memory estimate also reads the fleet jobs archived within this time
+SIZE_WEIGHT = 0.5          # _order: minutes a job stands back in its class per slot-minute of estimated work
+SIZE_CAP_SLOT_MIN = 240    # _order: slot-minutes of work counted at most (so two hours back at most)
+AGE_S = 3600               # _order: a queued job that has waited this long goes ahead of newer work of every class
+BACKFILL_OVERRUN = 0.25    # _expected_end: a running job past its estimate is given this share of it again
+BACKFILL_MIN_LEFT_S = 600  # _expected_end: ... and at least this long
+BACKFILL_UNKNOWN_S = 600   # _reserve: with no shadow time, a job estimated to end within this may pass a held host
+HOLD_PATIENCE_S = 900      # _reserve: ... and only this long after the held job began to hold; then nothing passes
+HELD_MIN_SAMPLES = 6       # _sizing_note: readings a run's held peak needs to count (the host's first six span about 14 s)
 TERMINAL = ('done', 'failed', 'cancelled', 'timeout')
 RUNTIME_FILES = ('artifact_transfer.py', 'host_stop.py', 'queue_generations.py', 'queue_paths.py', 'cq.py', 'multi_host.py', 'remote_stage.py', 'quiet_helper.py',
                  'fleet_queue.py', 'fleet_telemetry.py', 'windows_pool.py', 'windows_broker.py', 'queue_policy.py')
@@ -162,8 +172,26 @@ def _submit(ctx, req):
         _error('defer must be spare or overnight')
     if defer:
         candidates = [h for h in candidates if h != 'laptop']
+    try:
+        sandbox, network = e.sandbox_request(req)
+    except e.CqError as exc:
+        _error(str(exc))
+    if sandbox is True and platform != 'linux':
+        _error(e.SANDBOX_LINUX_ONLY)
     if not candidates:
-        _error('no candidates match platform and deferral')
+        _error(e.SANDBOX_LINUX_ONLY if sandbox is True else 'no candidates match platform and deferral')
+    # keep the hosts whose setting takes the request (a host with an invalid setting takes none); a host not configured
+    # here is checked at placement
+    configured, refusals, kept = _hosts(ctx), [], []
+    for host in candidates:
+        try:
+            e.sandbox_plan(dict(sandbox=sandbox, network=network), configured[host][1] if host in configured else {})
+            kept.append(host)
+        except e.SandboxError as exc:
+            refusals.append(str(exc))
+    if not kept:
+        _error(refusals[0])
+    candidates = kept
     requires = req.get('requires') or []
     if not isinstance(requires, list) or len(requires) > 32 or any(not isinstance(x, str) or not re.fullmatch(r'[a-zA-Z0-9_.+-]{1,64}', x) for x in requires):
         _error('requires must be a list of tool names')
@@ -217,18 +245,24 @@ def _submit(ctx, req):
         command_key = _digest(command, subdir, tree)
         memory = req.get('memory_gb')
         if memory is None:
-            history = all_jobs(ctx)
+            # finished jobs leave the scanned store after two days (cq.archive_jobs): the estimate keeps their peaks
+            history = all_jobs(ctx) + e._jobs_in(ctx, os.path.join('fleet', 'jobs') + e.ARCHIVE_SUFFIX, HISTORY_S)
             recommendations = [telemetry.estimate_memory(history, profile_key, command_key, platform, host, slots, 2)['memory_gb'] for host in candidates]
             memory = min(50.0, max(recommendations or [2]))
         cap = req.get('memory_max_gb')
         if cap is None:
             cap = min(50.0, math.ceil(memory * 1.25 * 4) / 4)
+            # A where: host job turned into a fleet job never had a cap: it gets a roomier default than a fleet
+            # job whose submitter left the cap out (queue_generations.host_job_for_fleet).
+            roomy = req.get('_default_memory_max_gb')
+            if _num(roomy, .25, 50):
+                cap = max(cap, float(roomy))
         if cap < memory:
             _error('memory_max_gb must be at least memory_gb')
         job = dict(id=jid, fleet=True, status='queued', command=command, subdir=subdir, source=req.get('source') or 'worktree',
                    sha=sha, base=base, snapshot=snap, where='fleet', slots=slots, self_heavy=False,
                    est_minutes=est, timeout_minutes=timeout, priority=priority, label=(str(req.get('label') or 'fleet job')[:60]),
-                   gets=gets, temp_storage='disk', defer=defer or 'immediate', requested_defer=defer,
+                   gets=gets, temp_storage='disk', sandbox=sandbox, network=network, defer=defer or 'immediate', requested_defer=defer,
                    deferred_registered=False, deferred_phase='staging_pending', memory_gb=float(memory), memory_max_gb=float(cap),
                    profile_key=profile_key, command_key=command_key, platform=platform, candidates=candidates, requires=requires,
                    artifact_policy=artifact_policy,
@@ -265,7 +299,62 @@ def _submit(ctx, req):
         ensure_controller(ctx)
     except Exception as exc:
         warning = 'accepted; controller could not start: ' + str(exc)[:200]
-    return {'ok': True, 'job': jid, 'note': 'fleet job accepted', **({'receipt_warning': warning} if warning else {})}
+    sizing = _sizing_note(ctx, job, memory=req.get('memory_gb') is not None or req.get('memory_max_gb') is not None,
+                          estimate=req.get('est_minutes') is not None)
+    return {'ok': True, 'job': jid, 'note': 'fleet job accepted' + ('; ' + sizing if sizing else ''),
+            **({'receipt_warning': warning} if warning else {})}
+
+
+def _sizing_note(ctx, job, memory=True, estimate=True):
+    """One sentence for the submitter when this command's own record shows it declares far more than it uses: at
+    least three successful runs of the same command on the same platform in the same repository (store and 30 days
+    of archive), and a memory cap of twice their largest peak plus 1 GB or more, or an estimate of twice their
+    longest run plus 5 minutes or more. A peak counts file cache, which grows to any cap; when the cap is not twice
+    the peak, but three runs carry what they held that could not be given back (peak_held_bytes from at least
+    HELD_MIN_SAMPLES readings on the host) and the cap is four times that plus 2 GB or more, the note gives both
+    figures of those runs. `memory` and `estimate` say which of the two the submitter stated: a default
+    is not theirs to correct. A new job's cap is reserved in full and the estimate decides whether a job may pass a held
+    host, so both cost the submitter waiting time. '' when there is nothing to say; never raises."""
+    try:
+        e = _engine()
+        history = all_jobs(ctx) + e._jobs_in(ctx, os.path.join('fleet', 'jobs') + e.ARCHIVE_SUFFIX, HISTORY_S)
+        peaks, minutes, helds = [], [], []
+        for row in history:
+            if (row.get('id') == job['id'] or row.get('profile_key') != job['profile_key'] or row.get('command') != job['command']
+                    or row.get('subdir') != job['subdir'] or row.get('platform') != job['platform']
+                    or row.get('status') != 'done' or row.get('exit') != 0):
+                continue
+            metrics = row.get('metrics') if isinstance(row.get('metrics'), dict) else {}
+            peak, start, finish = metrics.get('peak_memory_bytes'), row.get('t_started'), row.get('t_finished')
+            if _num(peak, 1) and _num(start, 1) and _num(finish, 1) and finish >= start:
+                peaks.append(peak / GIB)
+                minutes.append((finish - start) / 60)
+                held = metrics.get('peak_held_bytes')
+                if (type(held) is int and 0 <= held <= peak and type(metrics.get('held_samples')) is int
+                        and metrics['held_samples'] >= HELD_MIN_SAMPLES):
+                    helds.append((held / GIB, peak / GIB))
+        if len(peaks) < 3:
+            return ''
+        peak, longest, parts = max(peaks), max(minutes), []
+        tenth = lambda gb: f'{max(0.1, math.ceil(gb * 10) / 10):g}'
+        if memory and job['memory_max_gb'] >= 2 * peak + 1:
+            parts.append(f"it reserves {job['memory_max_gb']:g} GB and {len(peaks)} earlier successful runs of this command "
+                         f"peaked at {tenth(peak)} GB at most")
+        elif memory and len(helds) >= 3 and job['memory_max_gb'] >= 4 * max(h for h, _ in helds) + 2:
+            # The peak fills the cap with file cache, which says nothing about need: say what the runs could not give
+            # back. Both figures are of the runs that carry enough readings, not of every run counted above.
+            parts.append(f"it reserves {job['memory_max_gb']:g} GB; {len(helds)} earlier successful runs of this command peaked "
+                         f"at {tenth(max(p for _, p in helds))} GB with file cache, and held at most "
+                         f"{tenth(max(h for h, _ in helds))} GB that could not be given back (read every 5 s, so a short "
+                         f"spike can be missed)")
+        if estimate and job['est_minutes'] >= 2 * longest + 5:
+            parts.append(f"it is estimated at {job['est_minutes']:g} min and {len(peaks)} earlier successful runs took "
+                         f"at most {max(1, math.ceil(longest))} min")
+        if not parts:
+            return ''
+        return 'sizing: ' + '; '.join(parts) + '. A job that declares less starts sooner.'
+    except Exception:
+        return ''
 
 
 def _laptop_config(ctx, probe):
@@ -399,6 +488,15 @@ def _pending(jobs, host, known):
                      and j.get('deferred_phase') == 'queued')]
 
 
+def _host_charge(data):
+    """Bytes a remote host's active fleet jobs still have to be kept: their caps less what they already hold
+    (held_memory_bytes: the memory on the anonymous lists of each running job's cgroup, which available_bytes has
+    already lost; charging the whole cap as well counts it twice). A helper that does not report it, or reports
+    more than the caps, is charged the caps in full."""
+    reserved, held = data['reserved_memory_bytes'], data.get('held_memory_bytes')
+    return reserved - held if type(held) is int and 0 <= held <= reserved else reserved
+
+
 def _fit(ctx, job, probe, jobs, now, explain=False):
     def no(reason):
         return (None, reason) if explain else None
@@ -438,7 +536,7 @@ def _fit(ctx, job, probe, jobs, now, explain=False):
     known = {x['id'] for x in active}
     pending = _pending(jobs, host, known)
     slots_used = data['active_fleet_slots'] + sum(j['slots'] for j in pending)
-    reserved = data['reserved_memory_bytes'] / GIB + sum(j['memory_max_gb'] for j in pending)
+    reserved = _host_charge(data) / GIB + sum(j['memory_max_gb'] for j in pending)
     if job['slots'] > total:
         return no('CPU slots exceed host pool')
     if job['memory_max_gb'] + policy['ram_floor_gb'] > data['total_bytes'] / GIB:
@@ -490,8 +588,91 @@ def _fits_idle(job, probe):
             job['slots'] * probe['binding'].get('slot_vcpu', 1.5) <= policy['load_cap'])
 
 
-def _order(job):
-    return (_engine().PRIO_RANK.get(job.get('priority'), 2), job.get('t_submitted', 0), job['id'])
+def _size_delay(job):
+    """Seconds a job stands back in its priority class for its size: SIZE_WEIGHT minutes per slot-minute of estimated
+    work, counted up to SIZE_CAP_SLOT_MIN. A 3-minute one-slot check gives way by 90 s, a 90-minute five-slot verify by
+    the full two hours."""
+    est, slots = job.get('est_minutes'), job.get('slots')
+    work = (est if _num(est, 0, 1e6) else 10) * (slots if type(slots) is int and slots > 0 else 1)
+    return min(work, SIZE_CAP_SLOT_MIN) * 60 * SIZE_WEIGHT
+
+
+def _order(job, now=None):
+    """Placement order. A job that has waited AGE_S goes first, oldest first, whatever its class or size (given
+    `now`; a deferred job waits by request and does not age): without that, steady verify and fixcheck work keeps
+    lane work out for as long as it lasts. So an aged lane job can be the one that holds a host (_reserve) against
+    fresh verify work, and after an hour without a controller (laptop asleep) the whole backlog is in submission
+    order. The host's tick has a like rule for its registered jobs, from registration time and for deferred ones too.
+    Among the rest: priority class first; within a class the smaller job first, by submission time plus
+    _size_delay. The delay is fixed at submission, so a large job is overtaken only by smaller ones submitted within
+    its delay, and no longer than until it has aged. Backfill (_reserve) is bounded separately."""
+    submitted = job.get('t_submitted', 0)
+    if now is not None and not job.get('requested_defer') and _num(submitted, 1) and now - submitted >= AGE_S:
+        return (0, 0, submitted, job['id'])
+    return (1, _engine().PRIO_RANK.get(job.get('priority'), 2), submitted + _size_delay(job), job['id'])
+
+
+def _expected_end(job, now):
+    """When a launching or running job is expected to leave its host: its start plus its estimate. One already past
+    its estimate is given BACKFILL_OVERRUN of it again (BACKFILL_MIN_LEFT_S at least), and none is expected beyond
+    its timeout."""
+    start = next((job[k] for k in ('t_started', 't_launch') if _num(job.get(k), 1)), now)
+    est = (job['est_minutes'] if _num(job.get('est_minutes'), .01, 1e6) else 10) * 60
+    end = start + est
+    if end <= now:
+        end = now + max(BACKFILL_MIN_LEFT_S, BACKFILL_OVERRUN * est)
+    if _num(job.get('timeout_minutes'), .01, 1e6):
+        end = min(end, max(now + 60, start + job['timeout_minutes'] * 60))
+    return end
+
+
+def _end_is_firm(job, now):
+    """Whether _expected_end(job, now) stays where it is as time passes: the start plus the estimate of a job still
+    within it, or the job's timeout. The allowance given to a job past its estimate is counted from `now`, so it
+    moves on with every look and promises nothing."""
+    start = next((job[k] for k in ('t_started', 't_launch') if _num(job.get(k), 1)), None)
+    if start is None:
+        return False
+    est = (job['est_minutes'] if _num(job.get('est_minutes'), .01, 1e6) else 10) * 60
+    end = _expected_end(job, now)
+    return ((start + est > now and end == start + est)
+            or (_num(job.get('timeout_minutes'), .01, 1e6) and end == start + job['timeout_minutes'] * 60))
+
+
+def _shadow(job, probe, jobs, now):
+    """When a queued job that does not fit this remote host now could start there, if the fleet work on it ends as
+    estimated (the "shadow time" of backfill scheduling). None when that cannot be told: the laptop, a host whose
+    reservations include work this store does not know, a job that slots and memory would already admit (something
+    else keeps it out), one that would not fit even with every known job gone, or one waiting for a job that is
+    already past its estimate (_end_is_firm: a time that moves on with every look would let short jobs pass for as
+    long as something overruns). Only slots and reserved memory are modelled: load, legacy work and the probe's age
+    are _fit's business."""
+    try:
+        if not probe or probe['host'] == 'laptop':
+            return None
+        data, host = probe['data'], probe['host']
+        policy = data['policy']
+        active = data['active_fleet']
+        known = {x['id'] for x in active}
+        here = [j for j in jobs if j.get('host_id') == host and j.get('status') in ('launching', 'running')]
+        if known - {j['id'] for j in here}:
+            return None
+        pending = _pending(jobs, host, known)
+        slots = (policy['pool_slots'] - policy.get('foreground_slots', 2)
+                 - data['active_fleet_slots'] - sum(j['slots'] for j in pending))
+        memory = (data['available_bytes'] / GIB - _host_charge(data) / GIB
+                  - sum(j['memory_max_gb'] for j in pending) - policy['ram_floor_gb'])
+        if slots >= job['slots'] and memory >= job['memory_max_gb']:
+            return None  # capacity is not what keeps it out
+        counted = known | {j['id'] for j in pending}
+        for other in sorted((j for j in here if j['id'] in counted), key=lambda j: _expected_end(j, now)):
+            slots += other['slots']
+            memory += other['memory_max_gb']  # its cap: the part still charged, and the part it held comes back as available
+            if slots >= job['slots'] and memory >= job['memory_max_gb']:
+                return _expected_end(other, now) if _end_is_firm(other, now) else None
+        return None
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def _execution_command(job, host):
@@ -555,12 +736,20 @@ def _reserve(ctx, probes, limit=3):
         jobs = all_jobs(ctx)
         laptop_open = _laptop_admission(ctx, jobs)
         eligible_hosts = set(_hosts(ctx)) | {'laptop'}
-        reserved_for_older = set()
+        # Backfill. The first job in order that a host cannot take now, but could take idle, holds that host: `holds`
+        # maps the host to (that job's shadow time, when it began to hold). A later job may still start there when
+        # its own estimate ends before the shadow time (_shadow), so by the estimates it is gone before the held job
+        # could start. A shadow time is a fixed moment (_end_is_firm), and a job passes only if it ends by then, so
+        # passing jobs cannot push it back. With no shadow time nothing shows that a passing job leaves in time, and
+        # a stream of short jobs could keep the held job out for good: then only a job estimated within
+        # BACKFILL_UNKNOWN_S may pass, and only for HOLD_PATIENCE_S after the hold began.
+        holds = {}
+        start = ctx.now()
         # A prior reservation can still be staging in another process after a
         # controller handoff. Do not start a second launcher for that device.
         inflight = {j.get('host_id') for j in jobs if j.get('status') == 'launching'
                     and (j.get('launch_uncertain') or not j.get('stage_attempted'))}
-        for job in sorted((j for j in jobs if j.get('status') == 'queued'), key=_order):
+        for job in sorted((j for j in jobs if j.get('status') == 'queued'), key=lambda j: _order(j, start)):
             if len(chosen) >= limit:
                 break
             options = []
@@ -570,12 +759,25 @@ def _reserve(ctx, probes, limit=3):
                 if host not in eligible_hosts:
                     reasons[host] = 'offline or unconfigured'
                     continue
+                if host != 'laptop' and probes.get(host):
+                    try:  # the host's setting as probed now, which may differ from the one the candidates were filtered by
+                        e.sandbox_plan(job, probes[host]['binding'])
+                    except e.SandboxError as exc:
+                        reasons[host] = str(exc)
+                        continue
                 if host == 'laptop' and not laptop_open:
                     reasons[host] = 'draining for legacy laptop work'
                     continue
-                if host in reserved_for_older:
-                    reasons[host] = 'reserved for an older eligible job'
-                    continue
+                if host in holds:
+                    shadow, held_since = holds[host]
+                    est = (job['est_minutes'] if _num(job.get('est_minutes'), .01, 1e6) else 10) * 60
+                    if shadow is not None:
+                        passes = start + est <= shadow
+                    else:
+                        passes = est <= BACKFILL_UNKNOWN_S and 0 <= start - held_since <= HOLD_PATIENCE_S
+                    if job.get('requested_defer') or not passes:
+                        reasons[host] = 'reserved for an older eligible job'
+                        continue
                 if host in inflight or host in {x['host_id'] for x in chosen}:
                     reasons[host] = 'another launcher is in flight'
                     if host in inflight and _fits_idle(job, probes.get(host)):
@@ -591,8 +793,14 @@ def _reserve(ctx, probes, limit=3):
                                   'host load cap', 'stale capacity') and _fits_idle(job, probes.get(host)):
                         temporarily_blocked.add(host)
             if not options:
-                reserved_for_older.update(temporarily_blocked)
-                if job.get('placement_reasons') != reasons:
+                changed = False
+                for host in temporarily_blocked:
+                    if host not in holds:
+                        if not _num(job.get('hold_since'), 1):
+                            job['hold_since'] = start  # kept until the job is placed: its patience does not restart
+                            changed = True
+                        holds[host] = (_shadow(job, probes.get(host), jobs, start), job['hold_since'])
+                if changed or job.get('placement_reasons') != reasons:
                     job['placement_reasons'] = reasons
                     job['reason'] = 'waiting for eligible fleet capacity'
                     e.save_job(ctx, job)
@@ -610,6 +818,7 @@ def _reserve(ctx, probes, limit=3):
             else:
                 update.update(laptop_config=dict(probe['config']), laptop_pending_gb=fit['reserved'] + job['memory_max_gb'])
             job.update(update)
+            job.pop('hold_since', None)
             e.save_job(ctx, job)
             _event(ctx, 'reserved', job)
             chosen.append(job)
@@ -625,12 +834,19 @@ def _stage_remote(ctx, job):
         with e.FileLock(e.dispatch_lock_path(shard, job['top']), 540):
             with ctx.qlock():
                 current = e.load_job(ctx, jid)
-                if not current or current.get('status') != 'launching' or current.get('cancel_requested'):
+                if (not current or current.get('status') != 'launching' or current.get('cancel_requested')
+                        or current.get('deferred_registered')):  # registered while this worker waited for the lock
                     return
                 if e.worktree_identity(current['top']) != current['worktree_identity']:
                     raise RuntimeError('submitting worktree identity changed')
-                script = e.make_launcher(dict(current, command=current.get('execution_command', current['command'])))
+                # the binding was copied from a probe when the host was reserved: a setting made stricter since then applies
+                binding = dict(current['host_config'])
+                binding['sandbox'] = e.stricter_sandbox(binding.get('sandbox', 'off'), e.host_conf(current['dispatch_state']).get('sandbox', 'off'))
+                script = e.make_launcher(dict(current, host_config=binding,
+                                              command=current.get('execution_command', current['command'])))
                 current['stage_attempted'] = True
+                current['stage_at'] = ctx.now()  # _restage_if_absent measures the attempt's age from here
+                current.pop('restage_due', None)
                 e.save_job(ctx, current)
             encoded = base64.b64encode(script.encode()).decode()
             argv = ['--rev', current['sha'], '--subdir', current['subdir'], '--', 'bash', '-c',
@@ -639,6 +855,11 @@ def _stage_remote(ctx, job):
                 rc, out, err = e.real_run_remoterun(argv, current['top'], host=current['host'], binding=current['host_config'])
             else:
                 rc, out, err = ctx.run_remoterun(argv, current['top'])
+        if f'CQ_NO_JOBBOX {jid}' in out:  # the launcher stopped before it made anything on the host
+            final = e.finish(ctx, jid, 'failed', None, reason=e.JOBBOX_MISSING, tail=[])
+            if final:
+                _event(ctx, 'finished', final)
+            return
         registered = f'CQ_REGISTERED {jid}' in out
         with ctx.qlock():
             current = e.load_job(ctx, jid)
@@ -651,6 +872,10 @@ def _stage_remote(ctx, job):
                                    reason=f'staging outcome unconfirmed (exit {rc}); reconcile original host')
                 e.save_job(ctx, current)
                 _event(ctx, 'registered' if registered else 'uncertain', current)
+    except e.SandboxError as exc:  # the host's setting no longer takes this job's request: nothing was staged
+        final = e.finish(ctx, jid, 'failed', None, reason=str(exc), tail=[])
+        if final:
+            _event(ctx, 'finished', final)
     except Exception as exc:
         _stage_error(ctx, jid, exc)
 
@@ -661,7 +886,7 @@ def _stage_error(ctx, jid, exc):
         current = e.load_job(ctx, jid)
         if not current or current.get('status') != 'launching':
             return
-        if current.get('stage_attempted'):
+        if current.get('stage_attempted') and not current.get('restage_due'):
             current.update(launch_uncertain=True, reason='staging unconfirmed: ' + type(exc).__name__)
         else:
             attempts = int(current.get('preparation_failures', 0)) + 1
@@ -820,7 +1045,7 @@ def _run_facts(facts):
                 alive=facts.get('phase') == 'running', cpu=None)
 
 
-def _remote_reconcile(ctx, job, fact=None, explicit=False):
+def _remote_reconcile(ctx, job, fact=None, explicit=False, restage=False):
     e = _engine()
     state = None
     if explicit or job.get('cancel_requested'):
@@ -832,6 +1057,8 @@ def _remote_reconcile(ctx, job, fact=None, explicit=False):
             ent = ((snap or {}).get('jobs') or {}).get(job['id'])
         _remote_metrics(ctx, job, state)
         e.reap_deferred(ctx, job, ent, ctx.now(), [], allow_registration=False, state=state)
+        if restage:  # only the controller's pass: it alone knows that no stage worker of its own holds this job
+            _restage_if_absent(ctx, job, state)
     elif fact:
         phase = fact.get('phase')
         state = dict(version=1, id=job['id'], phase=phase, registered=True, reason=fact.get('reason') or '')
@@ -845,14 +1072,66 @@ def _remote_reconcile(ctx, job, fact=None, explicit=False):
     return {'ok': state is not None, 'cached': state is None, 'phase': state.get('phase') if state else None}
 
 
+def _restage_wanted(job, now):
+    """An unconfirmed, unregistered staging attempt old enough that its push has ended. The attempt's age runs from
+    stage_at, which _stage_remote sets once it holds the dispatch lock; the push that follows is given 540 s, and a
+    live controller's worker holds the job until it returns. A push orphaned by a controller that died is not bounded:
+    it can overlap a restage, and the host's refusal to make an existing job directory is what keeps the job from
+    running twice. A job reserved by an older engine has no stage_at: its reservation time stands in, plus the 540 s
+    the attempt may have waited for that lock, plus a minute."""
+    since = job.get('stage_at')
+    if not _num(since):
+        since = job.get('t_touch') + 600 if _num(job.get('t_touch')) else now
+    return bool(job.get('status') == 'launching' and job.get('launch_uncertain') and job.get('stage_attempted')
+                and not job.get('restage_due') and not job.get('cancel_requested')
+                and not job.get('deferred_registered') and now - since >= RESTAGE_AFTER_S)
+
+
+def _restage_if_absent(ctx, job, state):
+    """Stage a job again on the host it is pinned to when its one staging attempt was never confirmed and left
+    nothing there. Without this the job stays `launching` for good and, as a launcher in flight, keeps every other
+    job off that host. Only from the controller's own pass (which skips a job one of its stage workers still holds),
+    only when the host answers that no directory exists for the job (a partial or complete one is left to the
+    ordinary reconcile), and only when _restage_wanted. The job keeps its host and stays `stage_attempted`, so a
+    cancel still asks the host; `restage_due` lets _resume_pending take it, and each further attempt waits longer.
+    True when the job was handed back."""
+    e = _engine()
+    now = ctx.now()
+    if not isinstance(state, dict) or state.get('phase') != 'absent' or not _restage_wanted(job, now):
+        return False
+    jid = shlex.quote(job['id'])
+    rc, out, _ = e.job_ssh(ctx, job, f'd="$HOME/q/"{jid}; if [ -e "$d" ] || [ -L "$d" ]; then echo present; else echo absent; fi\n')
+    if rc != 0 or out.strip() != 'absent':
+        return False
+    with ctx.qlock():
+        current = e.load_job(ctx, job['id'])
+        # the attempt this answer was about must still be the last one: another may have started meanwhile
+        if (not current or not _restage_wanted(current, now) or current.get('host_id') != job.get('host_id')
+                or current.get('stage_at') != job.get('stage_at')):
+            return False
+        attempt = int(current.get('restages', 0)) + 1
+        current.update(restage_due=True, restages=attempt, deferred_phase='staging',
+                       stage_resume_after=now + min(1800, 60 * 2 ** min(attempt - 1, 5)),
+                       reason='host has no staged copy; staging again on the pinned host')
+        e.save_job(ctx, current)
+        _event(ctx, 'restage', current)
+    return True
+
+
 def _remote_metrics(ctx, job, state):
     peak = state.get('memory_peak_bytes')
     if not _num(peak, 1):
         return
+    metrics = dict(peak_memory_bytes=peak, memory_kind='linux-cgroup')
+    # What the job held that could not be given back, as the host sampled it while the job ran (the cgroup's
+    # anonymous lists). The peak above counts file cache too, which grows to any cap.
+    held, samples = state.get('memory_held_peak_bytes'), state.get('memory_held_samples')
+    if type(held) is int and 0 <= held <= peak and type(samples) is int and samples > 0:
+        metrics.update(peak_held_bytes=held, held_samples=samples)
     with ctx.qlock():
         current = _engine().load_job(ctx, job['id'])
         if current and current.get('status') in ACTIVE:
-            current['metrics'] = dict(peak_memory_bytes=peak, memory_kind='linux-cgroup')
+            current['metrics'] = metrics
             _engine().save_job(ctx, current)
 
 
@@ -1178,6 +1457,8 @@ def _capacity(ctx, probes, jobs, cache_only=False):
                                  slots_used=data['active_fleet_slots']+sum(j['slots'] for j in pending),
                                  memory_available_gb=data['available_bytes']/GIB,
                                  memory_reserved_gb=data['reserved_memory_bytes']/GIB+sum(j['memory_max_gb'] for j in pending),
+                                 # The part of those caps already in use; admission keeps reserved less held free.
+                                 memory_held_gb=(data['reserved_memory_bytes']-_host_charge(data))/GIB,
                                  memory_floor_gb=data['policy']['ram_floor_gb'], load=data['load'],
                                  load_cap=data['policy']['load_cap'], reason=reason or '', capabilities=data.get('capabilities', []))
     _engine().write_json(ctx.p('fleet', 'capacity.json'), dict(version=1, at=now, devices=devices))
@@ -1194,6 +1475,19 @@ def _finalize_capacity(ctx, jobs):
     if not isinstance(probes, dict):
         return
     terminal = {j.get('id'): j for j in jobs if j.get('status') in TERMINAL and isinstance(j.get('id'), str)}
+    scanned = {j.get('id') for j in jobs}
+
+    def finished(jid):
+        """The job when it is finished: from the scan, or by ID when it has left the scanned store (archived)."""
+        if jid in terminal or jid in scanned or not isinstance(jid, str):
+            return terminal.get(jid)
+        if not re.fullmatch(r'cq-(?:v2--)?fleet-\d{8}T\d{6}-[0-9a-f]{16}', jid):
+            return None
+        job = _engine().load_job(ctx, jid)
+        if isinstance(job, dict) and job.get('id') == jid and job.get('status') in TERMINAL:
+            terminal[jid] = job
+        scanned.add(jid)
+        return terminal.get(jid)
     final_probes = dict(probes)
     for host in sorted(h for h in probes if h != 'laptop'):
         probe = probes.get(host)
@@ -1215,7 +1509,7 @@ def _finalize_capacity(ctx, jobs):
             if not isinstance(fact, dict):
                 continue
             jid = fact.get('id')
-            job = terminal.get(jid)
+            job = finished(jid)
             amount, bytes_ = fact.get('slots'), fact.get('reserved_memory_bytes')
             if (job and counts.get(jid) == 1 and job.get('host_id') == host and
                     (job.get('host_config') or {}).get('machine_id') == machine_id and
@@ -1229,6 +1523,16 @@ def _finalize_capacity(ctx, jobs):
         adjusted = dict(data, active_fleet=[fact for fact in active if not isinstance(fact, dict) or fact.get('id') not in remove],
                         active_fleet_slots=data['active_fleet_slots'] - slots,
                         reserved_memory_bytes=data['reserved_memory_bytes'] - memory)
+        if 'held_memory_bytes' in data:
+            # What the remaining jobs hold, by their own facts and never more than the host's total: a finished
+            # job's share leaves with it, and the sample's available memory does not yet show it back.
+            kept = sum(fact['held_memory_bytes'] for fact in adjusted['active_fleet']
+                       if isinstance(fact, dict) and type(fact.get('held_memory_bytes')) is int
+                       and type(fact.get('reserved_memory_bytes')) is int
+                       and 0 <= fact['held_memory_bytes'] <= fact['reserved_memory_bytes'])
+            # A total _host_charge would not credit stays uncredited, whatever the remaining facts add up to.
+            credited = data['reserved_memory_bytes'] - _host_charge(data)
+            adjusted['held_memory_bytes'] = min(kept, credited)
         final_probes[host] = dict(probe, data=adjusted)
     _capacity(ctx, final_probes, jobs, cache_only=True)
 
@@ -1285,9 +1589,9 @@ def _pass(ctx, futures, reconcile_pool=None, reconcile_futures=None):
                     current['last_reconcile'] = ctx.now()
                     _engine().save_job(ctx, current)
                 if reconcile_pool is None:
-                    _remote_reconcile(ctx, current, fact, explicit=explicit)
+                    _remote_reconcile(ctx, current, fact, explicit=explicit, restage=True)
                 else:
-                    reconcile_futures[current['id']] = (host, reconcile_pool.submit(_remote_reconcile, ctx, current, fact, explicit))
+                    reconcile_futures[current['id']] = (host, reconcile_pool.submit(_remote_reconcile, ctx, current, fact, explicit, True))
             except Exception:
                 pass
     jobs = all_jobs(ctx)
@@ -1418,7 +1722,8 @@ def _resume_pending(ctx, busy, probes=None):
             if len(busy) >= 3:
                 break
             host = job.get('host_id')
-            if (job.get('status') != 'launching' or job.get('stage_attempted') or job.get('cancel_requested') or
+            if (job.get('status') != 'launching' or (job.get('stage_attempted') and not job.get('restage_due')) or
+                    job.get('deferred_registered') or job.get('cancel_requested') or
                     job.get('preparation_blocked') or not host or host in busy or
                     ctx.now() < job.get('stage_resume_after', 0)):
                 continue

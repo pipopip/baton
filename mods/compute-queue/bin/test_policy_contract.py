@@ -83,6 +83,16 @@ class PolicyContractTests(Base):
         self.assertEqual(cq.all_jobs(self.ctx), [])
         self.assertEqual(cq.normalize_gets(['frames\\one.png', 'video.mp4']), ['frames/one.png', 'video.mp4'])
 
+    def test_shared_schema_carries_the_sandbox_fields_for_claude_and_codex(self):
+        schema = next(t['inputSchema'] for t in codex_bridge.TOOLS if t['name'] == 'run')
+        for name in ('sandbox', 'network'):
+            self.assertEqual(schema['properties'][name]['type'], 'boolean')
+        request = {'root': self.repo, 'command': 'go test ./...', 'sandbox': True, 'network': False}
+        codex_bridge.validate(request, schema)
+        for changes in ({'sandbox': 'yes'}, {'network': 1}, {'sandbox': None}):
+            with self.subTest(changes=changes), self.assertRaises(codex_bridge.Refusal):
+                codex_bridge.validate({**request, **changes}, schema)
+
     def test_shared_schema_accepts_configured_ids_and_bounded_artifacts(self):
         schema = next(t['inputSchema'] for t in codex_bridge.TOOLS if t['name'] == 'run')
         request = {'root': self.repo, 'command': 'python3 render.py', 'where': 'fleet',

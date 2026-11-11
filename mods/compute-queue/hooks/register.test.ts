@@ -189,6 +189,10 @@ describe('the tools', () => {
     const props = (w.registered[0]?.inputSchema as { properties: Record<string, any> }).properties
     expect(props.artifact_max_mb.maximum).toBe(1024)
     expect(props.artifact_total_mb.maximum).toBe(4096)
+    expect(props.sandbox.type).toBe('boolean')
+    expect(props.network.type).toBe('boolean')
+    expect(props.sandbox.description).toContain('Linux hosts only')
+    expect(props.network.description).toContain('loopback only')
     expect(new RegExp(props.candidates.items.pattern).test('renderfarm')).toBe(true)
     expect(w.commands).toEqual(['cq'])
   })
@@ -223,6 +227,14 @@ describe('the tools', () => {
     expect(w.runs.find(x => x.cmd === 'submit')?.payload).toMatchObject({ where: 'fleet',
       platform: 'portable', candidates: ['laptop', 'renderfarm'], requires: ['go'], slots: 2,
       memory_gb: 0.5, memory_max_gb: 1, artifact_max_mb: 256, artifact_total_mb: 1024, session: 'sess-T' })
+  })
+
+  test('sandbox and network reach the queue unchanged', async ($, on) => {
+    const w = world(on)
+    w.answers.submit = () => ({ ok: true, job: 'cq-box-test', position: 1, note: 'queued', queued: 1 })
+    await start($, w)
+    await $.tool.call({ tool: 'mcp__compute-queue__run', command: 'go test ./...', sandbox: true, network: true })
+    expect(w.runs.find(x => x.cmd === 'submit')?.payload).toMatchObject({ sandbox: true, network: true, session: 'sess-T' })
   })
 
   test('status, cancel and wait pass through', async ($, on) => {

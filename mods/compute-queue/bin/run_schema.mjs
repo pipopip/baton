@@ -19,7 +19,7 @@ export default {
         "any",
         "fleet"
       ],
-      "description": "fleet selects a compatible configured device using independent CPU and RAM requirements. Existing explicit destinations retain their behavior."
+      "description": "fleet selects a compatible configured device using independent CPU and RAM requirements. host (the default) with slots >= 1 and no host_id runs as a contained fleet job on ember: CPU held to the slots, memory capped (memory_max_gb, else the larger of 8 GB and 4 GB per slot). host with a host_id, slots 0, split, self_heavy and RAM jobs keep the ordinary queue."
     },
     "platform": {
       "type": "string",
@@ -91,6 +91,14 @@ export default {
       "minimum": 0.25,
       "maximum": 50,
       "description": "Enforced job memory cap in GiB: Linux cgroup memory, Windows aggregate committed memory. Required for pinned RAM/deferred jobs; fleet can derive a conservative cap from its estimate."
+    },
+    "sandbox": {
+      "type": "boolean",
+      "description": "Run the job in the host's sandbox: it sees its own source copy, the host's configured toolchains and caches, and nothing else of the queue user's home. No network unless network is true. Needed on hosts set to require it; refused on hosts that have none. Linux hosts only."
+    },
+    "network": {
+      "type": "boolean",
+      "description": "For a sandboxed job: use the host's network (module downloads, external services). Default: loopback only."
     },
     "defer": {
       "type": "string",

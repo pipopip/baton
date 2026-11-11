@@ -21,7 +21,7 @@ import time
 import tomllib
 import unicodedata
 
-from . import compute_pickup, config, gitutil, harvest, locking, paths
+from . import compute_pickup, config, diskspace, gitutil, harvest, locking, paths
 
 TERMINAL = compute_pickup.TERMINAL
 NAME = re.compile(r'[a-z0-9][a-z0-9_-]{0,39}')
@@ -357,8 +357,9 @@ def _record(job, state=None):
 
 def _record_on_disk(job, state=None):
     try:
-        return any(p.exists() for p in compute_pickup.job_record_paths(Path(state or config.STATE_DIR) / 'compute',
-                                                                         job, _host_for(job)))
+        root = Path(state or config.STATE_DIR) / 'compute'
+        return any(p.exists() for archived in (False, True)
+                   for p in compute_pickup.job_record_paths(root, job, _host_for(job), archived))
     except (OSError, ValueError, TypeError, AttributeError):
         return True  # cannot tell: do not declare the job lost
 
@@ -782,6 +783,86 @@ def _history(outcomes, repo, display, night):
     return f'still failing since {since}'
 
 
+KERNEL_WARN_GB = 5.0   # kernel pools (nonpaged + paged) at or above this go under "Needs attention"; about 2 after a restart
+COMMIT_WARN = 0.90     # committed memory at or above this share of its limit does too
+SAMPLE_MAX_AGE_S = 2 * 3600
+SAMPLE_TAIL_BYTES = 4 * 1024 * 1024  # the last day of one-row-a-minute samples is about 1.5 MB
+
+
+def laptop_memory(state=None, now=None):
+    """The laptop's memory from the queue's samples (one row a minute from a leader's tick): the newest row, and the
+    kernel pools about a day before it. None when there is no row from the last two hours. Both queue generations
+    write samples (compute/ and compute/queue-v2/) and each file is rotated to samples.jsonl.1 at 20 MB, so the end
+    of all four is read. The kernel pools are what Windows only gives back at a restart: they reached 13.6 GB on
+    2026-11-11 while the queue opened tens of thousands of files a second."""
+    compute = Path(state or config.STATE_DIR) / 'compute'
+    now = _now() if now is None else now
+    lines = []
+    for path in (compute / 'samples.jsonl.1', compute / 'samples.jsonl',
+                 compute / 'queue-v2' / 'samples.jsonl.1', compute / 'queue-v2' / 'samples.jsonl'):
+        try:
+            with open(path, 'rb') as f:
+                f.seek(0, os.SEEK_END)
+                start = max(0, f.tell() - SAMPLE_TAIL_BYTES)
+                f.seek(start)
+                lines += f.read().decode('utf-8', 'replace').splitlines()[1 if start else 0:]  # a first line begun mid-row is cut
+        except OSError:
+            continue
+
+    def number(value, least=0.0):
+        try:  # isfinite raises OverflowError for an integer too large for a float
+            return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= least
+        except OverflowError:
+            return False
+    rows = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(row, dict) and number(row.get('at')) and number(row.get('laptop_np_gb'))
+                and number(row.get('laptop_paged_gb'))):
+            rows.append(row)
+    rows = [r for r in rows if r['at'] <= now + 60]
+    if not rows:
+        return None
+    last = max(rows, key=lambda r: r['at'])
+    if now - last['at'] > SAMPLE_MAX_AGE_S:
+        return None
+    pools = lambda r: round(r['laptop_np_gb'] + r['laptop_paged_gb'], 1)
+    target = last['at'] - 86400
+    earlier = min(rows, key=lambda r: abs(r['at'] - target))
+    commit, limit = last.get('laptop_commit_gb'), last.get('laptop_commit_limit_gb')
+    commit_ok = number(commit) and number(limit, 0.1)
+    out = {'at': time.strftime('%Y-%m-%d %H:%MZ', time.gmtime(last['at'])), 'pools_gb': pools(last),
+           'np_gb': round(last['laptop_np_gb'], 1), 'paged_gb': round(last['laptop_paged_gb'], 1),
+           'day_ago_gb': pools(earlier) if abs(earlier['at'] - target) <= SAMPLE_MAX_AGE_S else None,
+           'free_gb': round(last['laptop_free_ram_gb'], 1) if number(last.get('laptop_free_ram_gb')) else None,
+           'commit_gb': round(commit, 1) if commit_ok else None, 'commit_limit_gb': round(limit, 1) if commit_ok else None}
+    out['warnings'] = []
+    if out['pools_gb'] >= KERNEL_WARN_GB:
+        out['warnings'].append(f"The Windows kernel holds {out['pools_gb']:g} GB (about 2 after a restart). "
+                               'Only a restart of Windows frees it.')
+    if commit_ok and commit / limit >= COMMIT_WARN:
+        out['warnings'].append(f"Committed memory is {out['commit_gb']:g} of {out['commit_limit_gb']:g} GB: "
+                               'programs will start to fail to allocate.')
+    return out
+
+
+def laptop_line(memory):
+    """One sentence for the report's Laptop memory section."""
+    if not memory:
+        return 'No sample from the last two hours.'
+    text = f"Kernel pools {memory['pools_gb']:g} GB (nonpaged {memory['np_gb']:g}, paged {memory['paged_gb']:g})"
+    if memory['day_ago_gb'] is not None:
+        text += f", {memory['day_ago_gb']:g} GB a day earlier"
+    if memory['free_gb'] is not None:
+        text += f"; {memory['free_gb']:g} GB of RAM available"
+    if memory['commit_gb'] is not None:
+        text += f"; committed {memory['commit_gb']:g} of {memory['commit_limit_gb']:g} GB"
+    return text + f". Sampled {memory['at']}."
+
+
 def build_report(night, rows, state=None):
     outcomes = [r for r in rows if r.get('kind') == 'outcome']
     by_job = {r.get('job'): r for r in outcomes}
@@ -865,7 +946,13 @@ def render_markdown(model):
         if e['tail']:
             out += ['', '```text'] + [line.replace('```', "'''") for line in e['tail']] + ['```']
         out.append('')
-    if not attention:
+    warnings = (model.get('laptop') or {}).get('warnings') or []
+    if warnings:
+        out += ['### Laptop memory'] + [f'- {w}' for w in warnings] + ['']
+    disk = model.get('disk') or []
+    if disk:
+        out += ['### Laptop disk'] + [f'- {w}' for w in disk] + ['']
+    if not attention and not warnings and not disk:
         out += ['None.', '']
     out += ['## Passed', '']
     passed = [e for e in model['entries'] if e['passed']]
@@ -885,6 +972,8 @@ def render_markdown(model):
             out += [f'### {recipe}'] + [f'- {_clean(f, 400)}' for f in files]
     if not any(groups.values()):
         out.append('None.')
+    if 'laptop' in model:
+        out += ['', '## Laptop memory', '', laptop_line(model['laptop'])]
     return '\n'.join(out + ['', CLOSING, ''])
 
 
@@ -899,7 +988,13 @@ def render_html(model):
                     + (f"<li>reason: {esc(e['reason'])}</li>" if e['reason'] else '')
                     + (f"<li>missing artifacts: {esc(', '.join(e['missing']))}</li>" if e['missing'] else '') + '</ul>'
                     + (f"<pre>{esc(chr(10).join(e['tail']))}</pre>" if e['tail'] else ''))
-    if not attention:
+    warnings = (model.get('laptop') or {}).get('warnings') or []
+    if warnings:
+        body.append('<h3>Laptop memory</h3><ul>' + ''.join(f'<li>{esc(w)}</li>' for w in warnings) + '</ul>')
+    disk = model.get('disk') or []
+    if disk:
+        body.append('<h3>Laptop disk</h3><ul>' + ''.join(f'<li>{esc(w)}</li>' for w in disk) + '</ul>')
+    if not attention and not warnings and not disk:
         body.append('<p>None.</p>')
     for title, rows in (('Passed', [f"{e['display']}: {_timing(e)}, job {e['job']}" for e in model['entries'] if e['passed']]),
                         ('Not finished', [f"{e['display']}: {e['status']}, {e['phase'] or 'unknown'}, "
@@ -924,6 +1019,8 @@ def render_html(model):
             for uri, cap in images) + '</div>')
     if not galleries:
         body.append('<p>None.</p>')
+    if 'laptop' in model:
+        body.append(f"<h2>Laptop memory</h2><p>{esc(laptop_line(model['laptop']))}</p>")
     body.append(f'<p class="note">{esc(CLOSING)}</p>')
     style = ('body{font:15px/1.5 system-ui,sans-serif;margin:2rem auto;max-width:72rem;padding:0 1rem;color:#1b1b1b;background:#fff}'
              'pre{background:#f3f3f3;padding:.6rem;overflow:auto}small{color:#666;font-weight:400}'
@@ -955,6 +1052,17 @@ def cmd_report(args):
         print('No night submissions recorded.')
         return 0
     model = build_report(night, rows, state)
+    latest = max((r['night'] for r in rows if r.get('kind') == 'submitted' and isinstance(r.get('night'), str)
+                  and re.fullmatch(r'\d{4}-\d{2}-\d{2}', r['night'])), default=None)
+    if night == latest:  # the laptop's memory is today's: a report of an earlier night written now does not carry it
+        try:
+            model['laptop'] = laptop_memory(state)
+        except Exception:  # the memory line must never cost the report
+            model['laptop'] = None
+        try:
+            model['disk'] = diskspace.warnings(diskspace.session_paths(state))  # today's too
+        except Exception:  # nor may the disk line cost the report, least of all when a drive is full
+            model['disk'] = []
     out = Path(args.out) if args.out else state / 'night' / 'reports'
     written = [out / f'{night}.md']
     text = render_markdown(model)

@@ -86,28 +86,34 @@ def local_dir(root, directory):
     return directory.resolve().is_relative_to(root.resolve()) and not directory.is_symlink()
 
 
-def job_record_paths(state, jid, host_id):
-    """Files that can hold the queue record for a job id and host: one for a fleet job, else private then legacy."""
+def job_record_paths(state, jid, host_id, archived=False):
+    """Files that can hold the queue record for a job id and host: one for a fleet job, else private then legacy.
+    With `archived`, the same files in the stores' archives (<store>-archive), where the queue moves a finished job
+    nothing has written for two days."""
     v2 = jid.startswith('cq-v2--')
     if host_id == 'fleet' and jid.startswith(('cq-fleet-', 'cq-v2--fleet-')):
         target = state / 'queue-v2' if v2 else state
-        return [target / 'fleet/jobs' / (jid + '.json')]
-    target = state_for(host_id, state)
-    if v2:
-        target = target / 'queue-v2'
-    return [target / 'deferred-jobs' / (jid + '.json'), target / 'jobs' / (jid + '.json')]
+        paths = [target / 'fleet/jobs' / (jid + '.json')]
+    else:
+        target = state_for(host_id, state)
+        if v2:
+            target = target / 'queue-v2'
+        paths = [target / 'deferred-jobs' / (jid + '.json'), target / 'jobs' / (jid + '.json')]
+    return [p.parent.with_name(p.parent.name + '-archive') / p.name for p in paths] if archived else paths
 
 
 def job_record(state, jid, host_id):
-    """Authoritative queue record for a job id and host; {} when unknown or ambiguous."""
+    """Authoritative queue record for a job id and host; {} when unknown or ambiguous. A record in a store wins over
+    one in that store's archive."""
     try:
-        files = job_record_paths(state, jid, host_id)
-        if len(files) == 1:
-            return read(files[0])
-        private, legacy = files
-        # Never pick one of two conflicting records with the same ID.
-        return {} if private.exists() and legacy.exists() else read(private if private.exists() else legacy)
-    except (ValueError, TypeError, AttributeError):
+        for archived in (False, True):
+            files = [p for p in job_record_paths(state, jid, host_id, archived) if p.exists()]
+            if len(files) > 1:
+                return {}  # Never pick one of two conflicting records with the same ID.
+            if files:
+                return read(files[0])
+        return {}
+    except (OSError, ValueError, TypeError, AttributeError):
         return {}
 
 

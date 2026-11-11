@@ -137,7 +137,10 @@ def initialize_default_lock(state):
             return
         for name in ("jobs", "deferred-jobs", "fleet/jobs", "run", "fleet/run",
                      "queue-v2/jobs", "queue-v2/deferred-jobs", "queue-v2/fleet/jobs",
-                     "queue-v2/run", "queue-v2/fleet/run"):
+                     "queue-v2/run", "queue-v2/fleet/run",
+                     # finished jobs the queue moved out of the scanned stores still mean the state was in use
+                     "jobs-archive", "deferred-jobs-archive", "fleet/jobs-archive",
+                     "queue-v2/jobs-archive", "queue-v2/deferred-jobs-archive", "queue-v2/fleet/jobs-archive"):
             directory = Path(state) / name
             if directory.is_dir() and next(directory.iterdir(), None) is not None:
                 return

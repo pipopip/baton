@@ -125,6 +125,8 @@ HOST_CONF_VALID = {
     # lane_plan's socket tests leave under the 108-byte unix socket path limit
     "tmp_root": lambda v: isinstance(v, str) and re.fullmatch(r"/[A-Za-z0-9_/-]{1,19}", v) is not None,
     "go_trimpath": lambda v: isinstance(v, bool),
+    # the Linux job sandbox (host/jobbox): off (the default), optional (a job asks with sandbox: true) or required
+    "sandbox": lambda v: v in ("off", "optional", "required"),
 }
 
 
@@ -136,15 +138,24 @@ def _valid(check, v):
 
 
 def host_conf(state_dir):
-    """The valid keys of <state_dir>/host.conf.json, strings trimmed; {} when the file is missing, unreadable, not JSON,
-    not an object or nested too deep to parse. cq.py reads it at import, so nothing here may raise."""
+    """The valid keys of <state_dir>/host.conf.json, strings trimmed; {} when the file is missing. A file that is there
+    but unreadable, not JSON, not an object or nested too deep to parse gives only {"sandbox": "invalid"}: every other
+    setting falls back to its default, but a sandbox the file may have required must not silently read as off
+    (sandbox_plan then refuses every job on the host). cq.py reads it at import, so nothing here may raise."""
+    unreadable = {"sandbox": "invalid"}
     try:
-        with open(os.path.join(queue_paths.config_state(state_dir), HOST_CONF_FILE), encoding="utf-8") as f:
+        try:
+            f = open(os.path.join(queue_paths.config_state(state_dir), HOST_CONF_FILE), encoding="utf-8")
+        except FileNotFoundError:
+            return {}
+        with f:
             raw = json.load(f)
         if not isinstance(raw, dict):
-            return {}
+            return unreadable
         vals = {k: v.strip() if isinstance(v, str) else v for k, v in raw.items() if k in HOST_CONF_VALID}
         result = {k: v for k, v in vals.items() if _valid(HOST_CONF_VALID[k], v)}
+        if "sandbox" in vals and "sandbox" not in result:
+            result["sandbox"] = "invalid"  # a mistyped setting must not read as "off": sandbox_plan refuses every job
         policy_keys = set(queue_policy.DEFAULTS)
         if policy_keys.intersection(raw):
             try:
@@ -153,7 +164,7 @@ def host_conf(state_dir):
                 result["_policy_error"] = "invalid configured host scheduling policy"
         return result
     except Exception:
-        return {}
+        return unreadable
 
 
 def host_address(env, conf=None):
@@ -240,6 +251,14 @@ MAX_ATTEMPTS = 3
 TAIL_LINES = 40
 LINE_CUT = 300
 TERMINAL = ("done", "failed", "timeout", "cancelled")
+JOB_STORES = ("jobs", "deferred-jobs", os.path.join("fleet", "jobs"))  # under a state directory; each may have an archive
+ARCHIVE_SUFFIX = "-archive"     # <store>-archive/ holds the finished jobs archive_jobs moved out of <store>/
+ARCHIVE_AFTER_S = 2 * 86400     # a finished job nothing has written for this long leaves the scanned store
+ARCHIVE_HELD_S = 14 * 86400     # the same for one something still waits on (_waited_on)
+ARCHIVE_EVERY_S = 3600          # the sweep runs at most this often per state directory
+SCAN_SETTLE_S = 10.0            # _jobs_in: a file that changed this recently is read again next time
+SCAN_REFRESH_S = 300.0          # _jobs_in: and every file is read again this often, whatever its size and times say
+_SCAN_CACHE = {}                # _jobs_in: store directory -> {file name: (signature, bytes, monotonic time read)}; this process only
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
 CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -248,6 +267,10 @@ CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 
 class CqError(Exception):
     """A refusal with a reason for the caller (printed as {ok: false, error})."""
+
+
+class SandboxError(CqError):
+    """A job's sandbox request that its host's setting cannot take (at submit, and again when the launcher is made)."""
 
 
 # --------------------------------------------------------------------------- files, locks, atomic writes
@@ -370,9 +393,29 @@ def read_lines(path, last=None):
     return lines[-last:] if last else lines
 
 
+REAL_PATH_S = 2.0  # same_path: a path's resolved form is reused this long within one process
+_REAL_PATHS = {}   # same_path: path as given -> (monotonic time resolved, resolved form)
+
+
+def _resolved(path):
+    """The form same_path compares: the real path, normalised and case-folded. Resolving opens the path in the kernel
+    (every component when it does not exist), and a watch compares the worktree with the `top` of every job in the
+    stores: over 5,000 opens per tick for a handful of distinct strings. So the answer for a string is kept for
+    REAL_PATH_S. A failure is not kept."""
+    now = time.monotonic()
+    hit = _REAL_PATHS.get(path)
+    if hit is not None and 0 <= now - hit[0] < REAL_PATH_S:
+        return hit[1]
+    value = norm_path(os.path.realpath(path)).casefold()
+    if len(_REAL_PATHS) >= 1024:
+        _REAL_PATHS.clear()
+    _REAL_PATHS[path] = (now, value)
+    return value
+
+
 def same_path(a, b):
     try:
-        return norm_path(os.path.realpath(a)).casefold() == norm_path(os.path.realpath(b)).casefold()
+        return _resolved(a) == _resolved(b)
     except (OSError, ValueError, TypeError):
         return False
 
@@ -865,14 +908,31 @@ def is_fleet_id(job_id):
     return isinstance(job_id, str) and re.fullmatch(r"cq-(?:v2--)?fleet-[A-Za-z0-9_-]+", job_id) is not None
 
 
+def archived_file(path):
+    """Where archive_jobs puts a job file: <store>-archive/<same name>, beside the store."""
+    return os.path.join(os.path.dirname(path) + ARCHIVE_SUFFIX, os.path.basename(path))
+
+
 def load_job(ctx, job_id):
+    """One job by ID, from its store or, when archive_jobs has moved it out, from that store's archive. A file in the
+    store wins: saving an archived job puts it back in the store, and the next sweep moves it again."""
     if is_fleet_id(job_id):
-        return read_json(job_file(ctx, job_id))
-    normal = read_json(job_file(ctx, job_id))
-    deferred = read_json(job_file(ctx, job_id, True))
+        path = job_file(ctx, job_id)
+        job = read_json(path)
+        return job if job is not None or os.path.lexists(path) else read_json(archived_file(path))
+    paths = (job_file(ctx, job_id, True), job_file(ctx, job_id))
+    deferred, normal = read_json(paths[0]), read_json(paths[1])
     if normal is not None and deferred is not None:
         raise CqError("duplicate job ID across ordinary and deferred stores")
-    return deferred if deferred is not None else normal
+    if deferred is not None or normal is not None:
+        return deferred if deferred is not None else normal
+    if any(os.path.lexists(p) for p in paths):
+        return None  # in a store but locked or unreadable just now: an archived copy would be an older record
+    for path in paths:
+        job = read_json(archived_file(path))
+        if job is not None:
+            return job
+    return None
 
 
 def save_job(ctx, job):
@@ -883,18 +943,125 @@ def save_job(ctx, job):
         write_json(path, job)
 
 
-def _jobs_in(ctx, directory):
-    d = ctx.p(directory)
+def _job_text(path):
+    """(bytes, parsed) of one job file, with read_json's patience for a file that is locked or half written;
+    (None, None) when it is missing or stays unreadable."""
+    for _ in range(40):
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+            return raw, json.loads(raw.decode("utf-8"))
+        except FileNotFoundError:
+            return None, None
+        except (PermissionError, json.JSONDecodeError):
+            time.sleep(0.025)
+    return None, None
+
+
+def _jobs_in(ctx, directory, newer_than_s=None):
+    """Every job of one store, in file-name order, as fresh objects the caller may change. With `newer_than_s`, only
+    the files written within that many seconds (for a bounded read of an archive).
+
+    One directory listing gives each file's size and times. A file is opened only when those differ from what this
+    process saw when it last read the file, when the file had changed within SCAN_SETTLE_S of that read (two writes in
+    one clock tick can leave size and time the same), or once SCAN_REFRESH_S has passed. Otherwise the bytes read
+    before are parsed again. A tick used to open every job file of every store some sixteen times: with thousands of
+    finished jobs that was tens of thousands of file opens a second across the sessions, each one scanned by the
+    virus scanner, and Windows keeps a small share of the kernel objects of that many opens for good."""
+    d = os.path.normpath(ctx.p(directory))
     try:
-        names = sorted(n for n in os.listdir(d) if n.endswith(".json"))
+        with os.scandir(d) as it:
+            entries = sorted(((e.name, e) for e in it if e.name.endswith(".json")), key=lambda pair: pair[0])
     except FileNotFoundError:
+        _SCAN_CACHE.pop(d, None)
         return []
-    jobs = []
-    for n in names:
-        j = read_json(os.path.join(d, n))
+    cache, kept, jobs = _SCAN_CACHE.get(d, {}), {}, []
+    for name, entry in entries:
+        try:
+            st = entry.stat()
+            sig = (st.st_mtime_ns, st.st_ctime_ns, st.st_size) if stat.S_ISREG(st.st_mode) else None
+        except OSError:
+            sig = None  # never hide a job because its metadata could not be read
+        if newer_than_s is not None and sig is not None and time.time() - sig[0] / 1e9 > newer_than_s:
+            if name in cache:
+                kept[name] = cache[name]
+            continue
+        hit, mono = cache.get(name), time.monotonic()
+        if hit is not None and sig is not None and hit[0] == sig and 0 <= mono - hit[2] < SCAN_REFRESH_S:
+            kept[name] = hit
+            j = json.loads(hit[1].decode("utf-8"))
+        else:
+            raw, j = _job_text(os.path.join(d, name))
+            # file times are on the real clock, so the settle test is too (ctx.now is the queue's injectable clock)
+            if raw is not None and sig is not None and time.time() - sig[0] / 1e9 >= SCAN_SETTLE_S:
+                kept[name] = (sig, raw, mono)
         if isinstance(j, dict) and "id" in j:
             jobs.append(j)
+    _SCAN_CACHE[d] = kept
     return jobs
+
+
+def _waited_on(job):
+    """A finished job something still finds by scanning its store: a completion notice not yet delivered or artifacts
+    not yet fetched."""
+    return bool((job.get("notify", True) and not job.get("notified") and not job.get("parent"))
+                or job.get("artifact_missing") or job.get("artifact_pending"))
+
+
+def _ram_held(job):
+    """A finished RAM job whose copy on the host is not yet confirmed cleaned: reserved_memory still counts its
+    declaration and cleanup_ram still retries, both by scanning the store, so it never leaves it."""
+    return job.get("temp_storage") == "ram" and job.get("placed_where") == "host" and not job.get("ram_cleaned")
+
+
+def archive_jobs(ctx, force=False):
+    """Move finished jobs nothing has written for ARCHIVE_AFTER_S out of the stores every tick scans, into
+    <store>-archive/. At most once per ARCHIVE_EVERY_S per state directory unless `force`. A job something still
+    waits on (_waited_on) stays for ARCHIVE_HELD_S, and one whose RAM copy is not cleaned (_ram_held) stays until it
+    is. load_job still finds an archived job by its ID, so status, review
+    and the host clean-up of its directory go on working; lists and scans no longer include it. Returns the number
+    moved. File times are compared with the real clock."""
+    wall = time.time()
+    stamp = ctx.p("archive.at")
+    if not force:
+        with contextlib.suppress(OSError):
+            # abs: a file time can be a few milliseconds ahead of time.time() (Windows reads a coarser clock here)
+            if abs(wall - os.path.getmtime(stamp)) < ARCHIVE_EVERY_S:
+                return 0
+    atomic_write(stamp, b"")
+    moved = 0
+    for directory in JOB_STORES:
+        if ctx.host_id and directory != "jobs" and directory != "deferred-jobs":
+            continue  # a host's shard keeps no fleet store (all_fleet_jobs)
+        d = ctx.p(directory)
+        old = []
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    with contextlib.suppress(OSError):  # one entry that cannot be read does not skip the store
+                        if e.name.endswith(".json") and wall - e.stat().st_mtime >= ARCHIVE_AFTER_S:
+                            old.append(e.name)
+        except OSError:
+            continue
+        old.sort()
+        for i in range(0, len(old), 200):  # short holds of the queue lock: a submit or a reap gets in between
+            with ctx.qlock():
+                for name in old[i:i + 200]:
+                    path = os.path.join(d, name)
+                    try:
+                        with open(path, "rb") as f:
+                            job = json.loads(f.read().decode("utf-8"))
+                        age = wall - os.path.getmtime(path)  # again under the lock: the listing may be stale
+                    except (OSError, ValueError):
+                        continue
+                    if (not isinstance(job, dict) or job.get("status") not in TERMINAL or age < ARCHIVE_AFTER_S
+                            or _ram_held(job) or (_waited_on(job) and age < ARCHIVE_HELD_S)):
+                        continue
+                    with contextlib.suppress(OSError):
+                        os.makedirs(os.path.dirname(archived_file(path)), exist_ok=True)
+                        os.replace(path, archived_file(path))
+                        moved += 1
+    return moved
 
 
 def all_deferred_jobs(ctx):
@@ -1164,6 +1331,49 @@ def normalize_gets(raw):
     return result
 
 
+JOBBOX = "/usr/local/libexec/baton/jobbox"  # installed on a host by host/install_jobbox.sh; run.sh runs a boxed job through it
+JOBBOX_MISSING = f"host has no job sandbox helper ({JOBBOX})"
+SANDBOX_LINUX_ONLY = "the job sandbox exists only on Linux hosts"
+
+
+def sandbox_request(req):
+    """(sandbox, network) as a submit request gives them: sandbox True, False or None (not given), network a bool."""
+    sandbox, network = req.get("sandbox"), req.get("network")
+    if sandbox is not None and not isinstance(sandbox, bool):
+        raise CqError("sandbox must be true or false")
+    if network is not None and not isinstance(network, bool):
+        raise CqError("network must be true or false")
+    return sandbox, bool(network)
+
+
+SANDBOX_RANK = {"off": 0, "optional": 1, "required": 2, "invalid": 3}
+
+
+def stricter_sandbox(*modes):
+    """The strictest of the given host settings (None is no opinion); an unknown value counts as "invalid"."""
+    modes = [m if m in SANDBOX_RANK else "invalid" for m in modes if m is not None]
+    return max(modes, key=SANDBOX_RANK.__getitem__) if modes else "off"
+
+
+def sandbox_plan(job, binding):
+    """(boxed, network) for a job on the host `binding` describes: its "sandbox" setting (off when absent) and the job's
+    sandbox/network request. Raises SandboxError when the request and the host's setting disagree, or when the setting
+    itself is invalid. network matters only to a boxed job; for any other it is accepted and ignored."""
+    mode = (binding or {}).get("sandbox", "off")
+    asked = job.get("sandbox")
+    if mode not in ("off", "optional", "required"):
+        raise SandboxError('host setting "sandbox" must be off, optional or required')  # or host.conf.json is unreadable
+    if mode == "off":
+        if asked is True:
+            raise SandboxError('this host has no job sandbox (host setting "sandbox" is off)')
+        return False, False
+    if mode == "required":
+        if asked is False:
+            raise SandboxError("this host requires the job sandbox")
+        return True, job.get("network") is True
+    return asked is True, asked is True and job.get("network") is True
+
+
 def cmd_submit(ctx, req):
     if getattr(ctx, 'generation', 1) == 2:
         raise CqError('generation-two jobs require the contained fleet submission path')
@@ -1182,6 +1392,13 @@ def cmd_submit(ctx, req):
         raise CqError("where must be host, laptop or any")
     if ctx.host_id and where != "host":
         raise CqError("a remote queue shard requires where host")
+    sandbox, network = sandbox_request(req)
+    if sandbox is True and where == "laptop":
+        raise CqError(SANDBOX_LINUX_ONLY)
+    if sandbox is True and where == "any":
+        where = "host"  # the laptop has no sandbox: a sandboxed job is pinned to the host
+    if where != "laptop":  # refused here when this host's setting cannot take the request; make_launcher decides again
+        sandbox_plan({"sandbox": sandbox, "network": network}, host_binding())
     defer = req.get("defer")
     if defer is not None and defer not in ("spare", "overnight"):
         raise CqError("defer must be spare or overnight")
@@ -1274,6 +1491,7 @@ def cmd_submit(ctx, req):
         "sha": sha, "base": base_sha, "snapshot": snap, "where": where, "slots": slots, "self_heavy": self_heavy, "est_minutes": est,
         "priority": priority, "timeout_minutes": timeout_min, "label": label, "gets": gets, "split": split,
         "temp_storage": temp_storage, "memory_max_gb": memory_max_gb, "defer": defer,
+        "sandbox": sandbox, "network": network,
         **({"deferred_registered": False, "deferred_phase": "staging_pending"} if defer else {}),
         "session": req.get("session") or "", "root": norm_path(root), "top": norm_path(top),
         "worktree_identity": identity,
@@ -1346,7 +1564,7 @@ def job_summary(job, now):
                                     "deferred_phase", "deferred_registered", "artifact_missing")} | {
         "age_min": round((now - job.get("t_submitted", now)) / 60, 1),
         "elapsed_min": round((now - job["t_started"]) / 60, 1) if job.get("t_started") and job.get("status") == "running" else None,
-    }
+    } | {k: True for k in ("sandbox", "network") if job.get(k) is True}  # shown only when asked for
 
 
 def _mins(later, earlier):
@@ -2842,6 +3060,29 @@ def make_launcher(job):
                                     '"$HOME/.local/bin/cq-job" start "$ID" --memory-bytes ' +
                                     str(int(job["memory_max_gb"] * 2**30)) + ' --timeout-seconds @TIMEOUT_S@')
         template = template.replace('mkdir -p "$D/tmp"', 'printf ram > "$D/temp_storage"')
+    # the host setting binds late (fleet placement), so this is the authoritative check of the job's sandbox request
+    # A binding is frozen when the job is first dispatched, so a setting made stricter since then must still apply:
+    # where the binding is for the host whose settings are loaded now, the stricter of the two decides.
+    mode = binding.get("sandbox", "off") if binding else None
+    if not binding or binding.get("machine_id") == _CONF.get("machine_id"):
+        mode = stricter_sandbox(mode, _CONF.get("sandbox", "off"))
+    boxed, network = sandbox_plan(job, {"sandbox": mode})
+    if boxed:
+        # the job runs through the helper, which builds its sandbox or refuses (the job never runs outside it). timeout
+        # stays inside, so TERM reaches the job; started is written outside, the job directory is read-only inside.
+        # --rw: the job's scratch directory, which the sandbox's /tmp does not hold: the tmp_root dir of a disk job
+        # (RT, read from ramtmp before the job runs) or the directory the RAM service made for a RAM job.
+        check = f'[ -f {JOBBOX} ] && [ -x {JOBBOX} ] || {{ echo "CQ_NO_JOBBOX $ID"; echo {shlex.quote(JOBBOX_MISSING)} >&2; exit 79; }}'
+        template = template.replace('mkdir -p "$Q"', check + '\nmkdir -p "$Q"', 1)
+        # GOFLAGS: the job's src is a shared clone whose alternates point into the real home, absent in the sandbox, so
+        # git history is unavailable and go build of a main package would fail to get VCS status
+        template = template.replace("inner='date +%s", 'export CQ_BOX_RW="${RT:-${CQ_RAM_TMP:-}}"\n'
+                                    'export GOFLAGS="${GOFLAGS:+$GOFLAGS }-buildvcs=false"\ninner=\'date +%s', 1)
+        template = template.replace('exec timeout -k 30',
+                                    f'exec {JOBBOX}{" --net" if network else ""} --dir "$D" ${{CQ_BOX_RW:+--rw "$CQ_BOX_RW"}} -- timeout -k 30', 1)
+        if (check not in template or template.count(f"exec {JOBBOX}") != 1 or template.count("export CQ_BOX_RW=") != 1
+                or template.count("-buildvcs=false") != 1):
+            raise CqError("sandbox launcher template mismatch")  # not a SandboxError: a changed template must be loud
     return (template.replace("@ID@", shlex.quote(job["id"]))
             .replace("@CMD_B64@", shlex.quote(base64.b64encode(job["command"].encode("utf-8")).decode()))
             .replace("@TMP_BLOCK@", TMP_BLOCK.replace("@TMP_ROOT@", shlex.quote(tmp_root)) if tmp_root else "")
@@ -2955,13 +3196,22 @@ def launch_host(ctx, job, family=None):
         if HOST_PAUSED or not binding_matches_current(job):
             requeue_or_fail(ctx, job["id"], "host paused or changed before launch", transient=True)
             return
-        script = make_launcher(job)
+        try:
+            script = make_launcher(job)
+        except SandboxError as exc:  # the host's setting changed since submit, or fleet placement bound another host
+            requeue_or_fail(ctx, job["id"], str(exc), transient=False)
+            return
         b64 = base64.b64encode(script.encode("utf-8")).decode()
         argv = ["--rev", job["sha"], "--subdir", job["subdir"], "--", "bash", "-c", f"echo {b64} | base64 -d | bash"]
         if ctx.run_remoterun is real_run_remoterun:
             rc, out, err = real_run_remoterun(argv, job["top"], host=job.get("host", HOST), binding=job.get("host_config"))
         else:
             rc, out, err = ctx.run_remoterun(argv, job["top"])
+    if f"CQ_NO_JOBBOX {job['id']}" in out:
+        # the launcher stopped before it made anything on the host: a fixed fact of the host, not a transient fault. A
+        # disk or deferred job fails with the reason; a RAM job takes its usual settlement (requeue_or_fail).
+        requeue_or_fail(ctx, job["id"], JOBBOX_MISSING, transient=False)
+        return
     if job.get("defer"):
         if f"CQ_REGISTERED {job['id']}" in out:
             _launch_result(ctx, job["id"], "launching", deferred_phase="queued", deferred_registered=True, reason="registered on host",
@@ -4385,6 +4635,10 @@ def cmd_tick(ctx, req):
                 row["backfill_ok"] = True
         out.update(queued=rows, running=[job_summary(j, now) for j in running],
                    can_start=bool(can), medians=history_medians(ctx, queued + running), ended=ended)
+        with contextlib.suppress(Exception):  # housekeeping: a failed sweep must not fail the tick
+            archived = archive_jobs(ctx)
+            if archived:
+                out["archived"] = archived
     else:
         cap = load_capacity(ctx) or {}
         out["capacity"] = cap
@@ -4851,7 +5105,7 @@ def refresh_host_config(state, host_id=None):
 def host_binding():
     """Immutable execution settings copied into a job before any remote work."""
     return {**_CONF, "address": HOST, "slots": HOST_SLOTS, "slot_ram_gb": SLOT_RAM_GB,
-            "tmp_root": TMP_ROOT, "go_trimpath": GO_TRIMPATH}
+            "tmp_root": TMP_ROOT, "go_trimpath": GO_TRIMPATH, "sandbox": _CONF.get("sandbox", "off")}
 
 
 def binding_matches_current(job):

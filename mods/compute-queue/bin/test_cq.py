@@ -3824,15 +3824,20 @@ class HostConfTests(Base):
             f.write(text)
         return d
 
-    def test_a_missing_unreadable_malformed_or_non_object_file_gives_no_settings(self):
+    def test_a_missing_file_gives_no_settings_and_an_unreadable_one_only_refuses_the_sandbox(self):
+        # missing: every default. There but unreadable: every default too, except that a sandbox the file may have
+        # required must not read as off, so the one setting left says "invalid" and sandbox_plan refuses every job
+        unreadable = {"sandbox": "invalid"}
         self.assertEqual(cq.host_conf(os.path.join(self.tmp, "absent")), {})
         os.makedirs(os.path.join(self.tmp, "dir", cq.HOST_CONF_FILE))  # a directory where the file should be
-        self.assertEqual(cq.host_conf(os.path.join(self.tmp, "dir")), {})
+        self.assertEqual(cq.host_conf(os.path.join(self.tmp, "dir")), unreadable)
+        with self.assertRaises(cq.SandboxError):
+            cq.sandbox_plan({}, cq.host_conf(os.path.join(self.tmp, "dir")))
         for text in ("{", "not json", "", "[13]", '"lane-ex44"', "13", "null", "NaN"):
-            self.assertEqual(cq.host_conf(self.write_conf(text)), {}, text)
+            self.assertEqual(cq.host_conf(self.write_conf(text)), unreadable, text)
         with open(os.path.join(self.tmp, "conf", cq.HOST_CONF_FILE), "wb") as f:
             f.write(b"\xff\xfe{}")  # not UTF-8
-        self.assertEqual(cq.host_conf(os.path.join(self.tmp, "conf")), {})
+        self.assertEqual(cq.host_conf(os.path.join(self.tmp, "conf")), unreadable)
 
     def test_every_valid_key_is_kept_and_unknown_keys_are_ignored(self):
         self.assertEqual(cq.host_conf(self.write_conf(json.dumps(self.VALID))), self.VALID)
@@ -3942,8 +3947,8 @@ class HostConfTests(Base):
             self.assertEqual(cq.host_conf(self.write_conf('{"%s": %s}' % (key, big))), {}, key)
         self.assertEqual(cq.host_conf(self.write_conf('{"slot_vcpu": %s, "slots": 13}' % big)), {"slots": 13})
         deep = "[" * 200000 + "]" * 200000  # json.load raises RecursionError on this
-        self.assertEqual(cq.host_conf(self.write_conf(deep)), {})
-        self.assertEqual(cq.host_conf(self.write_conf('{"slots": 13, "extra": %s}' % deep)), {})
+        self.assertEqual(cq.host_conf(self.write_conf(deep)), {"sandbox": "invalid"})  # unreadable: see the test above
+        self.assertEqual(cq.host_conf(self.write_conf('{"slots": 13, "extra": %s}' % deep)), {"sandbox": "invalid"})
 
     def test_the_bounds_are_inclusive_and_stop_absurd_values(self):
         cases = [("slot_vcpu", 0.1, True), ("slot_vcpu", 64, True), ("slot_vcpu", 0.09, False), ("slot_vcpu", 64.5, False),

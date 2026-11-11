@@ -1,12 +1,14 @@
 """Route legacy and generation-two queue records without migrating live work."""
+import json
 import os
 from pathlib import Path
 import re
 
 import multi_host
 import queue_paths
+import queue_policy
 
-_V2 = re.compile(r'cq-v2--(?:(?:[a-z][a-z0-9_]{0,31})-)?\d{8}T\d{6}-[0-9a-f]{16}\Z')
+_V2 =re.compile(r'cq-v2--(?:(?:[a-z][a-z0-9_]{0,31})-)?\d{8}T\d{6}-[0-9a-f]{16}\Z')
 
 
 def job_generation(engine, jid):
@@ -177,6 +179,56 @@ def _apply_v2(engine, ctx, req, result, leaf):
         result['apply'] = {'ok': False, 'error': str(exc)}
 
 
+HOST_JOB_CAP_FLOOR_GB = 8      # a where: host job that becomes a fleet job without a stated memory cap gets the larger
+HOST_JOB_CAP_PER_SLOT_GB = 4   # of this floor and this much per slot (50 at most): above what fleet submitters state today
+
+
+def host_job_for_fleet(engine, ctx, req):
+    """Whether an ordinary heavy `where: host` submission becomes a fleet job pinned to its host. An ordinary heavy
+    job has no memory cap, so the host cannot run it beside fleet work: while one runs or waits, the host admits no
+    fleet job at all. As a fleet job it is contained (CPU held to its slots, memory capped) and shares the host.
+    Only a submission that names no host is converted (it goes to ember): an explicit host_id selects that host's
+    own queue, which machine-specific work such as GPU renders is qualified on. Also kept ordinary: a light job
+    (slots 0, which does not stop fleet work), and what the fleet backend does not do (split, self_heavy, RAM
+    scratch, deferred through the ordinary queue, estimates over 480 minutes).
+    A job larger than the host's fleet pool (its slots less the foreground reserve) stays ordinary too: the fleet
+    backend would accept it and never place it. So does every job while generation two cannot be used.
+    "host_jobs_to_fleet": false in the queue's own host.conf.json turns the conversion off; that file is read here,
+    once and only for a request that would otherwise convert, because the engine's loaded settings are those of
+    whichever host or shard served the last request. When it cannot be read, nothing is converted.
+
+    Returns None, or the default memory cap in GB for a job that states none: the larger of HOST_JOB_CAP_FLOOR_GB
+    and HOST_JOB_CAP_PER_SLOT_GB a slot, at most the host's memory budget (and 50)."""
+    slots, est, timeout = req.get('slots', 1), req.get('est_minutes'), req.get('timeout_minutes')
+    if not ((req.get('where') or 'host') == 'host' and type(slots) is int and slots >= 1
+            and not req.get('defer') and not req.get('self_heavy') and req.get('split') is None
+            and req.get('temp_storage', 'disk') == 'disk' and req.get('platform', 'linux') == 'linux'
+            and req.get('candidates') is None and req.get('host_id') is None
+            and isinstance(req.get('command'), str) and '{part}' not in req['command']
+            and (est is None or (type(est) is int and 1 <= est <= 480))
+            and (timeout is None or (type(timeout) is int and 1 <= timeout <= 480))):
+        return None
+    try:
+        try:
+            with open(os.path.join(queue_paths.config_state(ctx.state), 'host.conf.json'), encoding='utf-8') as handle:
+                conf = json.load(handle)
+        except FileNotFoundError:
+            conf = {}  # no settings: the engine's defaults
+        if not isinstance(conf, dict) or conf.get('host_jobs_to_fleet') is False:
+            return None
+        pool, budget = conf.get('slots', 8), conf.get('memory_budget_gb', 42)
+        if type(pool) is not int or isinstance(budget, bool) or not isinstance(budget, (int, float)) or not budget >= 1:
+            return None
+        if slots > pool - queue_policy.policy_fields(conf, pool)['foreground_slots']:
+            return None
+        usable, why = _v2_availability(engine, ctx)
+        if not usable and why:
+            return None
+        return min(50.0, float(budget), max(HOST_JOB_CAP_FLOOR_GB, HOST_JOB_CAP_PER_SLOT_GB * slots))
+    except Exception:
+        return None  # whatever is wrong with the settings, the request keeps the path it always had
+
+
 def execute(engine, ctx, command, request, leaf):
     # One refusal for every route (single host, shard, generation, fleet): who submits or cancels is always named.
     if command in ('submit', 'cancel'):
@@ -186,6 +238,7 @@ def execute(engine, ctx, command, request, leaf):
         return leaf(ctx, command, request)
     req = dict(request)
     if command == 'submit':
+        req.pop('_default_memory_max_gb', None)  # set here only, for a converted where: host job
         v2 = req.get('where') == 'fleet' or req.get('gets') is not None or any(
             req.get(key) is not None for key in ('artifact_max_mb', 'artifact_total_mb'))
         if v2 and req.get('where') != 'fleet':
@@ -197,6 +250,36 @@ def execute(engine, ctx, command, request, leaf):
             # reservations. Pin to the existing authoritative host fleet broker.
             selected = req.pop('host_id', None) or 'ember'
             req.update(where='fleet', candidates=[selected], platform='linux')
+        default_cap = None if v2 or getattr(ctx, 'host_id', None) else host_job_for_fleet(engine, ctx, req)
+        fleet = None
+        if default_cap is not None:
+            try:
+                fleet = context(engine, ctx, 2)
+            except (engine.CqError, ValueError, OSError):
+                fleet = None  # generation two cannot be opened: the request keeps the path it always had
+        if fleet is not None:
+            selected = 'ember'  # where a submission that names no host has always gone
+            slots, text = req.get('slots', 1), req['command']
+            # The ordinary backend ignored `requires` and named a job after its command: both stay so.
+            req.pop('requires', None)
+            if not req.get('label'):
+                words = [w for w in text.split() if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', w)]
+                req['label'] = (' '.join(words[:6]) or ' '.join(text.split()[:6]))[:60] or None
+            req.update(where='fleet', candidates=[selected], platform='linux', slots=slots, _default_memory_max_gb=default_cap)
+            try:
+                result = leaf(fleet, command, req)
+            except engine.CqError as exc:
+                raise engine.CqError(f'{exc} (a heavy where: host job that names no host now runs as a contained fleet job '
+                                     f'on {selected}, so the host can share its capacity)') from exc
+            if isinstance(result, dict) and result.get('ok') and isinstance(result.get('job'), str):
+                try:
+                    cap = engine.load_job(fleet, result['job'])['memory_max_gb']
+                    result['note'] = (f"{result.get('note') or 'accepted'}; this where: host job runs as a contained fleet job on "
+                                      f"{selected}: CPU held to {slots} slot{'s' if slots != 1 else ''}, memory capped at {cap:g} GB "
+                                      f"(state memory_max_gb to change it)")
+                except Exception:
+                    pass  # the note is a courtesy; the job is accepted
+            return result
         return leaf(context(engine, ctx, 2 if v2 else 1), command, req)
     if command in ('notified', 'notice_authorize') and (req.get('ids') or req.get('job')):
         return _notices(engine, ctx, command, req, leaf)

@@ -18,6 +18,9 @@ QUEUE_DELAY_SECONDS = 900
 RECENT_SECONDS = 86400
 HOSTS = (('laptop', 'L'), ('hearth', 'H'), ('ember', 'E'))
 STATUSES = ('queued', 'launching', 'running', 'done', 'failed', 'cancelled', 'timeout')
+JOB_SETTLE_S = 10.0    # _read_jobs: a job file that changed this recently is read again next time
+JOB_REFRESH_S = 300.0  # _read_jobs: and every file is read again this often, whatever its size and times say
+_JOB_CACHE = {}        # _read_jobs: jobs directory -> {file name: (signature, job, monotonic time read)}; this process only
 _TOKEN = re.compile(r'^[A-Za-z0-9_.:-]{1,100}$')
 _OOM = re.compile(r'\boom\b|out[ -]of[ -]memory|memory limit', re.I)
 
@@ -45,15 +48,52 @@ def _time(value):
     return None
 
 
-def _read(path):
+def _read(path, size=None):
+    """The JSON object in a file of at most MAX_JSON_BYTES, else None. `size`: the file's size when the caller already
+    has it from a directory listing, which saves the stat."""
     try:
-        if path.stat().st_size > MAX_JSON_BYTES:
+        if (path.stat().st_size if size is None else size) > MAX_JSON_BYTES:
             return None
         with path.open(encoding='utf-8') as f:
             value = json.load(f)
         return value if isinstance(value, dict) else None
     except (OSError, ValueError, UnicodeError):
         return None
+
+
+def _read_jobs(directory):
+    """(number of job files in the directory, the readable jobs among the first MAX_JOB_FILES in name order).
+
+    One directory listing gives each file's size and times; a file is opened only when those differ from what this
+    process saw when it last read the file, when the file had changed within JOB_SETTLE_S of that read, or once
+    JOB_REFRESH_S has passed. One status snapshot used to open every fleet job file three times, in every session's
+    tick. The jobs returned are shared between calls: callers only read them."""
+    directory = Path(directory)
+    try:
+        with os.scandir(directory) as found:
+            entries = sorted(((e.name, e) for e in found if e.name.endswith('.json')), key=lambda pair: pair[0])
+    except OSError:
+        _JOB_CACHE.pop(str(directory), None)
+        return 0, []
+    cache, kept, jobs = _JOB_CACHE.get(str(directory), {}), {}, []
+    for name, entry in entries[:MAX_JOB_FILES]:
+        try:
+            info = entry.stat()
+            stamp = (info.st_mtime_ns, info.st_ctime_ns, info.st_size)
+        except OSError:
+            stamp = None  # never hide a job because its metadata could not be read
+        hit, clock = cache.get(name), time.monotonic()
+        if hit is not None and stamp is not None and hit[0] == stamp and 0 <= clock - hit[2] < JOB_REFRESH_S:
+            kept[name] = hit
+            job = hit[1]
+        else:
+            job = _read(directory / name, None if stamp is None else stamp[2])
+            if job is not None and stamp is not None and time.time() - stamp[0] / 1e9 >= JOB_SETTLE_S:
+                kept[name] = (stamp, job, clock)
+        if job:
+            jobs.append(job)
+    _JOB_CACHE[str(directory)] = kept
+    return len(entries), jobs
 
 
 # The status line. Device words: UPPERCASE for a host that is down, stale or paused (somebody can act); lowercase for
@@ -200,7 +240,7 @@ def summarize(state, now=None, _collect=None):
         for key in ('slots_configured', 'slots_reserved'):
             value = raw.get(key)
             devices[host][key] = int(value) if _number(value) and 0 <= value <= 100000 else None
-        for key in ('memory_available_gb', 'memory_reserved_gb', 'memory_floor_gb', 'commit_free_gb', 'load', 'load_cap'):
+        for key in ('memory_available_gb', 'memory_reserved_gb', 'memory_held_gb', 'memory_floor_gb', 'commit_free_gb', 'load', 'load_cap'):
             value = raw.get(key)
             devices[host][key] = value if _number(value) and value >= 0 else None
         reason = raw.get('reason')
@@ -211,15 +251,9 @@ def summarize(state, now=None, _collect=None):
     counts = {status: 0 for status in STATUSES}
     started = 0
     tops, sessions = set(), set()
-    try:
-        paths = sorted((state / 'jobs').glob('*.json'))
-    except OSError:
-        paths = []
-    truncated = len(paths) > MAX_JOB_FILES
-    for path in paths[:MAX_JOB_FILES]:
-        job = _read(path)
-        if not job:
-            continue
+    found, jobs = _read_jobs(state / 'jobs')
+    truncated = found > MAX_JOB_FILES
+    for job in jobs:
         status = job.get('status')
         if not isinstance(status, str) or status not in counts:
             continue
@@ -292,12 +326,7 @@ def summarize_generations(queue_state, now=None):
     active = {}
     unknown = set()
     for root in roots:
-        try:
-            paths = sorted((root / 'jobs').glob('*.json'))[:MAX_JOB_FILES]
-        except OSError:
-            paths = []
-        for path in paths:
-            job = _read(path) or {}
+        for job in _read_jobs(root / 'jobs')[1]:
             host = job.get('host_id')
             if job.get('status') not in ('launching', 'running') or not isinstance(host, str):
                 continue

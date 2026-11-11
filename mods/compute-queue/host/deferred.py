@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from zoneinfo import ZoneInfo
@@ -500,8 +501,99 @@ def ordinary_waiter(d, state, policy=None, memory_total=None):
     return True, None
 
 
+def held_memory(state):
+    """Bytes of a running fleet job's cap that it already holds as memory MemAvailable no longer counts: the pages
+    on the anonymous lists of its own unit's cgroup (memory.stat active_anon + inactive_anon: anonymous and shared
+    memory, which cannot be reclaimed while the unit has no swap), at most its cap. Admission subtracts this from
+    the cap, because MemAvailable has already lost it; charging the whole cap as well counts it twice. Not the
+    `anon` figure: that includes pages freed lazily (MADV_FREE), which sit on the file lists and MemAvailable still
+    counts. Page cache is left out for the same reason, and kernel and locked memory too, so the figure errs low.
+    0 when the job is not running or the cgroup cannot be read: it is then charged its whole cap."""
+    try:
+        group = state.get('control_group')
+        if (state.get('phase') != 'running' or not isinstance(group, str) or not group.startswith('/')
+                or '..' in group.split('/') or group.rsplit('/', 1)[-1] != unit(state['id'])):
+            return 0
+        held = anon_lists(CGROUP / group.lstrip('/'))
+        return max(0, min(held, state['memory_bytes'])) if held is not None else 0
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return 0
+
+
+def anon_lists(group):
+    """Bytes on the anonymous lists of the cgroup at this path (memory.stat active_anon + inactive_anon), or None
+    when either figure is missing or the file cannot be read."""
+    try:
+        found = {}
+        for line in (group / 'memory.stat').read_text().splitlines():
+            name, _, value = line.partition(' ')
+            if name in ('active_anon', 'inactive_anon'):
+                found[name] = int(value)
+        return sum(found.values()) if len(found) == 2 and min(found.values()) >= 0 else None
+    except (OSError, ValueError):
+        return None
+
+
+HELD_SAMPLE_S = 5
+HELD_SAMPLE_START = (.2, .5, 1, 2)   # the first waits: a short job is read a few times too
+
+
+def sample_held(group, stop, result):
+    """Runs beside a job's command, started once the command exists: after each wait (HELD_SAMPLE_START, then every
+    HELD_SAMPLE_S) it reads what the job's cgroup holds on its anonymous lists and keeps the largest figure in
+    result['peak'] and the number of readings in result['samples']. memory.peak cannot say this: it counts file
+    cache, which grows to any cap and is given back under pressure. A spike between two readings is missed, so the
+    figure is a lower bound on what the job needed; a reader should want several readings before trusting it."""
+    waits = iter(HELD_SAMPLE_START)
+    while not stop.wait(next(waits, HELD_SAMPLE_S)):
+        value = anon_lists(group)
+        if value is not None:
+            result['peak'] = max(result.get('peak', 0), value)   # before the count: a count always has its peak
+            result['samples'] = result.get('samples', 0) + 1
+
+
+def start_sampler():
+    """Start sample_held on this runner's own cgroup. (readings, stop, thread); the thread is None when it could not
+    start. Called with the command already running, so nothing here may raise: the runner must go on to wait for it."""
+    sampled, stop, thread = {}, threading.Event(), None
+    try:
+        thread = threading.Thread(target=sample_held, args=(CGROUP / self_group().lstrip('/'), stop, sampled), daemon=True)
+        thread.start()
+    except Exception:
+        thread = None
+    return sampled, stop, thread
+
+
+def finish_sampler(sampled, stop, thread):
+    """Stop the sampler and give (peak bytes, readings), or None when it read nothing. Never raises."""
+    try:
+        stop.set()
+        if thread is not None:
+            thread.join(10)
+        peak, samples = sampled.get('peak'), sampled.get('samples')
+        return (peak, samples) if type(peak) is int and type(samples) is int and samples > 0 else None
+    except Exception:
+        return None
+
+
+def available_after(active):
+    """available(), read between two looks at what each job in `active` holds: reservations() made the first, this
+    makes the second, and each job keeps the smaller figure. A job that grew in between is charged for the growth,
+    and one that shrank (or ended) is not credited with memory available() already shows as free."""
+    free = available()
+    for row in active:
+        if row.get('held_memory_bytes'):
+            try:
+                state = read(Q / row['id'] / 'deferred-state.json')
+            except (OSError, ValueError, RuntimeError):
+                state = None
+            row['held_memory_bytes'] = min(row['held_memory_bytes'], held_memory(state) if isinstance(state, dict) else 0)
+    return free
+
+
 def reservations():
-    """Read reservations without mutating state; malformed active state fails closed."""
+    """Read reservations without mutating state; malformed active state fails closed. Callers that compare what
+    the jobs hold with available memory read that through available_after(active)."""
     active, ordinary, waiting = [], False, False
     policy, memory_total = None, None
     for d in sorted(Q.glob('cq-*')):
@@ -526,7 +618,7 @@ def reservations():
                 or s.get('id') != d.name):
             raise RuntimeError('invalid active fleet reservation')
         active.append({'id': d.name, 'phase': phase, 'slots': s['slots'],
-                       'reserved_memory_bytes': s['memory_bytes']})
+                       'reserved_memory_bytes': s['memory_bytes'], 'held_memory_bytes': held_memory(s)})
     return active, ordinary, waiting
 
 
@@ -583,7 +675,7 @@ def fleet_probe():
     if len(active) > policy['pool_slots']:
         raise RuntimeError('too many fleet reservations')
     load = os.getloadavg()[0]
-    avail, total = available(), total_memory()
+    avail, total = available_after(active), total_memory()
     busy = legacy_busy() or ordinary or not existing_lock_free(Q / '.heavy.gate', shared=True)
     if not any(s['phase'] == 'running' for s in active):
         busy = busy or any(not existing_lock_free(Q / ('.heavy.' + str(i))) for i in range(policy['pool_slots']))
@@ -607,6 +699,9 @@ def fleet_probe():
         peak = state.get('memory_peak_bytes')
         if type(peak) is int and peak >= 0:
             item.update(memory_peak_bytes=peak, memory_kind='cgroup_memory')
+        held_peak, samples = state.get('memory_held_peak_bytes'), state.get('memory_held_samples')
+        if type(held_peak) is int and held_peak >= 0 and type(samples) is int and samples > 0:
+            item.update(memory_held_peak_bytes=held_peak, memory_held_samples=samples)
         terminal.append(item)
     capabilities = ['linux']
     for name, candidates in (('python', ('python3', 'python')), ('bash', ('bash',)), ('go', ('go',)),
@@ -622,6 +717,7 @@ def fleet_probe():
             'total_bytes': total, 'logical_cpus': os.cpu_count(),
             'active_fleet_slots': sum(s['slots'] for s in active),
             'reserved_memory_bytes': sum(s['reserved_memory_bytes'] for s in active),
+            'held_memory_bytes': sum(s.get('held_memory_bytes', 0) for s in active),
             'legacy_busy': busy, 'ordinary_waiting': waiting, 'reasons': reasons,
             'active_fleet': active, 'terminal_fleet': terminal[-32:]}
 
@@ -637,8 +733,12 @@ def fleet_reason(value, jid=None):
     other = [s for s in active if s['id'] != jid]
     if sum(s['slots'] for s in other) + value['slots'] > value['pool_slots'] - policy_fields(value, value['pool_slots'])['foreground_slots']:
         return 'fleet CPU pool exhausted'
-    reserve = sum(s['reserved_memory_bytes'] for s in other) + math.ceil(value['memory_max_gb'] * GIB)
-    if available() < math.ceil(value['ram_floor_gb'] * GIB) + reserve:
+    # Each other job is charged the part of its cap it does not hold yet (held_memory): what it holds is already
+    # missing from available memory. available_after reads that between two looks at what they hold.
+    free = available_after(other)
+    reserve = (sum(s['reserved_memory_bytes'] - s.get('held_memory_bytes', 0) for s in other)
+               + math.ceil(value['memory_max_gb'] * GIB))
+    if free < math.ceil(value['ram_floor_gb'] * GIB) + reserve:
         return 'insufficient available memory for fleet reservations and floor'
     return None
 
@@ -851,12 +951,14 @@ def runner(jid, nonce):
             raise OSError(ctypes.get_errno(), 'PR_SET_CHILD_SUBREAPER failed')
         proc = subprocess.Popen(['/bin/bash', str(jobdir(jid) / 'run.sh')], pass_fds=tuple(held + ([gate] if gate is not None else [])),
                                 stdin=subprocess.DEVNULL, start_new_session=True)
+        sampler = start_sampler()   # what the job really holds, read while it runs
         proc.wait()
         while True:
             try:
                 os.waitpid(-1, 0)
             except ChildProcessError:
                 break
+        held_peak = finish_sampler(*sampler)
         # Read the cgroup while this runner still keeps it alive.
         try:
             relative = self_group()
@@ -867,6 +969,8 @@ def runner(jid, nonce):
                 if state and state.get('nonce') == nonce:
                     state['memory_current_bytes'] = metrics['memory.current']
                     state['memory_peak_bytes'] = metrics['memory.peak']
+                    if held_peak:
+                        state['memory_held_peak_bytes'], state['memory_held_samples'] = held_peak
                     save(jid, state)
         except (OSError, ValueError, StopIteration):
             pass  # unavailable cgroup counters do not change the job result

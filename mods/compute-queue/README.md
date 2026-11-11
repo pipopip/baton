@@ -116,7 +116,8 @@ For compatible work, submit the actual script with explicit resource needs:
 
 Codex additionally supplies the absolute owned worktree `root`; Claude derives
 it. Fleet chooses a compatible destination and pins it before staging. CPU and
-RAM are independent; admission reserves the full enforced memory cap. Do not
+RAM are independent; admission reserves a new job's full enforced memory cap
+(a job already running on a Linux host is charged the part it does not hold yet). Do not
 wrap fleet commands in `heavy`/`heavyrun` again. GPU work stays on an explicitly
 qualified backend. Source is frozen, and the command runs in a separate clone.
 
@@ -142,6 +143,22 @@ Artifact-bearing `where: "host"` requests use that host's contained fleet backen
 with at least one CPU slot, disk scratch and no `self_heavy` wrapper. The shared
 admission floor covers managed reservations and current available memory; manual
 processes and legacy zero-slot work can still change pressure after a sample.
+
+A heavy `where: "host"` submission (slots of 1 or more) that names no `host_id`
+also runs as a contained fleet job on the default host, so it can share the host
+with fleet work instead of stopping it: CPU is held to its slots and memory is
+capped at `memory_max_gb`, or the larger of 8 GiB and 4 GiB per slot. The answer
+to the submission says so. An explicit `host_id`, slots 0, a job larger than the
+host's fleet pool, `split`, `self_heavy` and RAM-scratch jobs keep the ordinary
+queue; `"host_jobs_to_fleet": false` in `host.conf.json` turns this off.
+
+Fleet jobs are placed by priority class and, within a class, smaller jobs first.
+A job that has waited an hour goes ahead of newer work of every class, oldest
+first. The first job a host cannot take yet holds that host; later jobs may still
+start there when their `est_minutes` ends before the held job could start, so an
+honest estimate and a memory cap near real need are what make a job start sooner.
+When earlier runs of the same command used far less than a stated cap or estimate,
+the answer to the submission says so.
 
 New fleet/artifact jobs use `cq-v2--` IDs and isolated `queue-v2` stores, so old
 loaded clients cannot bypass the new checks. Both current clients and Baton pickup

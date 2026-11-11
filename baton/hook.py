@@ -13,7 +13,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import capsule, config, harvest, locking, paths, registry
+from . import capsule, config, diskspace, harvest, locking, paths, registry
 
 STALE_TOKENS = 60_000          # resume warning threshold (context tokens)
 LOG_MAX_BYTES = 256 * 1024
@@ -636,6 +636,10 @@ def _on_user_prompt_locked(vendor: str, data: dict, root: Path) -> dict | None:
     pickup = _guard(vendor, "UserPromptSubmit", lambda: compute_pickup.prompt_summary(root, session_id), "")
     if pickup:
         parts.append(pickup)
+    # while a drive this session needs is nearly full, every prompt of the worktree's owner says so
+    low = _guard(vendor, "UserPromptSubmit", lambda: diskspace.prompt_warning(diskspace.session_paths(root)), "")
+    if low:
+        parts.append(low)
     if session_id and _may_record(root, session_id, data.get("transcript_path") or None, vendor, config.account_from_env(vendor, os.environ)):
         _guard(vendor, "UserPromptSubmit", lambda: registry.startup_add(
             root, vendor, config.account_from_env(vendor, os.environ), session_id, now, STARTUP_TOUCH))

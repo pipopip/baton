@@ -59,9 +59,49 @@ def repo_id(common_dir):
     return name + "-" + hashlib.sha256(absolute.encode()).hexdigest()[:16]
 
 
-def remote_script(repo, stage_name, sha, subdir, command, machine_id):
+TAG_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/+-]{0,199}")
+MAX_TAGS = 64          # the newest tags reachable from the snapshot
+MAX_TAG_BYTES = 6000   # of names and ids together: the script is one argument of ssh, and Windows caps a command line at 32,767 characters
+
+
+def tag_name_value(name):
+    return (TAG_NAME.fullmatch(name) is not None and ".." not in name and "//" not in name
+            and not name.endswith(("/", ".", ".lock")) and not any(part.startswith(".") for part in name.split("/")))
+
+
+def merged_tags(git, top, sha):
+    """The newest tags merged into sha as (name, oid) pairs sorted by name: MAX_TAGS at most and MAX_TAG_BYTES of
+    names and ids, newest first when there are more (so `git describe` finds the nearest). Tags are a convenience:
+    a failed listing gives none."""
+    try:
+        listing = git("-C", top, "for-each-ref", "--merged", sha, "--sort=-creatordate",
+                      "--format=%(objectname) %(refname)", "refs/tags")
+    except Exception:
+        return []
+    tags, size = [], 0
+    for line in listing.splitlines():
+        oid, _, ref = line.partition(" ")
+        name = ref[len("refs/tags/"):] if ref.startswith("refs/tags/") else ""
+        try:
+            revision_value(oid)
+        except ValueError:
+            continue
+        if not tag_name_value(name):
+            continue
+        size += len(name) + len(oid)
+        if len(tags) >= MAX_TAGS or size > MAX_TAG_BYTES:
+            break
+        tags.append((name, oid))
+    tags.sort(key=lambda tag: tag[0])
+    return tags
+
+
+def remote_script(repo, stage_name, sha, subdir, command, machine_id, tags=()):
     # Every interpolated value is shell-quoted; paths are anchored to $HOME.
     q = shlex.quote
+    # Tags go into the stage clone only: the shared mirror must not hold snapshot-specific tag refs. A tag that
+    # cannot be set does not fail the staging.
+    tag_lines = "".join(f'git -C "$stage" update-ref {q("refs/tags/" + name)} {q(oid)} || true\n' for name, oid in tags)
     return f'''set -eu
 expected={q(machine_id)}
 if [ -n "$expected" ]; then
@@ -79,7 +119,7 @@ git --git-dir="$bare" update-ref refs/baton-snapshots/{q(sha)} {q(sha)}
 trap 'rm -rf -- "$stage"' EXIT
 git clone -q --shared --no-checkout "$bare" "$stage"
 git -C "$stage" checkout -q --detach {q(sha)}
-stage=$(realpath -e -- "$stage")
+{tag_lines}stage=$(realpath -e -- "$stage")
 work=$(realpath -e -- "$stage/"{q(subdir)})
 case "$work/" in "$stage/"*) ;; *) echo "[remote_stage] subdir escapes staging" >&2; exit 1;; esac
 [ -d "$work" ] || {{ echo "[remote_stage] subdir is not a directory" >&2; exit 1; }}
@@ -111,12 +151,14 @@ def main(argv=None):
         resolved = git("-C", top, "rev-parse", "--verify", sha + "^{commit}")
         if resolved != sha:
             raise ValueError("--rev must name an exact commit")
+        tags = merged_tags(git, top, sha)
         script = remote_script(repo_id(common), sha[:12] + "-" + uuid.uuid4().hex,
-                               sha, subdir, command, machine_id)
+                               sha, subdir, command, machine_id, tags=tags)
         ssh = os.environ.get("CQ_SSH") or system_ssh() or "ssh"
+        revs = "".join(f"{rev}\n" for rev in [sha, *(oid for _, oid in tags)])
         with tempfile.TemporaryFile() as pack:
             subprocess.run(["git", "-C", top, "pack-objects", "--stdout", "--revs"],
-                           input=(sha + "\n").encode(), stdout=pack, check=True, creationflags=FLAGS)
+                           input=revs.encode(), stdout=pack, check=True, creationflags=FLAGS)
             pack.seek(0)
             result = subprocess.run([ssh, *SSH_OPTIONS, host, "bash -c " + shlex.quote(script)],
                                     stdin=pack, creationflags=FLAGS)

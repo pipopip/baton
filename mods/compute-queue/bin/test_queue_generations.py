@@ -95,6 +95,109 @@ class Generations(unittest.TestCase):
                     generations.execute(cq, self.ctx, command, dict(req, **partial), leaf)
         self.assertEqual(len(calls), count)
 
+    def test_a_heavy_where_host_job_becomes_a_fleet_job_pinned_to_its_host(self):
+        generations.context(cq, self.ctx, 2)
+        calls = []
+        def leaf(ctx, cmd, req):
+            calls.append((ctx.state.endswith('queue-v2'), dict(req)))
+            return {'ok': True, 'job': self.fleet, 'note': 'fleet job accepted'}
+        base = {'root': str(self.root), 'session': 'sess-A', 'command': 'bash build.sh'}
+        submit = lambda **fields: generations.execute(cq, self.ctx, 'submit', dict(base, **fields), leaf)
+        with unittest.mock.patch.object(cq, 'load_job', return_value={'memory_max_gb': 12.0}):
+            result = submit(where='host', slots=3, est_minutes=20, priority='verify', _default_memory_max_gb=50)
+        v2, sent = calls[-1]
+        self.assertTrue(v2)
+        self.assertEqual((sent['where'], sent['candidates'], sent['platform'], sent['slots']), ('fleet', ['ember'], 'linux', 3))
+        self.assertEqual(sent['_default_memory_max_gb'], 12)          # 4 GB a slot; a figure sent by the client is dropped
+        self.assertEqual((sent['est_minutes'], sent['priority'], sent['command']), (20, 'verify', 'bash build.sh'))
+        self.assertEqual(result['note'], 'fleet job accepted; this where: host job runs as a contained fleet job on ember: '
+                                         'CPU held to 3 slots, memory capped at 12 GB (state memory_max_gb to change it)')
+        self.assertEqual(sent['label'], 'bash build.sh')              # named after its command, as an ordinary job was
+        submit()                                                       # where and slots left out: the host, one slot
+        self.assertEqual((calls[-1][0], calls[-1][1]['candidates'], calls[-1][1]['slots'], calls[-1][1]['_default_memory_max_gb']),
+                         (True, ['ember'], 1, 8))                      # never under the 8 GB floor
+        # the ordinary backend ignored `requires`; a stated label stands; NAME=value stays out of a derived one
+        submit(slots=2, requires=['no-such-tool'], label='mine', command='A=1 B=2 go test ./... -run X -count 1 -v -race')
+        self.assertEqual((calls[-1][0], calls[-1][1]['label']), (True, 'mine'))
+        self.assertNotIn('requires', calls[-1][1])
+        submit(slots=2, command='A=1 B=2 go test ./... -run X -count 1 -v -race')
+        self.assertEqual(calls[-1][1]['label'], 'go test ./... -run X -count')
+        # a job larger than the host's fleet pool would be accepted there and never placed: it stays ordinary.
+        # With no settings file the pool is the engine's default 8 slots, less 2 kept for foreground work.
+        submit(slots=6)
+        self.assertTrue(calls[-1][0])
+        submit(slots=7)
+        self.assertFalse(calls[-1][0])
+        (self.root / 'host.conf.json').write_text(json.dumps({'name': 'ember', 'slots': 16}))
+        submit(slots=14)
+        self.assertEqual((calls[-1][0], calls[-1][1]['_default_memory_max_gb']), (True, 42))   # the memory budget bounds it
+        submit(slots=15)
+        self.assertFalse(calls[-1][0])
+        (self.root / 'host.conf.json').write_text(json.dumps({'name': 'ember', 'slots': 16, 'foreground_slots': 4,
+                                                             'memory_budget_gb': 30}))
+        submit(slots=12)
+        self.assertEqual((calls[-1][0], calls[-1][1]['_default_memory_max_gb']), (True, 30))
+        submit(slots=13)
+        self.assertFalse(calls[-1][0])
+        (self.root / 'host.conf.json').unlink()
+        # what stays an ordinary job: an explicitly chosen host (its own queue; GPU work is qualified there), light
+        # work, and what the fleet backend does not do
+        for fields in ({'host_id': 'hestia', 'slots': 2}, {'host_id': 'ember'},
+                       {'slots': 0}, {'slots': 2, 'self_heavy': True}, {'slots': 2, 'split': {'max_parts': 2}},
+                       {'temp_storage': 'ram', 'memory_max_gb': 4}, {'defer': 'overnight', 'host_id': 'ember', 'memory_max_gb': 4},
+                       {'where': 'laptop'}, {'where': 'any'}, {'host_id': 'laptop'}, {'est_minutes': 600},
+                       {'command': 'bash part.sh {part}'}, {'slots': '2'}, {'timeout_minutes': 900}):
+            submit(**fields)
+            self.assertFalse(calls[-1][0], fields)
+            self.assertNotIn('_default_memory_max_gb', calls[-1][1])
+        # the queue's own setting turns it off; the engine's loaded settings (the last host served) do not decide
+        (self.root / 'host.conf.json').write_text(json.dumps({'name': 'ember', 'host_jobs_to_fleet': False}))
+        submit(where='host', slots=3)
+        self.assertFalse(calls[-1][0])
+        (self.root / 'host.conf.json').write_text(json.dumps({'name': 'ember'}))
+        with unittest.mock.patch.dict(cq._CONF, {'host_jobs_to_fleet': False}):
+            submit(where='host', slots=3)
+            self.assertTrue(calls[-1][0])
+        # settings that cannot be read or make no sense: the request keeps the path it always had
+        for text in ('not json', '[]', json.dumps({'slots': '16'}), json.dumps({'slots': 16, 'foreground_slots': 'two'}),
+                     json.dumps({'memory_budget_gb': True}), '[' * 5000):
+            (self.root / 'host.conf.json').write_text(text)
+            submit(where='host', slots=3)
+            self.assertFalse(calls[-1][0], text[:40])
+        (self.root / 'host.conf.json').unlink()
+        # the settings file is not opened for a request that would not convert anyway
+        with unittest.mock.patch('builtins.open', side_effect=AssertionError('settings read')):
+            submit(slots=0)
+            submit(where='laptop')
+        # generation two unusable (its state overlaps a shard, or cannot be opened): ordinary, as before
+        with unittest.mock.patch.object(generations, '_v2_availability', return_value=(False, 'overlaps a shard')):
+            submit(slots=2)
+            self.assertFalse(calls[-1][0])
+        with unittest.mock.patch.object(generations, '_v2_availability', return_value=(False, None)):   # not created yet
+            submit(slots=2)
+            self.assertTrue(calls[-1][0])
+        opened = generations.context
+        def broken(engine, ctx, generation):
+            if generation == 2:
+                raise ValueError('generation-two state exists without a valid marker')
+            return opened(engine, ctx, generation)
+        with unittest.mock.patch.object(generations, 'context', side_effect=broken):
+            submit(slots=2, requires=['go'])
+            self.assertFalse(calls[-1][0])
+            self.assertEqual((calls[-1][1].get('requires'), calls[-1][1].get('where')), (['go'], None))   # the request as it came
+        # a direct fleet submission cannot pick the roomier default for itself
+        submit(where='fleet', _default_memory_max_gb=50)
+        self.assertNotIn('_default_memory_max_gb', calls[-1][1])
+        # a refusal says why a where: host job met a fleet rule
+        def refuse(ctx, cmd, req):
+            raise cq.CqError('fleet submission requires the current worktree owner session')
+        with self.assertRaisesRegex(cq.CqError, r'owner session \(a heavy where: host job that names no host now runs as a '
+                                                r'contained fleet job on ember, so the host can share its capacity\)$'):
+            generations.execute(cq, self.ctx, 'submit', dict(base, slots=2), refuse)
+        # the note is a courtesy: a job whose record cannot be read back is still accepted
+        with unittest.mock.patch.object(cq, 'load_job', side_effect=cq.CqError('gone')):
+            self.assertEqual(submit(slots=2), {'ok': True, 'job': self.fleet, 'note': 'fleet job accepted'})
+
     def test_views_merge_and_flag_generation_errors(self):
         generations.context(cq, self.ctx, 2)
         def leaf(ctx, cmd, req):

@@ -678,32 +678,375 @@ class FleetTests(unittest.TestCase):
         self.assertEqual(receipt['pid'], os.getpid())
         self.assertEqual(receipt['status'], 'starting')
 
-    def test_large_head_reserves_device_through_small_arrivals(self):
-        head = self.submit(candidates=['ember'], slots=5)['job']
+    def running_on_ember(self, slots=3, est=20, started_ago=600, memory=2, **fields):
+        """A fleet job this store knows to be running on ember, and the probe that reports it."""
+        jid = self.submit(candidates=['ember'], slots=slots, est_minutes=est, memory_gb=memory, memory_max_gb=memory)['job']
+        job = self.job(jid)
+        job.update(status='running', host_id='ember', host='ember', host_config={'machine_id': 'a' * 32},
+                   stage_attempted=True, deferred_registered=True, deferred_phase='running',
+                   t_launch=self.clock[0] - started_ago, t_started=self.clock[0] - started_ago, **fields)
+        cq.save_job(self.ctx, job)
+        probe = self.remote()
+        probe['data'].update(active_fleet_slots=slots, reserved_memory_bytes=int(memory * fq.GIB),
+                             active_fleet=[{'id': jid, 'slots': slots, 'reserved_memory_bytes': int(memory * fq.GIB)}])
+        return jid, probe
+
+    def queued(self, jid):
+        job = self.job(jid)
+        return job['status'], (job.get('placement_reasons') or {}).get('ember')
+
+    def test_a_smaller_job_stands_ahead_of_a_larger_one_in_its_class_for_a_bounded_time(self):
+        self.assertEqual(fq._size_delay({'est_minutes': 3, 'slots': 1}), 90)
+        self.assertEqual(fq._size_delay({'est_minutes': 90, 'slots': 5}), 7200)   # capped at 240 slot-minutes
+        self.assertEqual(fq._size_delay({}), 300)                                 # 10 minutes on one slot when unstated
+        big = self.submit(candidates=['ember'], slots=5, est_minutes=90, priority='lane')['job']
+        self.clock[0] += 600
+        small = self.submit(candidates=['ember'], slots=1, est_minutes=3, priority='lane')['job']
+        self.clock[0] += 7200
+        late = self.submit(candidates=['ember'], slots=1, est_minutes=3, priority='lane')['job']
+        urgent_big = self.submit(candidates=['ember'], slots=5, est_minutes=90, priority='verify')['job']
+        order = [j['id'] for j in sorted(fq.all_jobs(self.ctx), key=fq._order)]
+        # the class comes first; in a class the small job passes the large one, but one submitted after the large
+        # job's two hours does not
+        self.assertEqual(order, [urgent_big, small, big, late])
+        # placement also lets a job that has waited an hour go first, oldest first: here both of the first two
+        probe = self.remote()
+        self.assertEqual([j['id'] for j in fq._reserve(self.ctx, {'ember': probe})], [big])
+
+    def test_a_job_that_has_waited_an_hour_goes_ahead_of_newer_work_of_any_class(self):
+        lane = self.submit(candidates=['ember'], slots=5, est_minutes=90, priority='lane')['job']
+        self.clock[0] += 10
+        background = self.submit(candidates=['ember'], slots=1, est_minutes=3, priority='background')['job']
+        self.clock[0] += 1
+        deferred = self.submit(candidates=['ember'], slots=1, est_minutes=3, defer='spare', memory_gb=1, memory_max_gb=1)['job']
+        self.clock[0] += fq.AGE_S - 12
+        verify = self.submit(candidates=['ember'], slots=5, est_minutes=5, priority='verify')['job']
+        now = self.clock[0]
+        order = lambda: [j['id'] for j in sorted(fq.all_jobs(self.ctx), key=lambda j: fq._order(j, self.clock[0]))]
+        # one second short of the hour nothing has aged: by class
+        self.assertEqual(order(), [verify, lane, background, deferred])
+        self.assertEqual([j['id'] for j in fq._reserve(self.ctx, {'ember': self.remote()})], [verify])
+        placed = self.job(verify)
+        placed.update(status='queued', host_id=None)
+        for key in ('t_launch', 'stage_at'):
+            placed.pop(key, None)
+        cq.save_job(self.ctx, placed)
+        self.clock[0] += 1
+        # the lane job has waited the hour: it goes first; ten seconds later the background job follows it, in the
+        # order they were submitted, whatever their size; a job deferred by request does not age
+        self.assertEqual(order(), [lane, verify, background, deferred])
+        self.clock[0] += 10
+        self.assertEqual(order(), [lane, background, verify, deferred])
+        self.assertEqual([j['id'] for j in sorted(fq.all_jobs(self.ctx), key=fq._order)], [verify, lane, background, deferred])
+        self.assertEqual([j['id'] for j in fq._reserve(self.ctx, {'ember': self.remote()})], [lane])
+        self.assertEqual(self.job(verify)['status'], 'queued')
+        # an hour after its own submission the deferred job still has not aged; the verify job has, in its turn
+        placed = self.job(lane)
+        placed.update(status='done')
+        cq.save_job(self.ctx, placed)
+        self.clock[0] += fq.AGE_S
+        queued = [j for j in fq.all_jobs(self.ctx) if j['status'] == 'queued']
+        self.assertEqual([j['id'] for j in sorted(queued, key=lambda j: fq._order(j, self.clock[0]))], [background, verify, deferred])
+        self.assertEqual(fq._order(self.job(deferred), self.clock[0]), fq._order(self.job(deferred)))
+        self.assertEqual(fq._order({'id': 'x', 'priority': 'lane'}, now), fq._order({'id': 'x', 'priority': 'lane'}))  # no submission time: never aged
+
+    def test_a_short_job_passes_a_held_host_and_a_long_one_does_not(self):
+        running, probe = self.running_on_ember(slots=3, est=20, started_ago=600)   # expected to end in 10 minutes
+        head = self.submit(candidates=['ember'], slots=5, est_minutes=30, priority='verify')['job']   # 5 > 6 - 3
+        self.clock[0] += 1
+        short = self.submit(candidates=['ember'], slots=1, est_minutes=5, priority='lane')['job']
+        long = self.submit(candidates=['ember'], slots=1, est_minutes=15, priority='lane')['job']
+        probe['at'] = self.clock[0]
+        self.assertEqual(fq._shadow(self.job(head), probe, fq.all_jobs(self.ctx), self.clock[0]), self.clock[0] - 1 + 600)
+        selected = fq._reserve(self.ctx, {'ember': probe})
+        self.assertEqual([j['id'] for j in selected], [short])   # gone, by its estimate, before the head could start
+        self.assertEqual(self.queued(head), ('queued', 'CPU slots unavailable'))
+        self.assertEqual(self.queued(long), ('queued', 'reserved for an older eligible job'))
+        # the head goes first as soon as it fits, whatever else waits
+        done = self.job(running)
+        done.update(status='done')
+        cq.save_job(self.ctx, done)
+        placed = self.job(short)
+        placed.update(status='done')
+        cq.save_job(self.ctx, placed)
+        idle = self.remote()
+        self.assertEqual([j['id'] for j in fq._reserve(self.ctx, {'ember': idle})], [head])
+
+    def test_with_no_shadow_time_only_a_job_within_ten_minutes_passes(self):
+        head = self.submit(candidates=['ember'], slots=5, priority='verify')['job']
+        self.clock[0] += 1
+        ten = self.submit(candidates=['ember'], slots=1, est_minutes=10, priority='lane')['job']
+        eleven = self.submit(candidates=['ember'], slots=1, est_minutes=11, priority='lane')['job']
+        probe = self.remote()
+        probe['data']['active_fleet_slots'] = 3
+        probe['data']['active_fleet'] = [{'id': 'external'}]   # work this store does not know: its end cannot be told
+        self.assertIsNone(fq._shadow(self.job(head), probe, fq.all_jobs(self.ctx), self.clock[0]))
+        self.assertEqual([j['id'] for j in fq._reserve(self.ctx, {'ember': probe})], [ten])
+        self.assertEqual(self.queued(eleven), ('queued', 'reserved for an older eligible job'))
+        self.assertEqual(self.queued(head)[0], 'queued')
+
+    def test_a_stream_of_short_jobs_cannot_keep_the_held_job_out_for_good(self):
+        head = self.submit(candidates=['ember'], slots=5, priority='verify')['job']
+        probe = self.remote()
+        probe['data']['active_fleet_slots'] = 3
+        probe['data']['active_fleet'] = [{'id': 'external'}]   # no shadow time can be worked out
+        placed = []
+        for minute in range(40):
+            self.clock[0] += 60
+            arrival = self.submit(candidates=['ember'], slots=1, est_minutes=3, priority='lane')['job']
+            probe['at'] = self.clock[0]
+            for job in fq._reserve(self.ctx, {'ember': probe}):
+                placed.append((minute, job['id']))
+                done = self.job(job['id'])
+                done.update(status='done')   # it runs and ends before the next pass: the slot is free again
+                cq.save_job(self.ctx, done)
+        # short jobs pass for the patience time after the hold began, then nothing does
+        self.assertTrue(placed)
+        self.assertLessEqual(max(minute for minute, _ in placed) * 60, fq.HOLD_PATIENCE_S)
+        self.assertEqual(self.queued(arrival), ('queued', 'reserved for an older eligible job'))
+        held = self.job(head)
+        self.assertEqual((held['status'], held['hold_since']), ('queued', 1700000000.0 + 60))
+        # the head takes the host as soon as it fits, and its patience mark goes with it
+        idle = self.remote()
+        self.assertEqual([j['id'] for j in fq._reserve(self.ctx, {'ember': idle})], [head])
+        self.assertNotIn('hold_since', self.job(head))
+
+    def test_short_jobs_cannot_keep_passing_while_the_job_that_must_end_overruns(self):
+        # the head waits for a job already past its estimate: its allowance is counted from now, so it is no shadow time
+        running, probe = self.running_on_ember(slots=3, est=3, started_ago=240, timeout_minutes=600)
+        head = self.submit(candidates=['ember'], slots=5, est_minutes=30, priority='verify')['job']
+        self.assertIsNone(fq._shadow(self.job(head), probe, fq.all_jobs(self.ctx), self.clock[0]))
+        placed = []
+        for minute in range(40):
+            self.clock[0] += 60
+            arrival = self.submit(candidates=['ember'], slots=1, est_minutes=3, priority='lane')['job']
+            probe['at'] = self.clock[0]
+            for job in fq._reserve(self.ctx, {'ember': probe}):
+                placed.append((minute, job['id']))
+                done = self.job(job['id'])
+                done.update(status='done')
+                cq.save_job(self.ctx, done)
+        self.assertTrue(placed)
+        self.assertLessEqual(max(minute for minute, _ in placed) * 60, fq.HOLD_PATIENCE_S)
+        self.assertEqual(self.queued(arrival), ('queued', 'reserved for an older eligible job'))
+        self.assertEqual(self.job(head)['status'], 'queued')
+        # its timeout is a fixed moment again: a job that ends before it may pass, one that does not may not
+        late = self.job(running)
+        late['timeout_minutes'] = (self.clock[0] - late['t_started']) / 60 + 5
+        cq.save_job(self.ctx, late)
+        self.assertEqual(fq._shadow(self.job(head), probe, fq.all_jobs(self.ctx), self.clock[0]), self.clock[0] + 300)
+        for job in fq.all_jobs(self.ctx):
+            if job['status'] == 'queued' and job['id'] != head:
+                job.update(status='cancelled')
+                cq.save_job(self.ctx, job)
+        six = self.submit(candidates=['ember'], slots=1, est_minutes=6, priority='lane')['job']
+        self.clock[0] += 1
+        three = self.submit(candidates=['ember'], slots=1, est_minutes=3, priority='lane')['job']
+        probe['at'] = self.clock[0]
+        self.assertEqual([j['id'] for j in fq._reserve(self.ctx, {'ember': probe})], [three])   # 3 minutes, within the 5
+        done = self.job(three)
+        done.update(status='done')
+        cq.save_job(self.ctx, done)
+        self.assertEqual(fq._reserve(self.ctx, {'ember': probe}), [])
+        self.assertEqual(self.queued(six), ('queued', 'reserved for an older eligible job'))
+
+    def test_the_cap_on_new_reservations_holds_when_a_host_is_held(self):
+        self.submit(candidates=['ember'], slots=5, priority='verify')
+        self.clock[0] += 1
+        for host in ('ember', 'hearth'):
+            self.submit(candidates=[host], slots=1, est_minutes=2, priority='lane')
+        busy = self.remote()
+        busy['data']['active_fleet_slots'] = 3
+        busy['data']['active_fleet'] = [{'id': 'external'}]
+        probes = {'ember': busy, 'hearth': self.remote('hearth')}
+        self.assertEqual(len(fq._reserve(self.ctx, probes, limit=1)), 1)
+        self.assertEqual(len(fq._reserve(self.ctx, probes, limit=0)), 0)
+
+    def test_the_shadow_time_follows_estimates_overruns_and_timeouts(self):
+        now = self.clock[0]
+        job = lambda **f: dict(dict(t_started=now - 600, est_minutes=20), **f)
+        self.assertEqual(fq._expected_end(job(), now), now + 600)
+        self.assertEqual(fq._expected_end(job(t_started=now - 3600), now), now + 600)                     # past it: 10 min more
+        self.assertEqual(fq._expected_end(job(t_started=now - 7200, est_minutes=90), now), now + 1350)   # or a quarter of it
+        self.assertEqual(fq._expected_end(job(t_started=now - 3600, timeout_minutes=61), now), now + 60)  # never past its timeout
+        self.assertEqual(fq._expected_end(job(t_started=None, t_launch=now - 60), now), now + 1140)
+        self.assertEqual(fq._expected_end({}, now), now + 600)
+        # a fixed moment: within the estimate, or the timeout; not the allowance past the estimate, nor an unknown start
+        self.assertTrue(fq._end_is_firm(job(), now))
+        self.assertFalse(fq._end_is_firm(job(t_started=now - 3600), now))
+        self.assertTrue(fq._end_is_firm(job(t_started=now - 3600, timeout_minutes=65), now))
+        self.assertFalse(fq._end_is_firm(job(t_started=now - 3600, timeout_minutes=55), now))   # past its timeout too
+        self.assertFalse(fq._end_is_firm(job(t_started=now - 3600, timeout_minutes=120), now))  # the allowance ends first
+        self.assertFalse(fq._end_is_firm({}, now))
+        # memory can be what the head waits for: 40 GB available, 30 reserved, floor 4, head needs 12
+        running, probe = self.running_on_ember(slots=1, est=20, started_ago=300, memory=30)
+        head = self.submit(candidates=['ember'], slots=1, memory_gb=12, memory_max_gb=12)['job']
+        probe['at'] = self.clock[0]
+        self.assertEqual(fq._shadow(self.job(head), probe, fq.all_jobs(self.ctx), now), now - 300 + 1200)
+        # a job that already fits is kept out by something else: no shadow time
+        fits = self.submit(candidates=['ember'], slots=1, memory_gb=1, memory_max_gb=1)['job']
+        self.assertIsNone(fq._shadow(self.job(fits), probe, fq.all_jobs(self.ctx), now))
+        self.assertIsNone(fq._shadow(self.job(head), None, [], now))
+        self.assertIsNone(fq._shadow(self.job(head), self.laptop(), [], now))
+        self.assertIsNone(fq._shadow(self.job(head), {'host': 'ember', 'data': {}}, [], now))
+
+    def test_a_running_job_is_charged_only_the_part_of_its_cap_it_does_not_hold(self):
+        gib = fq.GIB
+        self.assertEqual(fq._host_charge(dict(reserved_memory_bytes=30 * gib, held_memory_bytes=20 * gib)), 10 * gib)
+        self.assertEqual(fq._host_charge(dict(reserved_memory_bytes=30 * gib, held_memory_bytes=30 * gib)), 0)
+        # a helper that does not say, or says something impossible, is charged the caps in full
+        for held in ({}, {'held_memory_bytes': None}, {'held_memory_bytes': 31 * gib}, {'held_memory_bytes': -1},
+                     {'held_memory_bytes': True}, {'held_memory_bytes': 1.5 * gib}, {'held_memory_bytes': '1'}):
+            self.assertEqual(fq._host_charge(dict(reserved_memory_bytes=30 * gib, **held)), 30 * gib, held)
+        # a 64 GB host whose one job holds 20 of its 30 GB cap: 40 GB available, floor 4. The 10 GB it may still
+        # take are kept for it, so 26 GB are free; charging all 30 on top of the 20 already gone left 6.
+        running, probe = self.running_on_ember(slots=1, est=20, started_ago=300, memory=30)
+        head = self.job(self.submit(candidates=['ember'], slots=1, memory_gb=12, memory_max_gb=12)['job'])
+        jobs = fq.all_jobs(self.ctx)
+        now = self.clock[0]
+        self.assertEqual(fq._fit(self.ctx, head, probe, jobs, now, explain=True), (None, 'RAM floor'))
+        self.assertEqual(fq._shadow(head, probe, jobs, now), now - 300 + 1200)
+        probe['data']['held_memory_bytes'] = 20 * gib
+        fit, reason = fq._fit(self.ctx, head, probe, jobs, now, explain=True)
+        self.assertEqual((fit['reserved'], reason), (10, None))
+        self.assertIsNone(fq._shadow(head, probe, jobs, now))   # it fits: nothing to wait for
+        exact = dict(head, memory_max_gb=26)
+        self.assertIsNotNone(fq._fit(self.ctx, exact, probe, jobs, now))
+        over = dict(head, memory_max_gb=26.5)
+        self.assertEqual(fq._fit(self.ctx, over, probe, jobs, now, explain=True), (None, 'RAM floor'))
+        # when the running job ends its whole cap comes back: the part still charged and the part it held
+        self.assertEqual(fq._shadow(over, probe, jobs, now), now - 300 + 1200)
+        # a launch the host has not confirmed yet holds nothing: its whole cap is charged
+        pending = self.job(self.submit(candidates=['ember'], slots=1, memory_gb=20, memory_max_gb=20)['job'])
+        pending.update(status='launching', host_id='ember', host='ember', stage_attempted=True)
+        cq.save_job(self.ctx, pending)
+        self.assertEqual(fq._fit(self.ctx, head, probe, fq.all_jobs(self.ctx), now, explain=True), (None, 'RAM floor'))
+        self.assertIsNotNone(fq._fit(self.ctx, dict(head, memory_max_gb=6), probe, fq.all_jobs(self.ctx), now))
+        fq._capacity(self.ctx, {'ember': probe}, fq.all_jobs(self.ctx))
+        device = cq.read_json(self.ctx.p('fleet', 'capacity.json'))['devices']['ember']
+        self.assertEqual((device['memory_reserved_gb'], device['memory_held_gb']), (50, 20))
+
+    def test_a_converted_host_job_gets_a_roomier_default_cap_only_when_none_is_stated(self):
+        cap = lambda **fields: self.job(self.submit(candidates=['ember'], **fields)['job'])['memory_max_gb']
+        self.assertEqual(cap(), 2.5)                                           # a fleet job that leaves the cap out
+        self.assertEqual(cap(_default_memory_max_gb=12), 12)                    # a where: host job turned into a fleet job
+        self.assertEqual(cap(_default_memory_max_gb=12, memory_max_gb=3), 3)    # a stated cap stands
+        self.assertEqual(cap(_default_memory_max_gb=12, memory_gb=20), 25)      # a stated estimate above it gets its margin
+        for bad in ('12', True, 99, 0, float('nan'), None):
+            self.assertEqual(cap(_default_memory_max_gb=bad), 2.5, bad)
+        # the default is not the submitter's figure: the sizing note does not comment on it
+        self.finished_runs(3, .5, 1, command='echo host')
+        self.assertEqual(self.submit(candidates=['ember'], command='echo host', _default_memory_max_gb=12)['note'], 'fleet job accepted')
+
+    def test_a_deferred_job_never_passes_a_held_host(self):
+        head = self.submit(candidates=['ember'], slots=5, priority='verify')['job']
+        self.clock[0] += 1
+        later = self.submit(candidates=['ember'], slots=1, est_minutes=2, priority='lane')['job']
+        job = self.job(later)
+        job['requested_defer'] = 'spare'
+        cq.save_job(self.ctx, job)
         probe = self.remote()
         probe['data']['active_fleet_slots'] = 3
         probe['data']['active_fleet'] = [{'id': 'external'}]
-        for _ in range(3):
-            self.clock[0] += 1
-            self.submit(candidates=['ember'], slots=1)
-            probe['at'] = self.clock[0]
-            self.assertEqual(fq._reserve(self.ctx, {'ember': probe}), [])
-        younger = [j for j in fq.all_jobs(self.ctx) if j['id'] != head]
-        self.assertTrue(all(j['placement_reasons']['ember'] == 'reserved for an older eligible job' for j in younger))
-        probe['data']['active_fleet_slots'] = 0
-        probe['data']['active_fleet'] = []
-        selected = fq._reserve(self.ctx, {'ember': probe})
-        self.assertEqual([j['id'] for j in selected], [head])
+        self.assertEqual(fq._reserve(self.ctx, {'ember': probe}), [])
+        self.assertEqual(self.queued(later), ('queued', 'reserved for an older eligible job'))
 
-    def test_head_reservation_leaves_other_devices_usable(self):
-        self.submit(candidates=['ember'], slots=5)
+    def finished_runs(self, n, peak_gb, minutes, held_gb=None, held_samples=12, **fields):
+        for _ in range(n):
+            self.clock[0] += 1
+            jid = self.submit(candidates=['ember'], memory_gb=1, memory_max_gb=1, est_minutes=1, **fields)['job']
+            job = self.job(jid)
+            job.update(status='done', exit=0, t_started=self.clock[0], t_finished=self.clock[0] + minutes * 60,
+                       metrics={'peak_memory_bytes': int(peak_gb * fq.GIB), 'memory_kind': 'linux-cgroup'})
+            if held_gb is not None:
+                job['metrics'].update(peak_held_bytes=int(held_gb * fq.GIB), held_samples=held_samples)
+            cq.save_job(self.ctx, job)
+
+    def test_a_cap_filled_by_file_cache_is_measured_by_what_the_runs_could_not_give_back(self):
+        gib = fq.GIB
+        jid = self.submit(candidates=['ember'])['job']
+        job = self.job(jid)
+        job.update(status='running', host_id='ember')
+        cq.save_job(self.ctx, job)
+        fq._remote_metrics(self.ctx, job, {'memory_peak_bytes': 4 * gib, 'memory_held_peak_bytes': gib, 'memory_held_samples': 7})
+        self.assertEqual(self.job(jid)['metrics'], {'peak_memory_bytes': 4 * gib, 'memory_kind': 'linux-cgroup',
+                                                    'peak_held_bytes': gib, 'held_samples': 7})
+        for held, samples in ((5 * gib, 7), (True, 7), (1.5, 7), (-1, 7), (gib, 0), (gib, None), (None, 7)):
+            fq._remote_metrics(self.ctx, job, {'memory_peak_bytes': 4 * gib, 'memory_held_peak_bytes': held, 'memory_held_samples': samples})
+            self.assertEqual(self.job(jid)['metrics'], {'peak_memory_bytes': 4 * gib, 'memory_kind': 'linux-cgroup'}, (held, samples))
+        done = self.job(jid)
+        done.update(status='done')
+        cq.save_job(self.ctx, done)
+        # three runs that filled an 12 GB cap with file cache and held 0.8 GB: the peak says nothing, the held figure does
+        self.finished_runs(2, 11.5, 3, held_gb=.8, command='echo cache')
+        self.finished_runs(1, 11.9, 3, command='echo cache')                    # an older run without the figure
+        self.finished_runs(1, 11.9, .05, held_gb=.02, held_samples=fq.HELD_MIN_SAMPLES - 1, command='echo cache')  # too few readings
+        stated = dict(candidates=['ember'], command='echo cache', memory_gb=12, memory_max_gb=12, est_minutes=5)
+        self.assertEqual(self.submit(**stated)['note'], 'fleet job accepted')   # two runs with the figure are not a record
+        self.finished_runs(1, 11.5, 3, held_gb=.75, held_samples=fq.HELD_MIN_SAMPLES, command='echo cache')
+        # both figures are of the three runs that carry enough readings: not the 11.9 GB or the 0.02 GB of the others
+        self.assertEqual(self.submit(**stated)['note'],
+                         'fleet job accepted; sizing: it reserves 12 GB; 3 earlier successful runs of this command peaked at '
+                         '11.5 GB with file cache, and held at most 0.8 GB that could not be given back (read every 5 s, so a '
+                         'short spike can be missed). A job that declares less starts sooner.')
+        self.assertEqual(self.submit(**dict(stated, memory_gb=5, memory_max_gb=5))['note'], 'fleet job accepted')  # under 4 x 0.8 + 2
+        self.assertEqual(self.submit(candidates=['ember'], command='echo cache', est_minutes=5)['note'], 'fleet job accepted')
+        # when the peak itself is far below the cap, the plainer sentence stands
+        self.assertIn('5 earlier successful runs of this command peaked at 11.9 GB at most',
+                      self.submit(**dict(stated, memory_gb=30, memory_max_gb=30))['note'])
+
+    def test_a_submission_is_told_when_its_own_record_shows_it_declares_far_too_much(self):
+        self.assertEqual(self.submit(candidates=['ember'], memory_gb=12, memory_max_gb=12, est_minutes=30)['note'], 'fleet job accepted')
+        self.finished_runs(2, 1.5, 3)
+        self.assertEqual(self.submit(candidates=['ember'], memory_gb=12, memory_max_gb=12, est_minutes=30)['note'],
+                         'fleet job accepted')  # two runs are not a record
+        self.finished_runs(1, 1.2, 2.2)
+        note = self.submit(candidates=['ember'], memory_gb=12, memory_max_gb=12, est_minutes=30)['note']
+        self.assertEqual(note, 'fleet job accepted; sizing: it reserves 12 GB and 3 earlier successful runs of this command '
+                               'peaked at 1.5 GB at most; it is estimated at 30 min and 3 earlier successful runs took '
+                               'at most 3 min. A job that declares less starts sooner.')
+        # what the submitter did not state is not theirs to correct: the defaults are 10 minutes and a derived cap
+        self.assertEqual(self.submit(candidates=['ember'])['note'], 'fleet job accepted')
+        self.assertNotIn('estimated', self.submit(candidates=['ember'], memory_gb=12, memory_max_gb=12)['note'])
+        self.assertNotIn('reserves', self.submit(candidates=['ember'], est_minutes=30)['note'])
+        self.assertEqual(self.submit(candidates=['ember'], platform='portable', memory_gb=12, memory_max_gb=12,
+                                     est_minutes=30)['note'], 'fleet job accepted')  # another platform's runs do not count
+        # close enough on either count says nothing about that count; another command has its own record
+        self.assertEqual(self.submit(candidates=['ember'], memory_gb=3, memory_max_gb=3.9, est_minutes=10)['note'], 'fleet job accepted')
+        only_memory = self.submit(candidates=['ember'], memory_gb=4, memory_max_gb=4, est_minutes=10)['note']
+        self.assertIn('it reserves 4 GB', only_memory)
+        self.assertNotIn('estimated', only_memory)
+        self.assertEqual(self.submit(candidates=['ember'], command='echo other', memory_gb=12, memory_max_gb=12)['note'],
+                         'fleet job accepted')
+        last = self.job(self.submit(candidates=['ember'], memory_gb=12, memory_max_gb=12, est_minutes=30)['job'])
+        self.assertIn('sizing: ', fq._sizing_note(self.ctx, last))
+        # a record small enough that the defaults themselves are far above it (1 minute, 0.5 GB): still only the
+        # figure the submitter stated is mentioned
+        self.finished_runs(3, .5, 1, command='echo small')
+        self.assertEqual(self.submit(candidates=['ember'], command='echo small')['note'], 'fleet job accepted')
+        stated_memory = self.submit(candidates=['ember'], command='echo small', memory_gb=12, memory_max_gb=12)['note']
+        self.assertIn('it reserves 12 GB', stated_memory)
+        self.assertNotIn('estimated', stated_memory)
+        stated_estimate = self.submit(candidates=['ember'], command='echo small', est_minutes=30)['note']
+        self.assertIn('it is estimated at 30 min', stated_estimate)
+        self.assertNotIn('reserves', stated_estimate)
+        small = self.job(self.submit(candidates=['ember'], command='echo small')['job'])
+        both = fq._sizing_note(self.ctx, small)   # the same job, had the submitter stated both figures
+        self.assertIn('it reserves', both)
+        self.assertIn('it is estimated at 10 min', both)
+        self.assertEqual(fq._sizing_note(self.ctx, small, memory=False, estimate=False), '')
+        with patch.object(fq, 'all_jobs', side_effect=RuntimeError('store')):
+            self.assertEqual(fq._sizing_note(self.ctx, last), '')
+
+    def test_a_held_host_leaves_other_devices_usable(self):
+        self.submit(candidates=['ember'], slots=5, priority='verify')
         self.clock[0] += 1
-        small = self.submit(candidates=['ember', 'hearth'], slots=1)['job']
+        long = self.submit(candidates=['ember', 'hearth'], slots=1, est_minutes=60, priority='lane')['job']
         busy = self.remote()
         busy['data']['active_fleet_slots'] = 3
         busy['data']['active_fleet'] = [{'id': 'external'}]
         selected = fq._reserve(self.ctx, {'ember': busy, 'hearth': self.remote('hearth')})
-        self.assertEqual([(j['id'], j['host_id']) for j in selected], [(small, 'hearth')])
+        self.assertEqual([(j['id'], j['host_id']) for j in selected], [(long, 'hearth')])
 
     def test_tick_and_startup_wake_persisted_work_without_new_submit(self):
         self.submit()
@@ -868,11 +1211,13 @@ class FleetTests(unittest.TestCase):
             cq.save_job(self.ctx, job)
         ember, hearth = self.remote('ember'), self.remote('hearth', 8)
         half_gib = fq.GIB // 2
-        ember['data'].update(active_fleet_slots=1, reserved_memory_bytes=half_gib,
-                             active_fleet=[dict(id=first, slots=1, reserved_memory_bytes=half_gib)])
-        hearth['data'].update(active_fleet_slots=2, reserved_memory_bytes=fq.GIB,
-                              active_fleet=[dict(id=second, slots=1, reserved_memory_bytes=half_gib),
-                                            dict(id='external-job', slots=1, reserved_memory_bytes=half_gib)])
+        quarter = fq.GIB // 4
+        ember['data'].update(active_fleet_slots=1, reserved_memory_bytes=half_gib, held_memory_bytes=half_gib,
+                             active_fleet=[dict(id=first, slots=1, reserved_memory_bytes=half_gib, held_memory_bytes=half_gib)])
+        hearth['data'].update(active_fleet_slots=2, reserved_memory_bytes=fq.GIB, held_memory_bytes=3 * quarter,
+                              active_fleet=[dict(id=second, slots=1, reserved_memory_bytes=half_gib, held_memory_bytes=half_gib),
+                                            dict(id='external-job', slots=1, reserved_memory_bytes=half_gib,
+                                                 held_memory_bytes=quarter)])
         previous_ember = json.dumps(ember, sort_keys=True)
         sampled = self.clock[0]
         self.ctx._fleet_pass_probes = {'ember': ember, 'hearth': hearth, 'laptop': self.laptop()}
@@ -885,6 +1230,8 @@ class FleetTests(unittest.TestCase):
         devices = cq.read_json(self.ctx.p('fleet', 'capacity.json'))['devices']
         self.assertEqual((devices['ember']['slots_used'], devices['ember']['memory_reserved_gb']), (0, 0))
         self.assertEqual((devices['hearth']['slots_used'], devices['hearth']['memory_reserved_gb']), (1, .5))
+        # what a finished job held leaves the count with it; the job still there keeps its own quarter
+        self.assertEqual((devices['ember']['memory_held_gb'], devices['hearth']['memory_held_gb']), (0, .25))
         self.assertEqual(devices['ember']['at'], sampled)
         self.assertEqual(devices['hearth']['at'], sampled)
         self.assertFalse(devices['ember']['eligible'])  # original hardware sample is stale
@@ -1056,6 +1403,207 @@ class FleetTests(unittest.TestCase):
             fq._pass(self.ctx, {})
         self.assertEqual(self.job(jid)['status'], 'done')
         fetch.assert_called_once()
+
+    def unconfirmed(self, **fields):
+        """A job reserved on ember whose one staging attempt, begun now, was never confirmed."""
+        jid = self.submit(candidates=['ember'])['job']
+        job = fq._reserve(self.ctx, {'ember': self.remote()})[0]
+        job.update(stage_attempted=True, stage_at=self.clock[0], launch_uncertain=True,
+                   deferred_phase='registration_unconfirmed')
+        job.update(fields)
+        for key in [k for k, v in fields.items() if v is None]:
+            del job[key]
+        cq.save_job(self.ctx, job)
+        return jid
+
+    def absent(self, jid):
+        return dict(version=1, id=jid, phase='absent', registered=False)
+
+    def reconcile_absent(self, jid, host_answer=(0, 'absent\n', '')):
+        """One controller pass in which the host's service knows nothing of the job; returns the scripts sent."""
+        scripts = []
+
+        def ssh(ctx, job, script, **kw):
+            scripts.append(script)
+            return host_answer
+        with patch.object(fq, '_probes', return_value={'ember': self.remote()}), \
+                patch.object(cq, 'deferred_control', return_value=self.absent(jid)), patch.object(cq, 'job_ssh', side_effect=ssh):
+            fq._pass(self.ctx, {})
+        return scripts
+
+    def test_an_unconfirmed_staging_that_left_nothing_on_the_host_is_made_again(self):
+        jid = self.unconfirmed()
+        self.assertEqual(self.reconcile_absent(jid), [])  # the attempt is recent: its push may still be on its way
+        self.assertNotIn('restage_due', self.job(jid))
+        self.clock[0] += fq.RESTAGE_AFTER_S + 1
+        scripts = self.reconcile_absent(jid)
+        self.assertEqual(len(scripts), 1)
+        self.assertIn(jid, scripts[0])
+        job = self.job(jid)
+        self.assertEqual((job['status'], job['host_id'], job['restage_due'], job['launch_uncertain'], job['restages']),
+                         ('launching', 'ember', True, True, 1))
+        self.assertTrue(job['stage_attempted'])  # so a cancel still asks the host
+        self.assertEqual(job['stage_resume_after'], self.clock[0] + 60)
+        self.assertEqual(job['reason'], 'host has no staged copy; staging again on the pinned host')
+        self.assertEqual(fq._reserve(self.ctx, {'ember': self.remote()}), [])  # the host stays held meanwhile
+        self.assertEqual(fq._resume_pending(self.ctx, set(), {'ember': self.remote()}), [])  # not before the wait is over
+        self.assertEqual(self.reconcile_absent(jid), [])  # and the host is not asked again while the restage is due
+        self.clock[0] += 61
+        self.assertEqual([j['id'] for j in fq._resume_pending(self.ctx, set(), {'ember': self.remote()})], [jid])
+        # the new attempt is stamped, and is itself left alone until it is old
+        self.ctx.run_remoterun = lambda argv, cwd: (255, '', 'connection lost')
+        with patch.object(cq, 'make_launcher', return_value='true'):
+            fq._stage_remote(self.ctx, self.job(jid))
+        job = self.job(jid)
+        self.assertEqual((job['stage_at'], job.get('restage_due'), job['stage_attempted']), (self.clock[0], None, True))
+        self.assertEqual(self.reconcile_absent(jid), [])
+        self.clock[0] += fq.RESTAGE_AFTER_S + 1
+        self.assertEqual(len(self.reconcile_absent(jid)), 1)
+        self.assertEqual(self.job(jid)['restages'], 2)
+
+    def test_a_cancel_after_a_restage_was_decided_still_asks_the_host(self):
+        jid = self.unconfirmed()
+        self.clock[0] += fq.RESTAGE_AFTER_S + 1
+        self.reconcile_absent(jid)
+        with patch.object(fq, '_remote_reconcile') as reconcile:
+            answer = fq.execute(self.ctx, 'cancel', dict(job=jid, root=str(self.root), session='s1'))
+        reconcile.assert_called_once()
+        self.assertEqual(answer['note'], 'cancellation pending confirmation')
+        job = self.job(jid)
+        self.assertEqual((job['status'], job['cancel_requested']), ('launching', True))
+        self.assertEqual(fq._resume_pending(self.ctx, set(), {'ember': self.remote()}), [])
+
+    def test_only_the_controller_pass_restages(self):
+        jid = self.unconfirmed()
+        self.clock[0] += fq.RESTAGE_AFTER_S + 1
+        with patch.object(cq, 'deferred_control', return_value=self.absent(jid)), \
+                patch.object(cq, 'job_ssh', return_value=(0, 'absent\n', '')) as ssh:
+            fq.execute(self.ctx, 'status', dict(job=jid, refresh=True))  # another process: a worker may hold the job
+            fq._remote_reconcile(self.ctx, self.job(jid), explicit=True)
+            ssh.assert_not_called()
+            self.assertNotIn('restage_due', self.job(jid))
+            fq._remote_reconcile(self.ctx, self.job(jid), explicit=True, restage=True)
+        self.assertTrue(self.job(jid)['restage_due'])
+
+    def test_a_job_one_of_this_controllers_workers_holds_is_not_reconciled(self):
+        jid = self.unconfirmed()
+        self.clock[0] += fq.RESTAGE_AFTER_S + 1
+        with patch.object(fq, '_probes', return_value={'ember': self.remote()}), \
+                patch.object(fq, '_remote_reconcile') as reconcile:
+            fq._pass(self.ctx, {jid: ('ember', None)})
+        reconcile.assert_not_called()
+
+    def test_each_further_staging_attempt_waits_longer(self):
+        jid = self.unconfirmed(restages=3)
+        self.clock[0] += fq.RESTAGE_AFTER_S + 1
+        self.reconcile_absent(jid)
+        job = self.job(jid)
+        self.assertEqual((job['restages'], job['stage_resume_after']), (4, self.clock[0] + 480))
+        job.update(restage_due=False, stage_at=self.clock[0], restages=40)
+        cq.save_job(self.ctx, job)
+        self.clock[0] += fq.RESTAGE_AFTER_S + 1
+        self.reconcile_absent(jid)
+        self.assertEqual(self.job(jid)['stage_resume_after'], self.clock[0] + 1800)
+
+    def test_an_attempt_without_a_stamp_is_aged_from_its_reservation_with_the_lock_wait_added(self):
+        jid = self.unconfirmed(stage_at=None)
+        job = self.job(jid)
+        self.assertNotIn('stage_at', job)
+        self.assertFalse(fq._restage_wanted(job, job['t_touch'] + fq.RESTAGE_AFTER_S + 599))
+        self.assertTrue(fq._restage_wanted(job, job['t_touch'] + fq.RESTAGE_AFTER_S + 600))
+        self.assertFalse(fq._restage_wanted(dict(job, t_touch=None), self.clock[0] + 10 ** 6))
+
+    def test_an_unconfirmed_staging_is_left_alone_unless_the_host_holds_nothing(self):
+        for label, fields, answer in (
+                ('a directory exists', {}, (0, 'present\n', '')),
+                ('the host cannot be asked', {}, (255, '', 'timeout')),
+                ('an unexpected answer', {}, (0, '', '')),
+                ('being cancelled', {'cancel_requested': True}, (0, 'absent\n', '')),
+                ('registered', {'deferred_registered': True}, (0, 'absent\n', '')),
+                ('confirmed', {'launch_uncertain': False}, (0, 'absent\n', '')),
+                ('a restage already due', {'restage_due': True}, (0, 'absent\n', ''))):
+            with self.subTest(label):
+                jid = self.unconfirmed(**fields)
+                self.clock[0] += fq.RESTAGE_AFTER_S + 1
+                job = self.job(jid)
+                with patch.object(cq, 'job_ssh', return_value=answer):
+                    self.assertFalse(fq._restage_if_absent(self.ctx, job, self.absent(jid)))
+                self.assertNotIn('restages', self.job(jid))
+                job.update(status='cancelled')  # free the host for the next case
+                cq.save_job(self.ctx, job)
+        jid = self.unconfirmed()
+        self.clock[0] += fq.RESTAGE_AFTER_S + 1
+        with patch.object(cq, 'job_ssh', return_value=(0, 'absent\n', '')) as ssh:
+            for state in (None, {'error': 'unreachable'}, dict(phase='queued'), dict(phase='running')):
+                self.assertFalse(fq._restage_if_absent(self.ctx, self.job(jid), state))
+            ssh.assert_not_called()
+
+    def test_a_restage_is_dropped_when_another_attempt_began_while_the_host_was_asked(self):
+        jid = self.unconfirmed()
+        self.clock[0] += fq.RESTAGE_AFTER_S + 1
+        seen = self.job(jid)
+
+        def ssh(ctx, job, script, **kw):
+            current = self.job(jid)
+            current['stage_at'] = self.clock[0]  # a newer attempt started after the pass read the job
+            cq.save_job(self.ctx, current)
+            return 0, 'absent\n', ''
+        with patch.object(cq, 'job_ssh', side_effect=ssh):
+            self.assertFalse(fq._restage_if_absent(self.ctx, seen, self.absent(jid)))
+        self.assertNotIn('restage_due', self.job(jid))
+
+    def test_a_registered_job_is_never_staged_again(self):
+        jid = self.unconfirmed(restage_due=True, deferred_registered=True, stage_resume_after=0)
+        self.assertEqual(fq._resume_pending(self.ctx, set(), {'ember': self.remote()}), [])
+        job = self.job(jid)
+        job.update(deferred_registered=False)
+        cq.save_job(self.ctx, job)
+        self.assertEqual([j['id'] for j in fq._resume_pending(self.ctx, set(), {'ember': self.remote()})], [jid])
+
+    def test_a_failed_preparation_of_a_restage_backs_off_like_a_first_one(self):
+        jid = self.unconfirmed(restage_due=True)
+        fq._stage_error(self.ctx, jid, RuntimeError('launcher'))
+        job = self.job(jid)
+        self.assertEqual((job['preparation_failures'], job['reason']), (1, 'pinned preparation failed: RuntimeError'))
+        self.assertEqual(job['stage_resume_after'], self.clock[0] + 30)
+
+    def test_the_memory_estimate_reads_archived_fleet_jobs_of_the_last_month(self):
+        import time as real_time
+        archive = Path(self.ctx.p('fleet', 'jobs-archive'))
+        archive.mkdir(parents=True)
+        for name, age in (('recent', 86400), ('old', fq.HISTORY_S + 86400)):
+            path = archive / f'cq-fleet-20260101T000000-{name:0>16}.json'
+            path.write_text(json.dumps({'id': path.stem, 'status': 'done', 'fleet': True}))
+            stamp = real_time.time() - age
+            os.utime(path, (stamp, stamp))
+        live = self.submit(candidates=['ember'], memory_gb=1)['job']
+        with patch.object(fq.telemetry, 'estimate_memory', return_value={'memory_gb': 3}) as estimate:
+            self.submit(candidates=['ember'])
+        history = [j['id'] for j in estimate.call_args[0][0]]
+        self.assertIn(live, history)
+        self.assertEqual([i for i in history if i.endswith(('recent', 'old'))], ['cq-fleet-20260101T000000-0000000000recent'])
+
+    def test_idle_finalization_drops_the_reservation_of_a_finished_job_that_was_archived(self):
+        jid = self.submit(candidates=['ember'])['job']
+        job = self.job(jid)
+        job.update(status='done', host_id='ember', host_config={'machine_id': 'a'*32}, t_finished=self.clock[0])
+        cq.save_job(self.ctx, job)
+        live = Path(cq.job_file(self.ctx, jid))
+        archived = Path(cq.archived_file(str(live)))
+        archived.parent.mkdir(parents=True)
+        live.replace(archived)
+        probe = self.remote('ember')
+        probe['data'].update(active_fleet_slots=1, reserved_memory_bytes=fq.GIB // 2,
+                             active_fleet=[dict(id=jid, slots=1, reserved_memory_bytes=fq.GIB // 2),
+                                           dict(id='../../x', slots=1, reserved_memory_bytes=1)])
+        self.ctx._fleet_pass_probes = {'ember': probe}
+        self.load.stop()  # this class reads fleet jobs straight from the store: use the engine's own lookup here
+        self.addCleanup(self.load.start)
+        with self.ctx.qlock():
+            self.assertEqual(fq.all_jobs(self.ctx), [])
+            fq._finalize_capacity(self.ctx, fq.all_jobs(self.ctx))
+        device = cq.read_json(self.ctx.p('fleet', 'capacity.json'))['devices']['ember']
+        self.assertEqual((device['slots_used'], device['memory_reserved_gb']), (0, 0))
 
     def test_missing_remote_facts_reconcile_two_per_host_per_pass_fairly(self):
         ids = []

@@ -303,6 +303,13 @@ def read_all_jobs(state, since, reading, primary, aliases, shards):
                 continue
             seen.add(job["id"])
             found.append(job)
+        # then the store's archive (<store>-archive, where the queue moves finished jobs out of the scanned store). A
+        # job saved again after it was archived is in both until the next sweep: the store's copy is the record and
+        # the archived one is not a repeated id.
+        for job in read_jobs(path + "-archive", tally, label, shard, primary, aliases):
+            if job["id"] not in seen:
+                seen.add(job["id"])
+                found.append(job)
         if since is not None:
             kept = [j for j in found if j["t_sub"] is not None and j["t_sub"] >= since]
             tally["dropped_since"] = len(found) - len(kept)
