@@ -187,35 +187,62 @@ def host_job_for_fleet(engine, ctx, req):
     """Whether an ordinary heavy `where: host` submission becomes a fleet job pinned to its host. An ordinary heavy
     job has no memory cap, so the host cannot run it beside fleet work: while one runs or waits, the host admits no
     fleet job at all. As a fleet job it is contained (CPU held to its slots, memory capped) and shares the host.
-    Only a submission that names no host is converted (it goes to ember): an explicit host_id selects that host's
-    own queue, which machine-specific work such as GPU renders is qualified on. Also kept ordinary: a light job
-    (slots 0, which does not stop fleet work), and what the fleet backend does not do (split, self_heavy, RAM
-    scratch, deferred through the ordinary queue, estimates over 480 minutes).
+    The host is the default one (ember) when the submission names none, names `ember` or names an alias of it.
+    A submission that names another configured host (by its id or an alias) is converted only when that host's own
+    settings opt in: "host_jobs_to_fleet": true in the host.conf.json of its shard state directory. Its GPU and
+    Blender jobs are qualified on its ordinary queue and keep it unless its owner says otherwise. An unknown or
+    disabled host, `laptop` and `fleet` are never converted: they keep the ordinary path and its own refusal.
+    Also kept ordinary: a light job (slots 0, which does not stop fleet work), and what the fleet backend does not
+    do (split, self_heavy, RAM scratch, deferred through the ordinary queue, estimates over 480 minutes).
     A job larger than the host's fleet pool (its slots less the foreground reserve) stays ordinary too: the fleet
     backend would accept it and never place it. So does every job while generation two cannot be used.
-    "host_jobs_to_fleet": false in the queue's own host.conf.json turns the conversion off; that file is read here,
-    once and only for a request that would otherwise convert, because the engine's loaded settings are those of
-    whichever host or shard served the last request. When it cannot be read, nothing is converted.
+    The other host must also be one the fleet backend can use: an `address`, a `host_id` equal to its registry id and
+    not `paused` in that same file; otherwise the job would wait for good as offline, so it keeps the ordinary path.
+    An empty host_id is the same as none. "host_jobs_to_fleet": false in the queue's own host.conf.json turns the default host's conversion off. The
+    host's file is read here, once and only for a request that would otherwise convert, because the engine's loaded
+    settings are those of whichever host or shard served the last request; its pool, memory budget and foreground
+    reserve come from that file. When it cannot be read, nothing is converted.
 
-    Returns None, or the default memory cap in GB for a job that states none: the larger of HOST_JOB_CAP_FLOOR_GB
-    and HOST_JOB_CAP_PER_SLOT_GB a slot, at most the host's memory budget (and 50)."""
+    Returns None, or (host, cap): the host the fleet job is pinned to (canonical id) and the default memory cap in
+    GB for a job that states none: the larger of HOST_JOB_CAP_FLOOR_GB and HOST_JOB_CAP_PER_SLOT_GB a slot, at most
+    the host's memory budget (and 50)."""
     slots, est, timeout = req.get('slots', 1), req.get('est_minutes'), req.get('timeout_minutes')
+    named = req.get('host_id')
+    if named == '':
+        named = None  # multi_host.execute sends an empty host_id to the default host
     if not ((req.get('where') or 'host') == 'host' and type(slots) is int and slots >= 1
             and not req.get('defer') and not req.get('self_heavy') and req.get('split') is None
             and req.get('temp_storage', 'disk') == 'disk' and req.get('platform', 'linux') == 'linux'
-            and req.get('candidates') is None and req.get('host_id') is None
+            and req.get('candidates') is None
+            and (named is None or (isinstance(named, str) and named not in ('laptop', 'fleet')))
             and isinstance(req.get('command'), str) and '{part}' not in req['command']
             and (est is None or (type(est) is int and 1 <= est <= 480))
             and (timeout is None or (type(timeout) is int and 1 <= timeout <= 480))):
         return None
     try:
+        host, state = 'ember', queue_paths.config_state(ctx.state)
+        if named not in (None, 'ember'):
+            aliases = {}
+            registry = multi_host._registry(engine, ctx, aliases)
+            host = aliases.get(named, named)
+            if host != 'ember':
+                if host not in registry or not registry[host][1]:
+                    return None  # unknown or disabled: the ordinary path gives its refusal
+                state = registry[host][0]
         try:
-            with open(os.path.join(queue_paths.config_state(ctx.state), 'host.conf.json'), encoding='utf-8') as handle:
+            with open(os.path.join(state, 'host.conf.json'), encoding='utf-8') as handle:
                 conf = json.load(handle)
         except FileNotFoundError:
             conf = {}  # no settings: the engine's defaults
-        if not isinstance(conf, dict) or conf.get('host_jobs_to_fleet') is False:
+        if not isinstance(conf, dict):
             return None
+        if host == 'ember':
+            if conf.get('host_jobs_to_fleet') is False:
+                return None
+        elif conf.get('host_jobs_to_fleet') is not True:
+            return None
+        elif not (conf.get('address') and conf.get('host_id') == host and not conf.get('paused')):
+            return None  # the fleet backend would not take this host (fleet_queue._hosts): the ordinary path refuses loudly
         pool, budget = conf.get('slots', 8), conf.get('memory_budget_gb', 42)
         if type(pool) is not int or isinstance(budget, bool) or not isinstance(budget, (int, float)) or not budget >= 1:
             return None
@@ -224,7 +251,7 @@ def host_job_for_fleet(engine, ctx, req):
         usable, why = _v2_availability(engine, ctx)
         if not usable and why:
             return None
-        return min(50.0, float(budget), max(HOST_JOB_CAP_FLOOR_GB, HOST_JOB_CAP_PER_SLOT_GB * slots))
+        return host, min(50.0, float(budget), max(HOST_JOB_CAP_FLOOR_GB, HOST_JOB_CAP_PER_SLOT_GB * slots))
     except Exception:
         return None  # whatever is wrong with the settings, the request keeps the path it always had
 
@@ -250,15 +277,16 @@ def execute(engine, ctx, command, request, leaf):
             # reservations. Pin to the existing authoritative host fleet broker.
             selected = req.pop('host_id', None) or 'ember'
             req.update(where='fleet', candidates=[selected], platform='linux')
-        default_cap = None if v2 or getattr(ctx, 'host_id', None) else host_job_for_fleet(engine, ctx, req)
+        plan = None if v2 or getattr(ctx, 'host_id', None) else host_job_for_fleet(engine, ctx, req)
         fleet = None
-        if default_cap is not None:
+        if plan is not None:
             try:
                 fleet = context(engine, ctx, 2)
             except (engine.CqError, ValueError, OSError):
                 fleet = None  # generation two cannot be opened: the request keeps the path it always had
         if fleet is not None:
-            selected = 'ember'  # where a submission that names no host has always gone
+            selected, default_cap = plan
+            req.pop('host_id', None)  # the fleet backend takes candidates, not a host_id
             slots, text = req.get('slots', 1), req['command']
             # The ordinary backend ignored `requires` and named a job after its command: both stay so.
             req.pop('requires', None)
@@ -269,7 +297,7 @@ def execute(engine, ctx, command, request, leaf):
             try:
                 result = leaf(fleet, command, req)
             except engine.CqError as exc:
-                raise engine.CqError(f'{exc} (a heavy where: host job that names no host now runs as a contained fleet job '
+                raise engine.CqError(f'{exc} (a heavy where: host job now runs as a contained fleet job '
                                      f'on {selected}, so the host can share its capacity)') from exc
             if isinstance(result, dict) and result.get('ok') and isinstance(result.get('job'), str):
                 try:

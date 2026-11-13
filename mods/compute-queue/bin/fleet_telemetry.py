@@ -16,6 +16,7 @@ MAX_JSON_BYTES = 256 * 1024
 STALE_SECONDS = 300
 QUEUE_DELAY_SECONDS = 900
 RECENT_SECONDS = 86400
+HELD_MIN_SAMPLES = 6  # readings a run's held peak needs before it is trusted (the host's first six span about 14 s)
 HOSTS = (('laptop', 'L'), ('hearth', 'H'), ('ember', 'E'))
 STATUSES = ('queued', 'launching', 'running', 'done', 'failed', 'cancelled', 'timeout')
 JOB_SETTLE_S = 10.0    # _read_jobs: a job file that changed this recently is read again next time
@@ -332,9 +333,10 @@ def summarize_generations(queue_state, now=None):
                 continue
             if not re.fullmatch(r'[a-z][a-z0-9_]{0,31}', host):
                 continue
-            # A host-registered deferred job waiting for its window holds no slot (admission leaves it out too,
-            # fleet_queue._pending). Counting it showed a host as over its pool, with an overrun alert, for the
-            # whole evening before the night's jobs started.
+            # A job registered on its host and not yet started holds no slot. Counting the deferred ones showed a
+            # host as over its pool, with an overrun alert, for the whole evening before the night's jobs started.
+            # (Admission, fleet_queue._pending, leaves out only those: an immediate job waiting there is charged
+            # the room it waits for, which is not the same as holding it.)
             if host != 'laptop' and job.get('deferred_registered') is True and job.get('deferred_phase') == 'queued':
                 continue
             slots = job.get('slots')
@@ -446,13 +448,17 @@ def estimate_memory(history, profile_key, command_key, platform, host_id, slots,
 
     Only fully completed, successful exact matches with one shared memory kind
     count. Mixed measurement kinds fall back rather than being combined.
+    A cache-filled run (its peak reached its cap, and most of that peak was file
+    cache rather than memory the job held) keeps the estimate it ran with, or
+    twice what it held plus 1 GB if larger, so file cache cannot ratchet the
+    estimate upward. Its cache-inflated peak does not raise the estimate.
     """
     default = float(default_gb) if _number(default_gb) else 1.0
     default = min(1024.0, max(0.25, default))
     result = {'memory_gb': default, 'sample_count': 0, 'memory_kind': None, 'method': 'default'}
     if any(x is None or x == '' for x in (profile_key, command_key, platform, host_id, slots)):
         return result
-    values, kinds = [], set()
+    values, kinds, capped = [], set(), False
     for row in history:
         if (not isinstance(row, dict) or row.get('status') != 'done'
                 or not _number(row.get('exit')) or row.get('exit') != 0):
@@ -470,12 +476,25 @@ def estimate_memory(history, profile_key, command_key, platform, host_id, slots,
         kind, peak = metrics.get('memory_kind'), metrics.get('peak_memory_bytes')
         if not isinstance(kind, str) or not _TOKEN.fullmatch(kind) or not _number(peak) or peak <= 0:
             continue
-        values.append(float(peak) / 1024 ** 3)
+        peak_gb = float(peak) / 1024 ** 3
+        cap, held = row.get('memory_max_gb'), metrics.get('peak_held_bytes')
+        samples = metrics.get('held_samples')
+        if (type(held) is int and 0 <= held <= peak and type(samples) is int and samples >= HELD_MIN_SAMPLES
+                and _number(cap) and cap > 0 and peak_gb >= 0.95 * cap and held / 1024 ** 3 <= 0.5 * cap):
+            # Cache-filled: the peak is the cap, not the job's own memory, so keep the prior estimate.
+            prior = row.get('memory_gb')
+            if not (_number(prior) and prior > 0):
+                prior = cap / 1.25
+            values.append(max(prior, held / 1024 ** 3 * 2 + 1))
+            capped = True
+        else:
+            # Max plus 25% avoids underestimating small or skewed samples.
+            values.append(peak_gb * 1.25)
         kinds.add(kind)
     if not values or len(kinds) != 1:
         return result
-    # Max plus 25% avoids underestimating small or skewed samples; clamp a
-    # finite advisory value without lowering the caller's default reservation.
-    estimate = max(default, min(1024.0, max(values) * 1.25))
+    # Clamp a finite advisory value without lowering the caller's default reservation.
+    estimate = max(default, min(1024.0, max(values)))
+    method = 'max_plus_25_percent_cache_capped' if capped else 'max_plus_25_percent'
     return {'memory_gb': math.ceil(estimate * 4) / 4, 'sample_count': len(values),
-            'memory_kind': next(iter(kinds)), 'method': 'max_plus_25_percent'}
+            'memory_kind': next(iter(kinds)), 'method': method}

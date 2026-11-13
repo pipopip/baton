@@ -57,6 +57,10 @@ function program(t: string): string | null {
   if (/^(?:~|[A-Za-z]:)?\/(?:[^/]+\/)*\.elan\/bin\/lake$/.test(q)) return 'lake'
   if (/^(?:~|[A-Za-z]:)?\/(?:[^/]+\/)*bin\/heavy$/.test(q)) return 'heavy'
   if (/(^|\/)\.venv\/(?:Scripts|bin)\/python(?:3)?(?:\.exe)?$/i.test(q)) return 'python'
+  // A Mac's package managers install the bare names under /opt/homebrew/bin, /usr/local/bin, /opt/local/bin and the
+  // python.org framework: such an absolute path stands for the bare name. /usr/bin is not one (Apple's own stubs).
+  const installed = /^\/(?:opt\/homebrew|usr\/local|opt\/local|Library\/Frameworks\/Python\.framework\/Versions\/[\d.]+)\/bin\/([a-z0-9]+)$/.exec(q)
+  if (installed !== null && installed[1] !== 'cd') return program(installed[1] as string)
   return null
 }
 

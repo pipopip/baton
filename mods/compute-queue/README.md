@@ -68,7 +68,9 @@ the directory containing both Python files, selecting budgets for that machine:
 python3 install_deferred.py --pool-slots 8 --load-cap 8 --ram-floor-gb 4
 ```
 
-This installs a user-scoped helper and timer. It requires at least three pool
+This installs a user-scoped helper and timer, and a `cq-fleet.slice` unit that
+limits the memory of all fleet jobs together to the host's memory less the RAM
+floor. It requires at least three pool
 slots and refuses to replace a different installed policy; settle existing jobs
 before changing a host policy. Fleet currently reserves two of the configured
 slots for foreground work. Do not copy an example's budget without checking the
@@ -117,7 +119,17 @@ For compatible work, submit the actual script with explicit resource needs:
 Codex additionally supplies the absolute owned worktree `root`; Claude derives
 it. Fleet chooses a compatible destination and pins it before staging. CPU and
 RAM are independent; admission reserves a new job's full enforced memory cap
-(a job already running on a Linux host is charged the part it does not hold yet). Do not
+(a job already running on a Linux host is charged the part it does not hold yet).
+A Linux host whose `cq-fleet.slice` memory limit is in effect for every running fleet
+job, while the rest of the machine leaves room, instead admits on the memory a job is
+expected to use (twice the largest memory held by at least three earlier successful
+runs of the same command, plus 1 GB, at most the cap). If any of that cannot be
+shown (a job that started before the upgrade still runs outside the slice, the
+kernel does not enforce the limit, or other memory use leaves less than the floor
+less 1 GiB), every job is charged its cap. The consequence is that jobs running together can need more than the pool, and
+the kernel can then kill a job that is under its own cap; the job ends `failed` with a
+reason starting `out of memory (oom-kill)`. Set `"expected_memory_admission": false`
+in a host's `host.conf.json` to charge caps for it. Do not
 wrap fleet commands in `heavy`/`heavyrun` again. GPU work stays on an explicitly
 qualified backend. Source is frozen, and the command runs in a separate clone.
 
@@ -128,9 +140,11 @@ before relying on laptop sleep. Foreground reserves and IANA timezone/HH:MM wind
 must match the installed host policy. Upgrade the helper unchanged first; intentional
 policy edits use its guarded `--update-policy` operation while drained.
 
-Continue independent work after submission. Use `bt compute --refresh`, verify
-the source SHA, exit, logs and actual returned files, then use
-`bt compute --reviewed ID --resolution checked|follow-up|superseded`. Open images
+Continue independent work after submission. For a deferred job, use
+`bt compute --refresh`, verify the source SHA, exit, logs and actual returned files,
+then use `bt compute --reviewed ID --resolution checked|follow-up|superseded`. A job
+that was not deferred needs no review mark once its completion notice has been
+delivered. Open images
 and inspect video frames before approving creative results. Missing artifacts
 remain visible. New artifact jobs default to 256 MiB per file and 1 GiB per job.
 `artifact_max_mb` allows up to 1024 MiB and `artifact_total_mb` up to 4096 MiB;
@@ -144,19 +158,26 @@ with at least one CPU slot, disk scratch and no `self_heavy` wrapper. The shared
 admission floor covers managed reservations and current available memory; manual
 processes and legacy zero-slot work can still change pressure after a sample.
 
-A heavy `where: "host"` submission (slots of 1 or more) that names no `host_id`
-also runs as a contained fleet job on the default host, so it can share the host
-with fleet work instead of stopping it: CPU is held to its slots and memory is
+A heavy `where: "host"` submission (slots of 1 or more) for the default host (no
+`host_id` or an empty one, or `ember`) also runs as a contained fleet job on it, so it can share the
+host with fleet work instead of stopping it: CPU is held to its slots and memory is
 capped at `memory_max_gb`, or the larger of 8 GiB and 4 GiB per slot. The answer
-to the submission says so. An explicit `host_id`, slots 0, a job larger than the
-host's fleet pool, `split`, `self_heavy` and RAM-scratch jobs keep the ordinary
-queue; `"host_jobs_to_fleet": false` in `host.conf.json` turns this off.
+to the submission says so. A job that names another configured host keeps that
+host's ordinary queue unless the host's own `host.conf.json` sets
+`"host_jobs_to_fleet": true` and gives it an `address`, a matching `host_id` and no
+`paused`. Slots 0, a job larger than the host's fleet pool,
+`split`, `self_heavy` and RAM-scratch jobs keep the ordinary queue;
+`"host_jobs_to_fleet": false` in the default host's `host.conf.json` turns this off.
 
 Fleet jobs are placed by priority class and, within a class, smaller jobs first.
 A job that has waited an hour goes ahead of newer work of every class, oldest
 first. The first job a host cannot take yet holds that host; later jobs may still
 start there when their `est_minutes` ends before the held job could start, so an
 honest estimate and a memory cap near real need are what make a job start sooner.
+When that time cannot be told, a job estimated at ten minutes or less may pass for
+15 minutes after the hold began, and after that only while the job the held job
+waits for is past its estimate, was launched before the hold began and has a
+timeout that the passing job would end before. Deferred jobs never pass a held host.
 When earlier runs of the same command used far less than a stated cap or estimate,
 the answer to the submission says so.
 

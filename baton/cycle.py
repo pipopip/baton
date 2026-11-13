@@ -27,7 +27,6 @@ mode; a minimum interval between cycles of one worktree.
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import os
 import re
@@ -38,7 +37,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import capsule, config, handoff, harvest, hook, launch, locking, paths, procs, registry
+from . import capsule, config, handoff, harvest, hook, launch, locking, paths, procs, registry, terminal
 
 CONFIG_NAME = "cycle.toml"
 LOCAL_NAME = "cycle.local.toml"
@@ -71,9 +70,8 @@ _ASYNC_LAUNCH = re.compile(r"\s*Async agent launched\b")   # how a launch result
 _ASSISTANT = re.compile(rb'"role"\s*:\s*"assistant"')
 _LOG_LINE = re.compile(r"^(\S+) cycled (\S+) ")
 
-PROMPT = ("Context cycle: the previous session reached {tokens} tokens and was cycled by the baton cycle hook. "
-          "Resume from .baton/now.md and the capsule; run the inbox receive; restart the background watchers "
-          "listed in now.md; continue the work.")
+PROMPT = ("Context cycle: the previous session was cycled at {tokens} tokens. Continue the work from "
+          ".baton/now.md and the capsule; restart only what now.md lists under In flight.")
 
 DRAIN_REASON = (
     "baton cycle: this session's context is ~{k}k tokens (limit {limit}k) and background subagents are still "
@@ -649,15 +647,49 @@ def pid_for_session(session_id: str, root: Path | None = None) -> int | None:
             except (TypeError, ValueError):
                 continue
             if hook._pid_alive(pid):
-                if os.name == "nt":
+                if procs.platform_name() == "windows":
                     try:
                         expected_start = int(rec["procStart"])
                     except (KeyError, TypeError, ValueError):
                         continue
                     if procs.process_start_time(pid) != expected_start:
                         continue
+                elif not _record_names_process(rec, pid):
+                    continue
                 return pid
     return None
+
+
+# A process born later than its session record's startedAt by more than this cannot be that session's process.
+START_SLACK_SECONDS = 5.0
+
+
+def _record_names_process(rec: dict, pid: int) -> bool:
+    """Off Windows: whether the live process ``pid`` can be the one the session record ``rec`` was written by.
+
+    Claude Code's ``procStart`` is a Windows FILETIME there and its format elsewhere is not known, so it is not
+    compared. The record's ``startedAt`` (milliseconds since the epoch) is: a process that started more than
+    START_SLACK_SECONDS after the record was written is not its writer (the pid was reused). A record without a
+    usable ``startedAt``, or a process whose start cannot be read, proves nothing and is refused."""
+    started = rec.get("startedAt")
+    if not isinstance(started, (int, float)) or isinstance(started, bool) or not started > 0:
+        return False
+    born = procs.process_started_epoch(pid)
+    return born is not None and born <= started / 1000 + START_SLACK_SECONDS
+
+
+def _expected_start(rec: dict, pid: int) -> int:
+    """The identity ``handoff.prepare`` and ``end_process`` hold the old session's process to (raises KeyError,
+    TypeError, ValueError or OSError when it cannot be established). Windows: the record's ``procStart``.
+    Elsewhere: ``procs.process_start_time(pid)``, read once ``_record_names_process`` has accepted the record."""
+    if procs.platform_name() == "windows":
+        return int(rec["procStart"])
+    if not _record_names_process(rec, pid):
+        raise ValueError("session record does not name the running process")
+    start = procs.process_start_time(pid)
+    if start is None:
+        raise OSError("cannot read the process start time")
+    return start
 
 
 def session_record(session_id: str) -> dict:
@@ -716,31 +748,13 @@ def successor_model(ws: str, transcript: str | os.PathLike | None, cfg: dict | N
     return None, "the routing lead model"
 
 
-def _lit(text: str) -> str:
-    return "'" + str(text).replace("'", "''") + "'"
-
-
-def tab_command(root: Path, vendor: str, account: str | None, prompt: str, model: str | None = None,
-                handoff_token: str | None = None) -> str:
-    """PowerShell text the new tab runs: the same `bt <worktree>` start path, fresh, with the continue prompt."""
-    cmd = f". {_lit(config.INSTALL_HOME / 'bt.ps1')}; bt {_lit(str(root))} -Vendor {_lit(vendor)}"
-    if account:
-        cmd += f" -Account {_lit(account)}"
-    cmd += f" -Fresh -Prompt {_lit(prompt)}"
-    if model:
-        cmd += f" -Model {_lit(model)}"
-    if handoff_token:
-        gate = (f"& {_lit(config.PYTHON)} -S {_lit(config.INSTALL_HOME / 'bt.py')} cycle --wait-handoff "
-                f"{_lit(handoff_token)} --root {_lit(str(root))}")
-        cmd = f"{gate}; if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}; {cmd}"
-    return cmd
-
-
-def wt_argv(root: Path, title: str, command: str, wt: str = "wt.exe") -> list[str]:
-    encoded = base64.b64encode(launch.managed_tab_command(command).encode("utf-16-le")).decode("ascii")
-    shell = "pwsh" if shutil.which("pwsh") else "powershell"
-    return [wt, "-w", "0", "nt", "-d", str(root), "--title", title, "--suppressApplicationTitle",
-            shell, "-EncodedCommand", encoded]
+def tab_for(root: Path, title: str, vendor: str, account: str | None, prompt: str, model: str | None = None,
+            handoff_token: str | None = None) -> terminal.Tab:
+    """The new tab: the same `bt <worktree>` start path, fresh, with the continue prompt; with ``handoff_token`` it
+    first runs the gate that waits for the old session to be gone and stops the launch unless that succeeds."""
+    return terminal.Tab(cwd=str(root), title=title, launch=terminal.Launch(
+        bt=terminal.bt_args(str(root), vendor, account, fresh=True, prompt=prompt, model=model),
+        gate=terminal.handoff_gate(handoff_token, root, vendor) if handoff_token else None))
 
 
 def workflow_registered(ws: str, thread: str) -> bool | None:
@@ -838,9 +852,9 @@ def run_cycle(root: Path, old_session: str, old_pid: int | None, tokens: int, tr
         write_flag(root, None)
         return 2
     model, model_from = successor_model(ws, transcript, cfg)
-    command = tab_command(root, vendor, account, PROMPT.format(tokens=tokens), model)
-    argv = wt_argv(root, ws, command, shutil.which("wt.exe") or "wt.exe")
-    echo(f"[cycle] {ws}: old session {harvest.id8(old_session)} pid {pid} ({tokens} tokens); new tab: {command}")
+    be = terminal.backend()
+    command = be.command_text(tab_for(root, ws, vendor, account, PROMPT.format(tokens=tokens), model))
+    echo(f"[cycle] {ws}: old session {harvest.id8(old_session)} pid {pid} ({tokens} tokens); new tab ({be.name}): {command}")
     log(f"model {ws} session {harvest.id8(old_session)}: successor on {model or 'the launcher default'} (from {model_from})")
     if dry:
         echo("[cycle] dry run: nothing released, launched or ended")
@@ -857,21 +871,17 @@ def run_cycle(root: Path, old_session: str, old_pid: int | None, tokens: int, tr
     try:
         if int(old_record.get("pid", 0)) != pid:
             raise ValueError("session pid mismatch")
-        expected_start = int(old_record["procStart"])
+        expected_start = _expected_start(old_record, pid)
         token = handoff.prepare(root, old_session, pid, expected_start, 2 * confirm_seconds + 15)
     except (KeyError, TypeError, ValueError, OSError) as exc:
         write_flag(root, None)
         echo(f"[cycle] cannot establish staged handoff: {exc}; old session kept")
         return 1
-    command = tab_command(root, vendor, account, PROMPT.format(tokens=tokens), model, token)
-    argv = wt_argv(root, ws, command, shutil.which("wt.exe") or "wt.exe")
-    try:
-        subprocess.Popen(argv, env=config.clean_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, close_fds=True)
-    except OSError as exc:
+    opened = be.open([tab_for(root, ws, vendor, account, PROMPT.format(tokens=tokens), model, token)], env=config.clean_env())
+    if not opened:
         handoff.cancel(root, token)
         write_flag(root, None)
-        echo(f"[cycle] wt.exe failed: {exc}; old session and ownership kept")
+        echo(f"[cycle] {be.name} failed: {opened.error}; old session and ownership kept")
         return 1
     staged_at = time.time()          # the waiting tab was requested; every later timestamp is measured from here
     deadline = time.monotonic() + confirm_seconds
@@ -996,9 +1006,39 @@ def _status_rows() -> list[dict]:
     return rows
 
 
+def successor_cli_problem(vendor: str) -> str | None:
+    """Why the CLI the successor will run (``config.exe(vendor)``, resolved as ``bt`` resolves it) cannot be started
+    from this environment, or None when it can: a path must be an executable file, a bare name must be on PATH."""
+    exe = config.exe(vendor)
+    if os.sep in exe or (os.altsep and os.altsep in exe):
+        path = Path(os.path.expanduser(exe))
+        if not path.is_file():
+            return f"the {vendor} CLI {exe} does not exist"
+        if not os.access(path, os.X_OK):
+            return f"the {vendor} CLI {exe} is not executable"
+        return None
+    if shutil.which(exe) is None:
+        return f"the {vendor} CLI {exe!r} is not on PATH"
+    return None
+
+
+def _wait_handoff(args) -> int:
+    """The waiting gate of a staged tab. Before it reports ready (which lets ``run_cycle`` end the old process) it
+    resolves the successor's CLI in this tab's own environment; off Windows only (see ``terminal.handoff_gate``)."""
+    root, vendor = Path(args.root), getattr(args, "vendor", None)
+    problem = successor_cli_problem(vendor) if vendor and not config.WINDOWS else None
+    if problem:
+        message = (f"{problem} in this terminal's environment (a macOS tab reads .zprofile, not .zshrc): the successor "
+                   "cannot start, so the old session is kept; fix PATH or BATON_CLAUDE_EXE in .zprofile")
+        print(f"[cycle] {message}", file=sys.stderr)
+        log(f"gate {paths.ws_name(root)}: {message}")
+        return 1
+    return 0 if handoff.wait_ready(root, args.wait_handoff) else 1
+
+
 def _cmd(args) -> int:
     if getattr(args, "wait_handoff", None):
-        return 0 if handoff.wait_ready(Path(args.root), args.wait_handoff) else 1
+        return _wait_handoff(args)
     if args.run:
         root = Path(args.root) if args.root else _resolve(None)
         return run_cycle(root, args.old_session, int(args.old_pid) if args.old_pid else None, int(args.tokens or 0),
@@ -1081,6 +1121,7 @@ def register(sub) -> None:
     p.add_argument("--on", action="store_true", help="kill switch off")
     # the detached cycler's own arguments
     p.add_argument("--wait-handoff", help=argparse.SUPPRESS)
+    p.add_argument("--vendor", help=argparse.SUPPRESS)
     p.add_argument("--run", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--root", help=argparse.SUPPRESS)
     p.add_argument("--old-session", help=argparse.SUPPRESS)

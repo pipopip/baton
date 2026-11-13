@@ -143,8 +143,36 @@ class HostSettingTests(Base):
         self.assertFalse(big["job"].startswith("cq-v2--"), big["job"])
         self.assertEqual([j["id"] for j in cq.all_jobs(self.ctx)], [big["job"]])
         # a refusal by the fleet backend says what happened to the request
-        with self.assertRaisesRegex(cq.CqError, r"resource_key.*\(a heavy where: host job that names no host now runs as a contained"):
+        with self.assertRaisesRegex(cq.CqError, r"resource_key.*\(a heavy where: host job now runs as a contained"):
             cq.execute(self.ctx, "submit", dict(who, command="bash build.sh", slots=2, resource_key=5))
+
+    def test_a_heavy_host_job_naming_an_opted_in_host_by_its_alias_is_accepted_by_the_real_fleet_leaf(self):
+        # nothing is mocked below cq.execute: the conversion, the real fleet leaf and its refusal of a host_id
+        cq.write_json(self.ctx.p("host.conf.json"), {"name": "ember", "address": "build@ember", "slots": 8})
+        self.addCleanup(cq.refresh_host_config, os.environ["CQ_STATE"])
+        os.makedirs(self.ctx.p("hosts", "hearth"), exist_ok=True)
+        cq.write_json(self.ctx.p("hosts.json"), {"version": 1, "hosts": {"hearth": {"state": "hosts/hearth", "enabled": True}},
+                                                 "aliases": {"hestia": "hearth"}})
+        conf = {"name": "hearth", "host_id": "hearth", "address": "worker@lan", "slots": 8, "host_jobs_to_fleet": True}
+        cq.write_json(self.ctx.p("hosts", "hearth", "host.conf.json"), conf)
+        who = {"root": self.repo, "session": "sess-A", "command": "bash build.sh", "slots": 2}
+        for name in ("hestia", "hearth"):
+            with self.subTest(name):
+                result = cq.execute(self.ctx, "submit", dict(who, host_id=name))
+                self.assertTrue(result["ok"], result)
+                self.assertTrue(result["job"].startswith("cq-v2--fleet-"), result["job"])
+                job = cq.load_job(queue_generations.context(cq, self.ctx, 2), result["job"])
+                self.assertEqual((job["where"], job["candidates"], job["host_id"], job["memory_max_gb"]), ("fleet", ["hearth"], None, 8.0))
+        # a host the fleet backend cannot use keeps the ordinary path, which refuses or accepts it on its own terms
+        for change in ({"address": None}, {"host_id": "other"}, {"paused": True}):
+            with self.subTest(change):
+                cq.write_json(self.ctx.p("hosts", "hearth", "host.conf.json"), dict(conf, **change))
+                self.assertIsNone(queue_generations.host_job_for_fleet(cq, self.ctx, dict(who, host_id="hestia")))
+        # an empty host_id is the default host
+        cq.write_json(self.ctx.p("hosts", "hearth", "host.conf.json"), conf)
+        result = cq.execute(self.ctx, "submit", dict(who, host_id=""))
+        job = cq.load_job(queue_generations.context(cq, self.ctx, 2), result["job"])
+        self.assertEqual((job["candidates"], job["host_id"]), (["ember"], None))
 
     def test_binding_of_an_explicitly_selected_host_shard(self):
         cq.write_json(self.ctx.p("host.conf.json"), {"name": "ember", "address": "build@ember", "slots": 4})
@@ -596,6 +624,67 @@ class LaunchFailureTests(Base):
         self.assertEqual(self.job(jid)["reason"], cq.JOBBOX_MISSING)
 
 
+class StagingSignalTests(Base):
+    """The staging helper is told whether the job runs in the sandbox, by the decision make_launcher makes."""
+
+    def setUp(self):
+        super().setUp()
+        patch = mock.patch.object(cq, "_CONF", {"sandbox": "optional"})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def run_env(self, **kwargs):
+        seen = {}
+
+        def fake_run(argv, **kw):
+            seen.update(env=kw["env"], argv=argv)
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+        with mock.patch.object(cq, "_run", side_effect=fake_run),                 mock.patch.dict(os.environ, {"CQ_REMOTE_SANDBOXED": "1"}):  # an ambient value never decides
+            cq.real_run_remoterun(["--", "true"], cwd=".", host="user@host.example", binding={"portable_runner": True}, **kwargs)
+        return seen["env"]
+
+    def test_the_helper_environment_carries_the_signal_only_for_a_sandboxed_job(self):
+        self.assertEqual(self.run_env(sandboxed=True)["CQ_REMOTE_SANDBOXED"], "1")
+        self.assertNotIn("CQ_REMOTE_SANDBOXED", self.run_env())
+        self.assertNotIn("CQ_REMOTE_SANDBOXED", self.run_env(sandboxed=False))
+
+    def test_the_signal_survives_the_fallback_address(self):
+        envs = []
+
+        def fake_run(argv, **kw):
+            envs.append(kw["env"])
+            return subprocess.CompletedProcess(argv, 255 if len(envs) == 1 else 0, b"", b"ssh: connect to host user@host.example port 22: timed out" if len(envs) == 1 else b"")
+        with mock.patch.object(cq, "_run", side_effect=fake_run):
+            cq.real_run_remoterun(["--", "true"], cwd=".", host="user@host.example",
+                                  binding={"portable_runner": True, "fallback_address": "user@other.example"}, sandboxed=True)
+        self.assertEqual([e["LANE_HOST"] for e in envs], ["user@host.example", "user@other.example"])
+        self.assertEqual([e["CQ_REMOTE_SANDBOXED"] for e in envs], ["1", "1"])
+
+    def test_launch_host_tells_the_helper_what_its_launcher_decided(self):
+        for request, boxed in ((dict(sandbox=True), True), (dict(), False), (dict(sandbox=False), False)):
+            with self.subTest(request=request):
+                jid = self.submit(**request)
+                self.assertTrue(cq.dispatch(self.ctx, {"job": jid, "where": "host"})["ok"])
+                remote = mock.Mock(side_effect=lambda argv, cwd, **kw: (0, f"CQ_LAUNCHED {jid}\n", ""))
+                with mock.patch.object(cq, "real_run_remoterun", remote):
+                    self.ctx.run_remoterun = remote
+                    cq.launch(self.ctx, jid)
+                self.assertEqual(remote.call_count, 1)
+                self.assertIs(remote.call_args.kwargs["sandboxed"], boxed)
+                script = base64.b64decode(remote.call_args.args[0][-1].split(" ")[1]).decode()
+                self.assertEqual("exec /usr/local/libexec/baton/jobbox" in script, boxed)
+
+    def test_a_host_made_required_after_dispatch_is_signalled_with_the_launcher(self):
+        jid = self.submit()  # asked for nothing, bound while the host was off
+        with mock.patch.object(cq, "_CONF", {}):
+            self.assertTrue(cq.dispatch(self.ctx, {"job": jid, "where": "host"})["ok"])
+        remote = mock.Mock(side_effect=lambda argv, cwd, **kw: (0, f"CQ_LAUNCHED {jid}\n", ""))
+        with mock.patch.object(cq, "real_run_remoterun", remote), mock.patch.object(cq, "_CONF", {"sandbox": "required"}):
+            self.ctx.run_remoterun = remote
+            cq.launch(self.ctx, jid)
+        self.assertIs(remote.call_args.kwargs["sandboxed"], True)
+
+
 class FleetSandboxTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -708,6 +797,23 @@ class FleetSandboxTests(unittest.TestCase):
         self.assertIn("jobbox --net --dir", sent[0])
         after = self.job(jid)
         self.assertEqual((after["status"], after["reason"]), ("failed", cq.JOBBOX_MISSING))
+
+    def test_staging_tells_the_helper_what_the_launcher_decided(self):
+        for conf, request, boxed in (({"sandbox": "optional"}, {"sandbox": True}, True), ({"sandbox": "optional"}, {}, False),
+                                     ({"sandbox": "required"}, {}, True)):
+            with self.subTest(conf=conf, request=request):
+                cq.write_json(str(self.state / "host.conf.json"), {"address": "ember", "host_id": "ember", **conf})
+                jid = self.submit(candidates=["ember"], **request)["job"]
+                job = fq._reserve(self.ctx, {"ember": self.remote("ember", conf["sandbox"])})[0]
+                remote = mock.Mock(return_value=(0, "", ""))
+                with mock.patch.object(cq, "real_run_remoterun", remote):
+                    self.ctx.run_remoterun = remote
+                    fq._stage_remote(self.ctx, job)
+                self.assertEqual(remote.call_count, 1)
+                self.assertIs(remote.call_args.kwargs["sandboxed"], boxed)
+                script = base64.b64decode(remote.call_args.args[0][-1].split(" ")[1]).decode()
+                self.assertEqual("exec /usr/local/libexec/baton/jobbox" in script, boxed)
+                cq.save_job(self.ctx, dict(self.job(jid), status="failed"))
 
     def test_staging_with_a_setting_that_no_longer_takes_the_request_fails_it(self):
         jid = self.submit(sandbox=True, candidates=["ember"])["job"]

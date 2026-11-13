@@ -16,8 +16,11 @@ _POLL_SECONDS = 0.1
 
 
 def _process_state(pid: int, start: int) -> bool | None:
-    """Exact identity alive, gone, or unknown. Unknown never grants a handoff."""
-    if os.name != "nt" or not isinstance(pid, int) or pid <= 0 or not isinstance(start, int) or start <= 0:
+    """Exact identity alive, gone, or unknown. Unknown never grants a handoff. Off Windows the identity is the pid
+    with its ``procs.process_start_time`` and a zombie counts as gone (see ``procs.process_identity_state``)."""
+    if procs.platform_name() != "windows":
+        return procs.process_identity_state(pid, start)
+    if not isinstance(pid, int) or pid <= 0 or not isinstance(start, int) or start <= 0:
         return None
     import ctypes
     from ctypes import wintypes

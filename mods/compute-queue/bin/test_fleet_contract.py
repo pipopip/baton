@@ -51,13 +51,17 @@ class FleetContractTests(unittest.TestCase):
 
     def test_host_waiting_queue_is_not_an_occupied_memory_reservation(self):
         import fleet_queue
-        job = {'id': self.jid, 'status': 'launching', 'host_id': 'hearth',
+        job = {'id': self.jid, 'status': 'launching', 'host_id': 'hearth', 'requested_defer': 'overnight',
                'deferred_registered': True, 'deferred_phase': 'queued', 'memory_max_gb': 8}
-        self.assertEqual(fleet_queue._pending([job], 'hearth', set()), [])
+        self.assertEqual(fleet_queue._pending([job], 'hearth', set()), [])    # deferred work waiting for its window
         job['deferred_registered'] = False
         self.assertEqual(fleet_queue._pending([job], 'hearth', set()), [job])
         job.update(host_id='laptop', deferred_registered=True)
         self.assertEqual(fleet_queue._pending([job], 'laptop', set()), [job])
+        # an immediate job registered and not yet started waits for room now: it is charged
+        job.update(host_id='hearth', requested_defer=None)
+        self.assertEqual(fleet_queue._pending([job], 'hearth', set()), [job])
+        self.assertEqual(fleet_queue._pending([job], 'hearth', {self.jid}), [])   # ... until the host lists it as active
 
     def test_codex_carries_independent_resources_and_compatibility(self):
         root = str(self.base / 'repo')

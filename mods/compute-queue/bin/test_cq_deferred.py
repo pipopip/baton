@@ -62,6 +62,22 @@ class DeferredTests(Base):
         self.assertEqual(cq.reserved_memory(self.ctx), 0)
         self.assertEqual(cq.running_jobs(self.ctx), [])
 
+    def test_stderr_of_a_registration_that_succeeded_stays_on_the_record(self):
+        for err, kept in (('[remote_stage] incremental staging failed; sending the full history\n', True), ('', False)):
+            with self.subTest(err=err):
+                jid = self.deferred()
+                job = self.job(jid)
+                job.update(status='launching', host_id='ember', host='me@192.0.2.7', host_config={})
+                cq.save_job(self.ctx, job)
+                self.ctx.run_remoterun = lambda argv, cwd: (0, f'CQ_REGISTERED {jid}\n', err)
+                with mock.patch.object(cq, 'make_launcher', return_value='true'), \
+                     mock.patch.object(cq, 'binding_matches_current', return_value=True):
+                    cq.launch_host(self.ctx, self.job(jid))
+                after = self.job(jid)
+                self.assertTrue(after['deferred_registered'])
+                self.assertEqual(after.get('staging_stderr'), err.strip() if kept else None)
+                self.assertEqual('staging_stderr' in cq.job_brief(after, self.clock[0]), kept)
+
     def test_legacy_scheduler_and_cancel_cannot_find_private_job(self):
         jid = self.deferred()
         self.assertTrue(os.path.isfile(self.ctx.p('deferred-jobs', jid + '.json')))
@@ -227,6 +243,26 @@ class DeferredTests(Base):
         with mock.patch.object(cq, 'job_ssh') as ssh:
             cq.cleanup_host(self.ctx, {'jobs': {jid: ent}}, self.clock[0], host=job['host'], binding=job['host_config'])
             ssh.assert_not_called()
+            # the copy is kept a week from the job's end for a refresh to fetch from, then cleaned like any other
+            week = self.job(jid)['t_finished'] + cq.ARTIFACT_KEEP_S
+            cq.cleanup_host(self.ctx, {'jobs': {jid: ent}}, week, host=job['host'], binding=job['host_config'])
+            ssh.assert_not_called()
+            ssh.return_value = (0, '', '')
+            cq.cleanup_host(self.ctx, {'jobs': {jid: ent}}, week + 1, host=job['host'], binding=job['host_config'])
+            self.assertIn(f'rm -rf "$HOME/q/{jid}/src" "$HOME/q/{jid}/tmp"', ssh.call_args.args[2])
+            ssh.reset_mock()
+            # a fetch under way holds the copy whatever its age
+            pending = dict(self.job(jid), artifact_pending=True)
+            with mock.patch.object(cq, 'load_job', return_value=pending):
+                cq.cleanup_host(self.ctx, {'jobs': {jid: ent}}, week + 10 * 86400, host=job['host'], binding=job['host_config'])
+            ssh.assert_not_called()
+            # a record with no end time falls back on the host's; with neither the copy stays
+            timeless = {k: v for k, v in self.job(jid).items() if k != 't_finished'}
+            with mock.patch.object(cq, 'load_job', return_value=timeless):
+                cq.cleanup_host(self.ctx, {'jobs': {jid: dict(ent, finished=None)}}, week + 10 * 86400, host=job['host'], binding=job['host_config'])
+                ssh.assert_not_called()
+                cq.cleanup_host(self.ctx, {'jobs': {jid: ent}}, week + 10 * 86400, host=job['host'], binding=job['host_config'])
+                self.assertEqual(ssh.call_count, 1)
         with mock.patch.object(cq, 'deferred_control', return_value={'error': 'offline'}):
             result = cq.cmd_status(self.ctx, {'job': jid, 'refresh': True})
         self.assertFalse(result['refresh']['ok'])

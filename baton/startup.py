@@ -1,11 +1,11 @@
-"""``bt startup``: reopen the owner's live workstreams as Windows Terminal tabs at logon.
+"""``bt startup``: reopen the owner's live workstreams as terminal tabs at logon.
 
 The list lives in STATE_DIR/startup.json and is maintained by the hooks (see ``registry.startup_add``):
 SessionStart adds or refreshes the worktree's entry, a deliberate exit (SessionEnd) removes it, a tab
 killed by a reboot fires no SessionEnd and stays listed. ``snapshot`` reseeds the list from the sessions
-that are live right now. ``run`` opens one Windows Terminal window with one tab per workstream, each
-already running ``bt <worktree>``. ``install`` puts a ``.cmd`` in the user's Startup folder that calls
-``run`` after a delay at logon.
+that are live right now. ``run`` opens one terminal window (see ``baton.terminal``) with one tab per
+workstream, each already running ``bt <worktree>``. ``install`` makes ``run`` happen after a delay at logon: a ``.cmd``
+in the user's Startup folder on Windows, a LaunchAgent (``me.baton.startup``) on macOS.
 
 What ``run`` opens, in order, capped at ``--max``:
 
@@ -15,16 +15,15 @@ What ``run`` opens, in order, capped at ``--max``:
 """
 from __future__ import annotations
 
-import base64
 import json
 import os
 import re
 import shutil
-import subprocess
+import sys
 import time
 from pathlib import Path
 
-from . import config, harvest, launch, registry, worktrees
+from . import config, harvest, launch, launchd, registry, terminal, worktrees
 from .hook import _pid_alive
 from .paths import find_worktree_root, key_for, main_checkout
 from .sessions import _rollout_meta
@@ -103,7 +102,20 @@ def claude_live() -> list[dict]:
 
 
 def _lock_held(lock: Path) -> bool:
-    """A running Codex holds a byte-range lock on its thread lock file: reading it fails."""
+    """A running Codex holds a lock on its thread lock file. On Windows it is a byte-range lock and reading the
+    file fails; elsewhere it is an advisory ``flock``, which reading ignores: a shared lock is asked for instead
+    and refused while the writer holds its exclusive one."""
+    if os.name != "nt":
+        import fcntl
+        try:
+            with open(lock, "rb") as fh:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return True
+        except OSError:
+            pass
+        return False
     try:
         with open(lock, "rb") as fh:
             fh.read(1)
@@ -215,36 +227,34 @@ def plan_entries(now: float | None = None, limit: int = DEFAULT_MAX) -> list[dic
     return entries[:limit]
 
 
-# -------------------------------------------------------------------- wt command line
+# -------------------------------------------------------------------- the tabs
 
-def tab_command(entry: dict) -> str:
-    """PowerShell text the tab runs: dot-source bt.ps1, then ``bt '<path>' [-Vendor v] [-Account a]``."""
-    def lit(text: str) -> str:
-        return "'" + str(text).replace("'", "''") + "'"
-    cmd = f". {lit(config.INSTALL_HOME / 'bt.ps1')}; bt {lit(entry['path'])}"
-    if entry.get("vendor"):
-        cmd += f" -Vendor {lit(entry['vendor'])}"
-    if entry.get("account"):
-        cmd += f" -Account {lit(entry['account'])}"
-    return cmd
+def tab_for(entry: dict) -> terminal.Tab:
+    """The tab of one entry: ``bt <path> [-Vendor v] [-Account a]``, titled with its key."""
+    return terminal.Tab(cwd=entry["path"], title=entry["key"],
+                        launch=terminal.Launch(bt=terminal.bt_args(entry["path"], entry.get("vendor"), entry.get("account"))))
 
 
-def encode_command(text: str) -> str:
-    return base64.b64encode(text.encode("utf-16-le")).decode("ascii")
+# -------------------------------------------------------------------- start at login
+
+def agent_plist(delay: int = DEFAULT_DELAY) -> dict:
+    """macOS: the LaunchAgent that runs ``bt startup run`` at login, after ``delay`` seconds (done by ``run --delay``)."""
+    python = launchd.python_exe()
+    return launchd.build_plist(launchd.STARTUP_LABEL, [python, str(config.INSTALL_HOME / "bt.py"), "startup", "run",
+                                                       "--delay", str(int(delay))], python, RunAtLoad=True)
 
 
-def wt_argv(entries: list[dict], wt: str = "wt.exe") -> list[str]:
-    """One wt invocation: a new window whose first tab is ``new-tab`` and the rest ``; new-tab`` segments."""
-    argv = [wt, "-w", "new"]
-    for i, entry in enumerate(entries):
-        if i:
-            argv.append(";")
-        argv += ["new-tab", "-d", entry["path"], "--title", entry["key"], "--suppressApplicationTitle",
-                 "pwsh", "-EncodedCommand", encode_command(launch.managed_tab_command(tab_command(entry)))]
-    return argv
+def install_agent(delay: int = DEFAULT_DELAY, force: bool = False) -> launchd.Installed:
+    """Write the agent and leave it for the next login: bootstrapping a RunAtLoad agent would run it now, and the
+    tabs of the sessions that are already open would be started a second time."""
+    return launchd.install(launchd.STARTUP_LABEL, agent_plist(delay), load=False, force=force)
 
 
-# -------------------------------------------------------------------- startup folder
+def uninstall_agent() -> tuple[bool, str | None]:
+    return launchd.uninstall(launchd.STARTUP_LABEL)
+
+
+# -------------------------------------------------------------------- startup folder (Windows)
 
 def cmd_text(delay: int = DEFAULT_DELAY) -> str:
     python = config.PYTHON if os.path.isabs(config.PYTHON) else (shutil.which(config.PYTHON) or config.PYTHON)
@@ -293,18 +303,23 @@ def _cmd_run(args) -> int:
     if not entries:
         print("[startup] nothing to open")
         return 0
-    argv = wt_argv(entries, shutil.which("wt.exe") or "wt.exe")
+    be = terminal.backend()
+    tabs = [tab_for(e) for e in entries]
     print(f"[startup] {len(entries)} tab(s):")
     for e in entries:
         print("  " + _fmt_entry(e))
     if args.dry_run:
-        print("wt argv: " + subprocess.list2cmdline(argv))
-        for e in entries:
-            print(f"  tab command ({e['key']}): {tab_command(e)}")
+        print(terminal.describe(be, tabs, new_window=True))
+        for e, tab in zip(entries, tabs):
+            print(f"  tab command ({e['key']}): {be.command_text(tab)}")
         return 0
-    subprocess.Popen(argv, env=config.clean_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL, close_fds=True)
-    print("[startup] opened a Windows Terminal window")
+    if args.delay > 0:
+        time.sleep(args.delay)
+    opened = be.open(tabs, new_window=True, env=config.clean_env())
+    if not opened:
+        print(f"[startup] {be.name} failed: {opened.error}", file=sys.stderr)
+        return 1
+    print(f"[startup] opened a {be.name} window with {len(tabs)} tab(s)")
     return 0
 
 
@@ -323,17 +338,43 @@ def _cmd_show(args) -> int:
     print(f"run would open {len(entries)} tab(s) (max {args.max}):")
     for e in entries:
         print("  " + _fmt_entry(e))
-    print(f"startup file: {startup_dir() / STARTUP_CMD} ({'installed' if (startup_dir() / STARTUP_CMD).exists() else 'not installed'})")
+    if config.MACOS and not config.WINDOWS:
+        st = launchd.status(launchd.STARTUP_LABEL)
+        state = ("installed, " + ("loaded" if st.loaded else "loads at the next login")) if st.installed else "not installed"
+        print(f"startup agent: {st.path} ({state})")
+    else:
+        print(f"startup file: {startup_dir() / STARTUP_CMD} ({'installed' if (startup_dir() / STARTUP_CMD).exists() else 'not installed'})")
     return 0
 
 
 def _cmd_install(args) -> int:
-    print(f"[startup] wrote {install(args.delay)} (runs `bt startup run` {args.delay}s after logon)")
+    if config.WINDOWS:
+        print(f"[startup] wrote {install(args.delay)} (runs `bt startup run` {args.delay}s after logon)")
+        return 0
+    if not config.MACOS:
+        print(f"bt startup install: start at login is available on Windows and macOS, not {sys.platform}", file=sys.stderr)
+        return 2
+    done = install_agent(args.delay, getattr(args, "force", False))
+    if done.error:
+        print(f"bt startup install: {done.error}", file=sys.stderr)
+        return 1
+    print(f"[startup] {'replaced' if done.replaced else 'wrote'} {done.path} (runs `bt startup run` {args.delay}s after each "
+          "login; it is loaded at the next login, nothing is started now)")
     return 0
 
 
 def _cmd_uninstall(args) -> int:
-    print(f"[startup] {'removed' if uninstall() else 'not installed:'} {startup_dir() / STARTUP_CMD}")
+    if config.WINDOWS:
+        print(f"[startup] {'removed' if uninstall() else 'not installed:'} {startup_dir() / STARTUP_CMD}")
+        return 0
+    if not config.MACOS:
+        print(f"bt startup uninstall: start at login is available on Windows and macOS, not {sys.platform}", file=sys.stderr)
+        return 2
+    removed, error = uninstall_agent()
+    if error:
+        print(f"bt startup uninstall: {error}", file=sys.stderr)
+        return 1
+    print(f"[startup] {'removed' if removed else 'not installed:'} {launchd.plist_path(launchd.STARTUP_LABEL)}")
     return 0
 
 
@@ -371,26 +412,28 @@ def _cmd_unpin(args) -> int:
 
 
 def register(subparsers) -> None:
-    p = subparsers.add_parser("startup", help="reopen live workstreams as Windows Terminal tabs at logon")
+    p = subparsers.add_parser("startup", help="reopen live workstreams as terminal tabs at logon")
     sub = p.add_subparsers(dest="startup_cmd", required=True)
 
     s = sub.add_parser("snapshot", help="reseed the list from the worktrees with a live Claude/Codex session now")
     s.set_defaults(func=_cmd_snapshot)
 
-    s = sub.add_parser("run", help="open one Windows Terminal window with a tab per workstream")
-    s.add_argument("--dry-run", action="store_true", help="print the tabs and the wt command line without launching")
+    s = sub.add_parser("run", help="open one terminal window with a tab per workstream")
+    s.add_argument("--dry-run", action="store_true", help="print the tabs and the terminal command line without launching")
     s.add_argument("--max", type=int, default=DEFAULT_MAX)
+    s.add_argument("--delay", type=int, default=0, help="seconds to wait before opening (the macOS login agent passes it)")
     s.set_defaults(func=_cmd_run)
 
     s = sub.add_parser("show", help="the startup list, pinned list and what `run` would open")
     s.add_argument("--max", type=int, default=DEFAULT_MAX)
     s.set_defaults(func=_cmd_show)
 
-    s = sub.add_parser("install", help="add baton-startup.cmd to the Startup folder")
+    s = sub.add_parser("install", help="start at login: baton-startup.cmd in the Startup folder (Windows), a LaunchAgent (macOS)")
     s.add_argument("--delay", type=int, default=DEFAULT_DELAY, help="seconds to wait after logon (default 30)")
+    s.add_argument("--force", action="store_true", help="macOS: replace the agent even while its run is in progress (that run is stopped)")
     s.set_defaults(func=_cmd_install)
 
-    s = sub.add_parser("uninstall", help="remove baton-startup.cmd from the Startup folder")
+    s = sub.add_parser("uninstall", help="stop starting at login")
     s.set_defaults(func=_cmd_uninstall)
 
     s = sub.add_parser("pin", help="always open this worktree first")

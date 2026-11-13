@@ -23,7 +23,7 @@ from pathlib import Path
 
 from . import accounts, capsule, config, follow, gitutil, harvest, install, paths, registry
 
-OK, WARN, FAIL = "OK", "WARN", "FAIL"
+OK, WARN, FAIL, SKIP = "OK", "WARN", "FAIL", "SKIP"   # SKIP: the check has no meaning on this platform (never a failure)
 HOOK_EVENTS = ("SessionStart", "PostCompact", "SessionEnd", "UserPromptSubmit", "PreToolUse")
 MIN_PYTHON = (3, 11)
 LOG_WINDOW = 7 * 86400
@@ -107,21 +107,47 @@ def _command_tokens(handler: dict) -> list[str]:
 # --------------------------------------------------------------------------- a. python
 
 
-def _python_version() -> tuple[int, ...] | None:
-    if os.path.normcase(config.PYTHON) == os.path.normcase(sys.executable):
+def _python_version(python: str | None = None) -> tuple[int, ...] | None:
+    python = python or config.PYTHON
+    if os.path.normcase(python) == os.path.normcase(sys.executable):
         return tuple(sys.version_info[:3])
     try:
-        cp = subprocess.run([config.PYTHON, "-c", "import sys;print(*sys.version_info[:3])"], capture_output=True,
+        cp = subprocess.run([python, "-c", "import sys;print(*sys.version_info[:3])"], capture_output=True,
                             text=True, timeout=10, creationflags=config.CREATE_NO_WINDOW)
         return tuple(int(x) for x in cp.stdout.split()) if cp.returncode == 0 else None
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
 
 
+_SCRIPT_TOKEN = re.compile(install._SCRIPT_NAMES.pattern + "$")   # a baton hook script or .cmd wrapper, as a path
+
+
+def _executable_exists(token: str) -> bool:
+    """A recorded interpreter: an absolute path must exist; a bare name must resolve on PATH."""
+    if os.path.isabs(token) or "/" in token or "\\" in token:
+        return Path(token).exists()
+    return shutil.which(token) is not None
+
+
+def missing_hook_paths(handler: dict) -> list[str]:
+    """The interpreter and baton script paths a hook entry names that do not exist, for either platform's form
+    (cmd.exe and the .cmd wrappers on Windows; python and the .py scripts directly elsewhere)."""
+    missing = []
+    for index, token in enumerate(_command_tokens(handler)):
+        norm = token.replace("\\", "/").lower()
+        if index == 0 and norm != "cmd.exe" and not norm.endswith("/cmd.exe"):
+            if (norm.endswith(".exe") or not config.WINDOWS) and not _executable_exists(token):
+                missing.append(token)
+        elif _SCRIPT_TOKEN.search(norm) and not Path(token).exists():
+            missing.append(token)
+    return missing
+
+
 def check_python() -> list[Check]:
     out = []
-    version = _python_version() if Path(config.PYTHON).exists() else None
-    if not Path(config.PYTHON).exists():
+    python_exists = _executable_exists(config.PYTHON)
+    version = _python_version() if python_exists else None
+    if not python_exists:
         out.append(Check("python", FAIL, f"{config.PYTHON} does not exist", "run `bt install` with the current Python"))
     elif version is None:
         out.append(Check("python", FAIL, f"{config.PYTHON} did not report a version", "reinstall Python, then `bt install`"))
@@ -135,16 +161,7 @@ def check_python() -> list[Check]:
         handlers = baton_handlers(path)
         if handlers is None:
             continue  # reported by the hooks check
-        missing = []
-        for event, items in handlers.items():
-            for _, _, handler in items:
-                tokens = _command_tokens(handler)
-                for token in tokens:
-                    norm = token.replace("\\", "/").lower()
-                    is_python = token is tokens[0] and norm.endswith(".exe") and not norm.endswith("/cmd.exe")
-                    if (is_python or norm.endswith(("/hook.py", "/inbox_check.cmd"))) and not Path(token).exists():
-                        missing.append(token)
-        missing = sorted(set(missing))
+        missing = sorted({token for items in handlers.values() for _, _, handler in items for token in missing_hook_paths(handler)})
         name = f"hook-paths:{vendor}"
         if missing:
             out.append(Check(name, FAIL, f"installed hook commands point at missing: {', '.join(missing)}",
@@ -173,6 +190,200 @@ def check_hooks() -> list[Check]:
         else:
             out.append(Check(name, OK, f"{len(HOOK_EVENTS)} events in {path}"))
     return out
+
+
+def hook_form(handler: dict) -> str | None:
+    """``"windows"`` (cmd.exe / .cmd wrapper), ``"posix"`` (the .py wrapper scripts run directly) or None for an
+    entry that reads the same on both (the python + hook.py / cycle_hook.py entries)."""
+    tokens = [t.replace("\\", "/").lower() for t in _command_tokens(handler)]
+    if any(t.endswith(".cmd") or t == "cmd.exe" or t.endswith("/cmd.exe") for t in tokens):
+        return "windows"
+    if any(t.endswith(("/inbox_check.py", "/wt_guard.py")) for t in tokens):
+        return "posix"
+    return None
+
+
+def check_hook_forms() -> list[Check]:
+    """The main accounts' baton entries must be in this platform's form: a Windows-form entry on a Mac runs
+    ``cmd.exe`` (not found) on every prompt and tool call; a POSIX-form one on Windows bypasses the .cmd wrappers."""
+    expected = "windows" if config.WINDOWS else "posix"
+    out = []
+    for vendor, account, path in _hook_files():
+        if account != "main":
+            continue
+        handlers = baton_handlers(path)
+        if handlers is None:
+            continue  # reported by the hooks check
+        wrong = sorted({event for event, items in handlers.items() for _, _, h in items if hook_form(h) not in (None, expected)})
+        name = f"hook-form:{vendor}"
+        if wrong:
+            other = "POSIX" if expected == "windows" else "Windows"
+            out.append(Check(name, FAIL, f"{', '.join(wrong)} in {path} use the {other} form (written on another platform)",
+                             "run `bt install` from the main checkout"))
+        else:
+            out.append(Check(name, OK, f"baton entries in {path} are in the {expected} form"))
+    return out
+
+
+def check_wrappers() -> list[Check]:
+    """The generated .cmd wrappers behind the Windows hook entries."""
+    if not config.WINDOWS:
+        return [Check("cmd-wrappers", SKIP, "Windows only: off Windows the hooks run python directly and no .cmd file is used")]
+    missing = [str(p) for p in (install.INBOX_CMD, install.WT_GUARD, install.WT_GUARD_CODEX) if not p.is_file()]
+    if missing:
+        return [Check("cmd-wrappers", FAIL, f"missing: {', '.join(missing)}", "run `bt install` from the main checkout")]
+    return [Check("cmd-wrappers", OK, "inbox_check.cmd, wt_guard.cmd and wt_guard_codex.cmd exist")]
+
+
+def _profile_line_paths(line: str) -> list[str]:
+    """The files a marked profile line names (``. <bt.sh> <baton home> <python>  # baton (bt command)``)."""
+    import shlex
+    try:
+        words = shlex.split(line.split(install.PROFILE_MARK)[0])
+    except ValueError:
+        return []
+    return words[1:]
+
+
+def check_posix_install() -> list[Check]:
+    """Off Windows: the shell profile line and bt.sh. Nothing is checked (and nothing reported) on Windows."""
+    if config.WINDOWS:
+        return []
+    out = []
+    rc = install.posix_rc_file()
+    try:
+        lines = [l for l in rc.read_text(encoding="utf-8", errors="replace").splitlines() if install.PROFILE_MARK in l]
+    except OSError:
+        lines = []
+    if not lines:
+        out.append(Check("profile", WARN, f"no `{install.PROFILE_MARK}` line in {rc}: the bt command is not defined in new shells",
+                         "run `bt install --profile` from the main checkout"))
+    else:
+        gone = [p for p in _profile_line_paths(lines[-1]) if not Path(p).exists()]
+        if len(lines) > 1:
+            out.append(Check("profile", WARN, f"{len(lines)} baton lines in {rc}", "run `bt install --profile` (it keeps one)"))
+        elif gone:
+            out.append(Check("profile", WARN, f"the baton line in {rc} names missing: {', '.join(gone)}",
+                             "run `bt install --profile` from the main checkout"))
+        else:
+            out.append(Check("profile", OK, f"{rc} sources bt.sh"))
+    try:
+        data = install.BT_SH.read_bytes()
+    except OSError:
+        out.append(Check("bt-sh", FAIL, f"{install.BT_SH} is missing", "restore it from the repository (git checkout bt.sh)"))
+        return out
+    if b"\r" in data:
+        out.append(Check("bt-sh", FAIL, f"{install.BT_SH} has CRLF line endings: the shell cannot source it",
+                         "convert to LF (git add --renormalize bt.sh, or `sed -i '' 's/\\r$//' bt.sh`)"))
+    elif any(b > 127 for b in data):
+        out.append(Check("bt-sh", WARN, f"{install.BT_SH} contains non-ASCII bytes", "keep bt.sh ASCII"))
+    else:
+        out.append(Check("bt-sh", OK, f"{install.BT_SH} has LF endings"))
+    return out
+
+
+def _session_workflow_entries(path: Path) -> list[tuple[str, str | None, list[str]]] | None:
+    """(event, group matcher, command words) of every session-workflow handler in a hooks file; None if unreadable."""
+    data = _read_json(path)
+    if not isinstance(data, dict):
+        return None
+    found = []
+    hooks = data.get("hooks")
+    for event, groups in (hooks.items() if isinstance(hooks, dict) else ()):
+        for group in (groups if isinstance(groups, list) else ()):
+            handlers = group.get("hooks") if isinstance(group, dict) else None
+            for handler in (handlers if isinstance(handlers, list) else ()):
+                if isinstance(handler, dict) and install.is_session_workflow(handler):
+                    found.append((event, group.get("matcher"), _command_tokens(handler)))
+    return found
+
+
+def check_session_workflow() -> list[Check]:
+    """Off Windows: session-workflow's hook entries are in each settings file in the POSIX form and what they run exists.
+    On Windows its entries are merged by hand and left alone, so nothing is checked."""
+    if config.WINDOWS:
+        return [Check("session-workflow", SKIP, "POSIX form only: on Windows its entries are merged by hand and left as they are")]
+    sw = install.session_workflow_dir()
+    if not (sw / "workflow.py").exists():
+        return [Check("session-workflow", WARN, f"{sw} is absent: a context cycle refuses and peer notices do not arrive",
+                      "put session-workflow next to baton (or set BATON_SESSION_WORKFLOW), then run `bt install`")]
+    out = []
+    missing = [str(p) for p in (sw / "workflow.py", install.WORKFLOW_HOOK_SH) if not p.is_file()]
+    if not _executable_exists(config.PYTHON):
+        missing.append(config.PYTHON)
+    if missing:
+        out.append(Check("session-workflow-files", FAIL, f"missing: {', '.join(missing)}", "run `bt install` from the main checkout"))
+    else:
+        out.append(Check("session-workflow-files", OK, "workflow.py, workflow_hook.sh and the Python exist"))
+    for vendor, account, path in _hook_files():
+        name = f"session-workflow:{vendor}:{account}"
+        main = account == "main"
+        fix = "run `bt install`" if main else f"run `bt account link {vendor} {account}`"
+        found = _session_workflow_entries(path)
+        if found is None:
+            continue  # reported by the hooks check
+        wanted = [(event, group.get("matcher"), _command_tokens(h))
+                  for event, group in install.session_workflow_handlers(vendor).items() for h in group["hooks"]]
+        missing_events = sorted({event for event, matcher, words in wanted if (event, matcher, words) not in found})
+        stale = sorted({event for event, matcher, words in found if (event, matcher, words) not in wanted})
+        if missing_events or stale:
+            parts = ([f"no POSIX-form entry for {', '.join(missing_events)}"] if missing_events else []) +                     ([f"other entries for {', '.join(stale)}"] if stale else [])
+            out.append(Check(name, FAIL if main and missing_events else WARN, f"{path}: {'; '.join(parts)}", fix))
+        else:
+            out.append(Check(name, OK, f"{len(wanted)} entries in {path}"))
+    return out
+
+
+def check_plugin_env() -> list[Check]:
+    """Off Windows: the compute-queue plugin is where Claude Code will look for it, and the interpreter its hook runs
+    (CQ_PYTHON; a Mac has no bare ``python``) exists and is Python 3.11 or later. On Windows both are set by hand."""
+    if config.WINDOWS:
+        return []
+    out = []
+    plugin = install.PLUGIN_DIR
+    gone = [str(plugin / part) for part in ("hooks/register.tsx", "bin/cq.py") if not (plugin / part).is_file()]
+    if gone:
+        out.append(Check("plugin-dir", FAIL, f"missing: {', '.join(gone)}", "restore the compute-queue plugin from the repository"))
+    else:
+        out.append(Check("plugin-dir", OK, f"{plugin} exists"))
+    for account in config.account_names("claude"):
+        path = config.account_dir("claude", account) / "settings.json"
+        name = f"plugin-env:{account}"
+        data = _read_json(path)
+        if not isinstance(data, dict):
+            continue  # reported by the hooks check
+        env = data.get("env") if isinstance(data.get("env"), dict) else {}
+        severity = FAIL if account == "main" else WARN
+        fix = "run `bt install`" if account == "main" else f"run `bt account link claude {account}`"
+        problems = []
+        dirs = env.get("CLAUDE_CODE_PLUGIN_DIRS")
+        if not isinstance(dirs, str) or not install.names_plugin_dir(dirs, install.PLUGIN_DIR.as_posix()):
+            problems.append(f"env CLAUDE_CODE_PLUGIN_DIRS does not name {plugin.as_posix()}: the queue's tools and hook are not loaded")
+        python = env.get("CQ_PYTHON")
+        if not isinstance(python, str) or not python.strip():
+            problems.append("env CQ_PYTHON is not set: the hook falls back to a bare `python`, which this machine may not have")
+        elif not _executable_exists(python):
+            problems.append(f"env CQ_PYTHON {python} does not exist")
+        else:
+            version = _python_version(python)
+            if version is None:
+                problems.append(f"env CQ_PYTHON {python} did not report a version")
+            elif version < MIN_PYTHON:
+                problems.append(f"env CQ_PYTHON {python} is {'.'.join(map(str, version))}; the queue needs >= 3.11")
+        if problems:
+            out.append(Check(name, severity, f"{path}: {'; '.join(problems)}", fix))
+        else:
+            out.append(Check(name, OK, f"{path}: plugin directory and Python {'.'.join(map(str, _python_version(env['CQ_PYTHON']) or ()))} set"))
+    return out
+
+
+def check_tools() -> list[Check]:
+    """Off Windows: ``fzf`` backs the picker of a bare ``bt``; without it the worktree list is printed instead."""
+    if config.WINDOWS:
+        return []
+    if shutil.which("fzf"):
+        return [Check("fzf", OK, "found")]
+    return [Check("fzf", WARN, "not found: a bare `bt` prints the worktree list instead of a picker", "brew install fzf")]
 
 
 # --------------------------------------------------------------------------- c. codex trust
@@ -453,7 +664,8 @@ def check_accounts() -> list[Check]:
                 for n in expected:
                     link = home / n
                     if not accounts._is_junction(link):
-                        problems.append(f"{n} missing" if not os.path.lexists(link) else f"{n} is not a junction")
+                        problems.append(f"{n} missing" if not os.path.lexists(link)
+                                        else f"{n} is not a {'junction' if config.WINDOWS else 'symlink'}")
                     elif not accounts._same_target(link, primary / n):
                         problems.append(f"{n} points elsewhere")
             if problems or notes:
@@ -463,7 +675,7 @@ def check_accounts() -> list[Check]:
                         f"set {config.ACCOUNT_ENV[vendor]}={home}, run {vendor} and log in" if not main else f"run {vendor} and log in")
                 out.append(Check(label, WARN, f"{home}: {detail}", hint))
             else:
-                out.append(Check(label, OK, f"{home} logged in" + ("" if main else "; junctions point at the primary")))
+                out.append(Check(label, OK, f"{home} logged in" + ("" if main else f"; {'junctions' if config.WINDOWS else 'symlinks'} point at the primary")))
     return out
 
 
@@ -901,9 +1113,11 @@ def _guarded(name: str, fn) -> list[Check]:
 def run_checks(live: bool = False, *, cheap: bool = False) -> list[Check]:
     """All checks in order. ``cheap`` restricts to a, b, d, g, g2, h, i and the cheap part of l (worktrees); ``live`` adds the self-test (e)."""
     versions = cli_versions()
-    plan = [("python", check_python), ("hooks", check_hooks)]
+    plan = [("python", check_python), ("hooks", check_hooks), ("hook-forms", check_hook_forms), ("cmd-wrappers", check_wrappers),
+            ("posix-install", check_posix_install), ("session-workflow", check_session_workflow),
+            ("plugin-env", check_plugin_env)]
     if not cheap:
-        plan.append(("codex-trust", check_codex_trust))
+        plan += [("tools", check_tools), ("codex-trust", check_codex_trust)]
     plan.append(("hook-health", check_hook_health))
     if live and not cheap:
         plan.append(("selftest", check_selftest))
@@ -960,7 +1174,7 @@ def daily_warnings(max_age_hours: float = 24) -> list[str]:
         checks = run_checks(live=False, cheap=True)
         _save_state(time=time.time())
         return lines + [f"baton doctor: {c.name}: {c.detail}" + (f" ({c.remedy})" if c.remedy else "")
-                        for c in checks if c.status != OK and not (c.status == WARN and c.name in refreshing)]
+                        for c in checks if c.status not in (OK, SKIP) and not (c.status == WARN and c.name in refreshing)]
     except Exception:  # noqa: BLE001
         return lines
 
@@ -995,7 +1209,7 @@ def format_table(checks: list[Check]) -> str:
     lines = [f"{'STATUS':<6}  {'check':<{width}}  detail"]
     for c in checks:
         lines.append(f"{c.status:<6}  {c.name:<{width}}  {_short(c.detail, DETAIL_WIDTH)}")
-        if c.status != OK and c.remedy:
+        if c.status not in (OK, SKIP) and c.remedy:
             lines.append(f"{'':<6}  {'':<{width}}  -> {c.remedy}")
     return "\n".join(lines)
 

@@ -104,6 +104,38 @@ class ArtifactTransferTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 transfer.open_source_posix(str(root), 'link')
 
+    @unittest.skipIf(not hasattr(transfer.os, 'O_NOFOLLOW'), 'requires openat no-follow')
+    def test_posix_root_may_sit_behind_a_link_but_may_not_be_one(self):
+        with tempfile.TemporaryDirectory() as name:
+            base = Path(name)
+            (base / 'disk' / 'job' / 'src').mkdir(parents=True)
+            (base / 'disk' / 'job' / 'src' / 'data').write_bytes(b'fixture')
+            (base / 'state').symlink_to(base / 'disk', target_is_directory=True)        # the controller's own link, above the root
+            handle, _ = transfer.open_source_posix(str(base / 'state' / 'job' / 'src'), 'data')
+            handle.close()
+            (base / 'elsewhere').mkdir()
+            (base / 'elsewhere' / 'data').write_bytes(b'not the job')
+            (base / 'disk' / 'job' / 'swapped').symlink_to(base / 'elsewhere', target_is_directory=True)   # a job put a link where its root was
+            for root in (base / 'disk' / 'job' / 'swapped', base / 'state' / 'job' / 'swapped'):
+                with self.assertRaises(OSError):
+                    transfer.open_source_posix(str(root), 'data')
+
+    @unittest.skipIf(not hasattr(transfer.os, 'O_NOFOLLOW'), 'requires openat no-follow')
+    def test_posix_state_directory_may_itself_be_a_link_and_nothing_below_it_may(self):
+        with tempfile.TemporaryDirectory() as name:
+            base = Path(name)
+            (base / 'disk').mkdir()
+            (base / 'state').symlink_to(base / 'disk', target_is_directory=True)        # the state directory on another disk
+            with transfer.destination_parent(str(base / 'state'), 'out/job/a.txt') as (_, directory, leaf):
+                self.assertEqual(leaf, 'a.txt')
+            self.assertTrue((base / 'disk' / 'out' / 'job').is_dir())
+            (base / 'elsewhere').mkdir()
+            (base / 'disk' / 'out' / 'planted').symlink_to(base / 'elsewhere', target_is_directory=True)
+            with self.assertRaises(OSError):
+                with transfer.destination_parent(str(base / 'state'), 'out/planted/a.txt'):
+                    pass
+            self.assertEqual(list((base / 'elsewhere').iterdir()), [])
+
     def test_rejects_truncation_and_digest_mismatch(self):
         wanted = [(0, 'a')]
         sink = Sink()

@@ -241,6 +241,38 @@ class FleetTelemetryTests(unittest.TestCase):
         self.assertEqual(ft.estimate_memory([], *args)['memory_gb'], 1)
         self.assertEqual(ft.estimate_memory([base], None, 'c', 'linux', 'hearth', 2, 1)['method'], 'default')
 
+    def test_a_cache_filled_run_does_not_raise_the_estimate(self):
+        GIB = 1024 ** 3
+        base = dict(status='done', exit=0, profile_key='p', command_key='c', platform='linux', host_id='hearth',
+                    slots=2, t_started=1, t_finished=2, memory_gb=8, memory_max_gb=10,
+                    metrics={'memory_kind': 'cgroup', 'peak_memory_bytes': 10*GIB, 'peak_held_bytes': GIB,
+                             'held_samples': 12})
+        args = ('p', 'c', 'linux', 'hearth', 2, 1)
+        capped, plain = 'max_plus_25_percent_cache_capped', 'max_plus_25_percent'
+
+        def expect(rows, memory_gb, method, sample_count=1):
+            self.assertEqual(ft.estimate_memory(rows, *args),
+                             {'memory_gb': memory_gb, 'sample_count': sample_count, 'memory_kind': 'cgroup', 'method': method})
+
+        def with_metrics(**changes):
+            return dict(base, metrics=dict(base['metrics'], **changes))
+
+        expect([base], 8.0, capped)
+        expect([with_metrics(peak_held_bytes=4*GIB)], 9.0, capped)
+        expect([with_metrics(held_samples=5)], 12.5, plain)
+        expect([with_metrics(peak_memory_bytes=9*GIB)], 11.25, plain)
+        expect([with_metrics(peak_held_bytes=6*GIB)], 12.5, plain)
+        for held in (True, 1.5, -1, 11*GIB):
+            expect([with_metrics(peak_held_bytes=held)], 12.5, plain)
+        no_prior = dict(base)
+        del no_prior['memory_gb']
+        expect([no_prior], 8.0, capped)
+        no_cap = dict(base)
+        del no_cap['memory_max_gb']
+        expect([no_cap], 12.5, plain)
+        ordinary = dict(base, metrics={'memory_kind': 'cgroup', 'peak_memory_bytes': 9*GIB})
+        expect([base, ordinary], 11.25, capped, 2)
+
 
 class StatusLineTests(unittest.TestCase):
     """The status line: devices with a reason when they cannot take work, live work by worktree, current attention only."""

@@ -33,6 +33,10 @@ def _install_home() -> Path:
 
 INSTALL_HOME = Path(os.environ.get("BATON_INSTALL_HOME") or _install_home())
 PYTHON = os.environ.get("BATON_PYTHON") or sys.executable
+# The one platform decision for everything that differs between Windows and POSIX (hook wrappers, shell profile,
+# CLI lookup, doctor checks). Read at call time, so tests patch it to exercise both forms on either platform.
+WINDOWS = os.name == "nt"
+MACOS = sys.platform == "darwin"   # likewise: terminal backend, LaunchAgents, `bt night schedule` choose by these two
 
 VENDORS = ("claude", "codex")
 # Env var that selects an account's config directory, per vendor.
@@ -65,7 +69,33 @@ def expand(path: str | os.PathLike) -> Path:
 
 
 def norm(path: str | os.PathLike) -> str:
-    """Stable registry key for a filesystem path (case- and slash-insensitive on Windows)."""
+    """Canonical key for comparing paths and keying registries, lineage, ownership and liveness by them.
+
+    Windows: ``normcase(abspath)``, case- and slash-insensitive; junctions are deliberately not resolved.
+    macOS and Linux: symbolic links are resolved first, so every spelling of one directory is one key: git prints
+    real paths, ``os.getcwd()`` returns the real path, ``$PWD`` and a hook payload's ``cwd`` may carry a link
+    (macOS ``/var`` is ``/private/var``; the owner's ``~/Code/app`` is ``~/Code/app``). A path that does not
+    exist is resolved as far as it does. On macOS the key is also put in one Unicode form (NFC) and lower-cased, as
+    Windows lower-cases: the default volume ignores both case and the composed or decomposed form of a name, and
+    ``normcase`` is the identity there (git prints NFC, a directory listing prints the form the name was made with).
+    On a case-sensitive macOS volume two paths that differ only in case would share a key, and a key used as a path
+    (a few places read a registry key back as one) would name the wrong spelling. Only comparison and keys use this
+    form; stored and displayed paths keep the spelling they were given.
+    """
+    absolute = os.path.abspath(str(path))
+    if os.name == "nt":
+        return os.path.normcase(absolute)
+    real = os.path.realpath(absolute)
+    if sys.platform != "darwin":
+        return real
+    import unicodedata                         # here only: the hooks import this module on every platform
+    return unicodedata.normalize("NFC", real).lower()
+
+
+def lexical(path: str | os.PathLike) -> str:
+    """The spelling-only form of a path (``normcase(abspath)``, no link resolved), for the few comparisons whose point is
+    whether two *configured spellings* name the same directory, as opposed to what is there: an account directory that is
+    a link to the primary one is a misconfiguration to refuse, not the primary account. Everything else uses ``norm``."""
     return os.path.normcase(os.path.abspath(str(path)))
 
 
@@ -107,6 +137,15 @@ def policy_int(name: str, default: int) -> int:
     except Exception:  # noqa: BLE001 - a broken accounts.toml must not break a hook
         return default
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else default
+
+
+def policy_str(name: str, default: str) -> str:
+    """Non-empty string ``[policy] <name>`` from accounts.toml (and its local overlay); ``default`` when absent or invalid."""
+    try:
+        value = accounts_config().get("policy", {}).get(name)
+    except Exception:  # noqa: BLE001 - a broken accounts.toml must not break a hook
+        return default
+    return value.strip() if isinstance(value, str) and value.strip() else default
 
 
 def _rotate_table() -> int | dict:
@@ -208,9 +247,9 @@ def account_from_env(vendor: str, environ: dict | None = None) -> str:
     value = environ.get(ACCOUNT_ENV[vendor])
     if not value:
         return "main"
-    target = norm(expand(value))
+    target = lexical(expand(value))
     for name in account_names(vendor):
-        if norm(account_dir(vendor, name)) == target:
+        if lexical(account_dir(vendor, name)) == target:
             return name
     return Path(value).name or "main"
 
@@ -221,11 +260,12 @@ def exe(vendor: str) -> str:
     if override:
         return override
     if vendor == "claude":
-        native = Path.home() / ".local" / "bin" / "claude.exe"
+        native = Path.home() / ".local" / "bin" / ("claude.exe" if WINDOWS else "claude")
         if native.exists():
             return str(native)
     found = shutil.which(vendor)
-    if vendor == "codex" and found and Path(found).suffix.lower() in (".cmd", ".ps1", ".bat"):
+    # The npm wrapper (a .cmd/.ps1 shim around a Windows .exe) exists only on Windows; elsewhere `codex` is the binary.
+    if WINDOWS and vendor == "codex" and found and Path(found).suffix.lower() in (".cmd", ".ps1", ".bat"):
         native = _codex_native(Path(found))
         if native is not None:
             return str(native)

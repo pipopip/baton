@@ -25,7 +25,7 @@ export type Capacity = {
     ram_floor_gb?: number
     load_cap?: number
   }
-  laptop: { heavy_busy: boolean; free_ram_gb: number; ram_ok?: boolean }
+  laptop: { heavy_busy: boolean; free_ram_gb: number | null; ram_ok?: boolean; executor?: boolean }
   hosts?: Record<string, Capacity['host'] & { sample_at?: number }>
 }
 
@@ -124,7 +124,9 @@ export function formatCapacity(c: Capacity): string {
         `${h.mem_avail_gb ?? '?'} GB RAM available; ${h.disk_free_gb ?? '?'} GB disk free` +
         (h.room !== undefined ? `; caps leave room for ${h.room} slots` : '')
   const l = c.laptop
-  const laptop = `laptop: heavy lock ${l.heavy_busy ? 'BUSY' : 'free'}; ${l.free_ram_gb} GB RAM free${l.ram_ok === false ? ' (below the 6 GB floor: no heavy job)' : ''}`
+  const laptop = l.executor === false
+    ? 'laptop: not an executor on this machine (start no job there; where any means the host)'
+    : `laptop: heavy lock ${l.heavy_busy ? 'BUSY' : 'free'}; ${l.free_ram_gb} GB RAM free${l.ram_ok === false ? ' (below the 6 GB floor: no heavy job)' : ''}`
   return `${host}\n${laptop}`
 }
 

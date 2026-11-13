@@ -140,9 +140,9 @@ class Generations(unittest.TestCase):
         submit(slots=13)
         self.assertFalse(calls[-1][0])
         (self.root / 'host.conf.json').unlink()
-        # what stays an ordinary job: an explicitly chosen host (its own queue; GPU work is qualified there), light
-        # work, and what the fleet backend does not do
-        for fields in ({'host_id': 'hestia', 'slots': 2}, {'host_id': 'ember'},
+        # what stays an ordinary job: another host that has not opted in (its own queue; GPU work is qualified
+        # there), light work, and what the fleet backend does not do
+        for fields in ({'host_id': 'hestia', 'slots': 2}, {'host_id': 'hearth'},
                        {'slots': 0}, {'slots': 2, 'self_heavy': True}, {'slots': 2, 'split': {'max_parts': 2}},
                        {'temp_storage': 'ram', 'memory_max_gb': 4}, {'defer': 'overnight', 'host_id': 'ember', 'memory_max_gb': 4},
                        {'where': 'laptop'}, {'where': 'any'}, {'host_id': 'laptop'}, {'est_minutes': 600},
@@ -191,12 +191,131 @@ class Generations(unittest.TestCase):
         # a refusal says why a where: host job met a fleet rule
         def refuse(ctx, cmd, req):
             raise cq.CqError('fleet submission requires the current worktree owner session')
-        with self.assertRaisesRegex(cq.CqError, r'owner session \(a heavy where: host job that names no host now runs as a '
+        with self.assertRaisesRegex(cq.CqError, r'owner session \(a heavy where: host job now runs as a '
                                                 r'contained fleet job on ember, so the host can share its capacity\)$'):
             generations.execute(cq, self.ctx, 'submit', dict(base, slots=2), refuse)
         # the note is a courtesy: a job whose record cannot be read back is still accepted
         with unittest.mock.patch.object(cq, 'load_job', side_effect=cq.CqError('gone')):
             self.assertEqual(submit(slots=2), {'ok': True, 'job': self.fleet, 'note': 'fleet job accepted'})
+
+    def test_a_where_host_job_naming_a_host_converts_only_for_the_default_host_or_an_opted_in_one(self):
+        generations.context(cq, self.ctx, 2)
+        shard = self.root / 'hosts' / 'hearth'
+        shard.mkdir(parents=True)
+        calls = []
+        def leaf(ctx, cmd, req):
+            calls.append((ctx.state.endswith('queue-v2'), dict(req)))
+            return {'ok': True, 'job': self.fleet, 'note': 'fleet job accepted'}
+        base = {'root': str(self.root), 'session': 'sess-A', 'command': 'bash build.sh'}
+        submit = lambda **fields: generations.execute(cq, self.ctx, 'submit', dict(base, **fields), leaf)
+        def conf(path, **fields):
+            path.write_text(json.dumps(dict({'name': 'x'}, **fields)))
+        with mock.patch.object(cq, 'load_job', return_value={'memory_max_gb': 12.0}):
+            # the default host named out of habit converts like a submission that names none, and loses the host_id
+            submit(host_id='ember', slots=3)
+            self.assertEqual((calls[-1][0], calls[-1][1]['candidates'], 'host_id' in calls[-1][1]), (True, ['ember'], False))
+            self.assertEqual(calls[-1][1]['_default_memory_max_gb'], 12)
+            conf(self.root / 'host.conf.json', host_jobs_to_fleet=False)
+            submit(host_id='ember', slots=3)
+            self.assertFalse(calls[-1][0])                       # the queue's own setting still turns it off
+            self.assertEqual(calls[-1][1]['host_id'], 'ember')    # and the ordinary request is untouched
+            (self.root / 'host.conf.json').unlink()
+            # another host keeps its ordinary queue unless its own settings say true
+            for text in (None, json.dumps({'name': 'hearth'}), json.dumps({'host_jobs_to_fleet': False}),
+                         json.dumps({'host_jobs_to_fleet': 'yes'}), json.dumps({'host_jobs_to_fleet': 1}),
+                         json.dumps({'host_jobs_to_fleet': [True]}), 'not json', '[]'):
+                if text is not None:
+                    (shard / 'host.conf.json').write_text(text)
+                for name in ('hearth', 'hestia'):
+                    submit(host_id=name, slots=2)
+                    self.assertEqual((calls[-1][0], calls[-1][1]['host_id']), (False, name), text)
+                    self.assertNotIn('_default_memory_max_gb', calls[-1][1])
+            conf(shard / 'host.conf.json', host_jobs_to_fleet=True, slots=12, foreground_slots=4, memory_budget_gb=20,
+                 host_id='hearth', address='u@hearth')
+            # opted in: pinned to that host (the canonical id for an alias), sized by that host's own settings
+            for name in ('hearth', 'hestia'):
+                submit(host_id=name, slots=3)
+                v2, sent = calls[-1]
+                self.assertEqual((v2, sent['where'], sent['candidates'], sent['platform'], sent['slots']),
+                                 (True, 'fleet', ['hearth'], 'linux', 3), name)
+                self.assertNotIn('host_id', sent)
+                self.assertEqual(sent['_default_memory_max_gb'], 12)
+            submit(host_id='hearth', slots=6)
+            self.assertEqual(calls[-1][1]['_default_memory_max_gb'], 20)   # that host's memory budget bounds the cap
+            submit(host_id='hearth', slots=8)                              # 12 slots less 4 for foreground work
+            self.assertEqual((calls[-1][0], calls[-1][1]['candidates']), (True, ['hearth']))
+            submit(host_id='hearth', slots=9)                              # larger than that host's fleet pool
+            self.assertEqual((calls[-1][0], calls[-1][1]['host_id']), (False, 'hearth'))
+            conf(self.root / 'host.conf.json', slots=64)                    # the queue's own pool does not decide
+            submit(host_id='hearth', slots=9)
+            self.assertFalse(calls[-1][0])
+            (self.root / 'host.conf.json').unlink()
+            # an opted-in host still keeps what the fleet backend does not do, and a request that names candidates
+            for fields in ({'slots': 0}, {'self_heavy': True}, {'defer': 'overnight', 'memory_max_gb': 4},
+                           {'where': 'any'}, {'candidates': ['hearth']}):
+                submit(host_id='hearth', **dict({'slots': 2}, **fields))
+                self.assertFalse(calls[-1][0], fields)
+            # unreadable settings of the host: ordinary
+            (shard / 'host.conf.json').write_text(json.dumps({'host_jobs_to_fleet': True, 'slots': '12'}))
+            submit(host_id='hearth', slots=2)
+            self.assertFalse(calls[-1][0])
+            conf(shard / 'host.conf.json', host_jobs_to_fleet=True, host_id='hearth', address='u@hearth')
+            # laptop, fleet and a host the registry does not have never convert; neither does a disabled one
+            for name in ('laptop', 'fleet', 'nowhere', 7):
+                submit(host_id=name, slots=2)
+                self.assertEqual((calls[-1][0], calls[-1][1]['host_id']), (False, name))
+            (self.root / 'hosts.json').write_text(json.dumps({'version': 1, 'hosts': {
+                'hearth': {'state': 'hosts/hearth', 'enabled': False}}}))
+            submit(host_id='hearth', slots=2)
+            self.assertEqual((calls[-1][0], calls[-1][1]['host_id']), (False, 'hearth'))
+            (self.root / 'hosts.json').write_text('not json')
+            submit(host_id='hearth', slots=2)
+            self.assertFalse(calls[-1][0])
+            # an alias of the default host is the default host
+            (self.root / 'hosts.json').write_text(json.dumps({'version': 1, 'hosts': {
+                'hearth': {'state': 'hosts/hearth', 'enabled': True}}, 'aliases': {'build': 'ember'}}))
+            submit(host_id='build', slots=2)
+            self.assertEqual((calls[-1][0], calls[-1][1]['candidates'], 'host_id' in calls[-1][1]), (True, ['ember'], False))
+        # a refusal of the fleet backend names the host the job went to
+        def refuse(ctx, cmd, req):
+            raise cq.CqError('fleet submission requires the current worktree owner session')
+        with self.assertRaisesRegex(cq.CqError, r'\(a heavy where: host job now runs as a contained fleet job on hearth, '
+                                                r'so the host can share its capacity\)$'):
+            generations.execute(cq, self.ctx, 'submit', dict(base, slots=2, host_id='hestia'), refuse)
+
+    def test_an_empty_host_id_is_the_default_host_and_an_unusable_opted_in_host_stays_ordinary(self):
+        generations.context(cq, self.ctx, 2)
+        shard = self.root / 'hosts' / 'hearth'
+        shard.mkdir(parents=True)
+        calls = []
+        def leaf(ctx, cmd, req):
+            calls.append((ctx.state.endswith('queue-v2'), dict(req)))
+            return {'ok': True, 'job': self.fleet, 'note': 'fleet job accepted'}
+        base = {'root': str(self.root), 'session': 'sess-A', 'command': 'bash build.sh', 'slots': 2}
+        submit = lambda **fields: generations.execute(cq, self.ctx, 'submit', dict(base, **fields), leaf)
+        with mock.patch.object(cq, 'load_job', return_value={'memory_max_gb': 12.0}):
+            submit(host_id='')
+            self.assertEqual((calls[-1][0], calls[-1][1]['candidates'], 'host_id' in calls[-1][1]), (True, ['ember'], False))
+            good = {'host_jobs_to_fleet': True, 'host_id': 'hearth', 'address': 'u@hearth'}
+            for name, change in (('usable', {}), ('no address', {'address': None}), ('empty address', {'address': ''}),
+                                 ('mismatched host_id', {'host_id': 'hestia'}), ('no host_id', {'host_id': None}),
+                                 ('paused', {'paused': True})):
+                (shard / 'host.conf.json').write_text(json.dumps(dict(good, **change)))
+                submit(host_id='hearth')
+                self.assertEqual(calls[-1][0], name == 'usable', name)
+                if name != 'usable':
+                    self.assertEqual(calls[-1][1]['host_id'], 'hearth', name)
+
+    def test_the_ordinary_path_refuses_an_unknown_or_disabled_host_as_before(self):
+        (self.root / 'hosts.json').write_text(json.dumps({'version': 1, 'hosts': {
+            'hearth': {'state': 'hosts/hearth', 'enabled': False}}}))
+        (self.root / 'hosts' / 'hearth').mkdir(parents=True)
+        (self.root / 'hosts' / 'hearth' / 'host.conf.json').write_text(json.dumps({'host_jobs_to_fleet': True}))
+        who = {'root': str(self.root), 'session': 'sess-A', 'command': 'bash build.sh', 'slots': 2}
+        leaf = lambda ctx, command, req: multi_host.execute(cq, ctx, command, req, lambda *a: {'ok': True})
+        for name in ('hearth', 'hestia', 'nowhere'):
+            with self.assertRaisesRegex(cq.CqError, 'unknown or disabled host'):
+                generations.execute(cq, self.ctx, 'submit', dict(who, host_id=name), leaf)
 
     def test_views_merge_and_flag_generation_errors(self):
         generations.context(cq, self.ctx, 2)

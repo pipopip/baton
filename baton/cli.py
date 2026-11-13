@@ -9,7 +9,7 @@ import argparse
 import importlib
 import sys
 
-MODULES = ("launch", "accounts", "routing", "follow", "capsule", "install", "close", "doctor", "attach", "worktrees", "backup", "startup", "cycle", "compute_pickup", "compute_status", "night")
+MODULES = ("launch", "accounts", "routing", "follow", "capsule", "install", "close", "doctor", "attach", "worktrees", "backup", "startup", "cycle", "compute_pickup", "compute_status", "night", "migrate", "shell")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -32,5 +32,10 @@ def main(argv: list[str] | None = None) -> int:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError):
             pass
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] == "shell":
+        # `bt shell` takes the user's launch options (-Fresh, --dry-run, ...) verbatim; argparse would reject them.
+        from .shell import run_tokens
+        return run_tokens(argv[1:])
     args = build_parser().parse_args(argv)
     return int(args.func(args) or 0)

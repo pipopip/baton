@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from . import config
+
 BATON_DIRNAME = ".baton"
 
 
@@ -65,7 +67,7 @@ def ws_name(root: Path) -> str:
 
 def key_for(root: Path) -> str:
     """``<repo>/<ws>`` label of a worktree, ``<repo>/main`` for the main checkout."""
-    is_main = os.path.normcase(os.path.abspath(main_checkout(root))) == os.path.normcase(os.path.abspath(root))
+    is_main = config.norm(main_checkout(root)) == config.norm(root)      # the one path key, whatever spelling either side arrived in
     return f"{repo_name(root)}/{'main' if is_main else ws_name(root)}"
 
 

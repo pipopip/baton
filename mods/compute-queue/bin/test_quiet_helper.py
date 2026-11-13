@@ -23,6 +23,7 @@ class QuietHelperTests(unittest.TestCase):
 
     def test_helper_arguments_streams_cwd_and_exit_match_direct_execution(self):
         with tempfile.TemporaryDirectory() as directory:
+            directory = os.path.realpath(directory)   # Python and getcwd() spell a temp directory behind a link (macOS /var) physically
             helper = Path(directory) / 'helper.py'
             helper.write_text('''import os, subprocess, sys
 print(repr((sys.argv, sys.path[0], os.getcwd())), flush=True)
@@ -44,6 +45,7 @@ sys.exit(23)
 
     def test_relative_helper_keeps_file_and_argv_semantics_after_chdir(self):
         with tempfile.TemporaryDirectory() as directory:
+            directory = os.path.realpath(directory)   # Python and getcwd() spell a temp directory behind a link (macOS /var) physically
             root = Path(directory)
             (root / 'resource.txt').write_text('resource-data', encoding='utf-8')
             (root / 'helper.py').write_text("import os, pathlib, sys\nos.chdir('..')\nprint(repr((__file__, sys.argv[0], pathlib.Path(__file__).with_name('resource.txt').read_text())))\n", encoding='utf-8')
@@ -58,6 +60,7 @@ sys.exit(23)
 
     def test_relative_bytecode_helper_keeps_file_and_argv_semantics(self):
         with tempfile.TemporaryDirectory() as directory:
+            directory = os.path.realpath(directory)   # Python and getcwd() spell a temp directory behind a link (macOS /var) physically
             root = Path(directory)
             source = root / 'helper.py'
             source.write_text("import sys; print(repr((__file__, sys.argv[0])))\n", encoding='utf-8')
@@ -72,6 +75,7 @@ sys.exit(23)
 
     def test_missing_helper_retains_exit_code_two(self):
         with tempfile.TemporaryDirectory() as directory:
+            directory = os.path.realpath(directory)   # Python and getcwd() spell a temp directory behind a link (macOS /var) physically
             kw = dict(cwd=directory, capture_output=True, text=True)
             if os.name == 'nt':
                 kw['creationflags'] = quiet_helper.CREATE_NO_WINDOW
@@ -82,6 +86,7 @@ sys.exit(23)
 
     def test_queue_invokes_external_helper_with_host_cwd_arguments_and_output(self):
         with tempfile.TemporaryDirectory() as directory:
+            directory = os.path.realpath(directory)   # Python and getcwd() spell a temp directory behind a link (macOS /var) physically
             helper = Path(directory) / 'remote.py'
             helper.write_text("import os, sys\nprint(repr((sys.argv[1:], os.getcwd(), os.environ['LANE_HOST'])))\nprint('remote-error', file=sys.stderr)\nsys.exit(7)\n", encoding='utf-8')
             with mock.patch.object(cq, 'REMOTERUN', str(helper)):

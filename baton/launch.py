@@ -149,10 +149,14 @@ def _lead_settings(vendor: str, role: str, account: str = "main", notes: list[st
     return found.model, found.effort or None
 
 
+CODEX_SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
+
+
 def build_argv(vendor: str, mode: str, worktree: Path, session_id: str | None, model: str | None, effort: str | None,
-               prompt: str | None = None) -> list[str]:
+               prompt: str | None = None, sandbox: str | None = None) -> list[str]:
     """The CLI argv. ``prompt`` (fresh sessions only) is the first user message, given as the CLI's positional
-    prompt; the context cycler uses it to tell the replacement session why it exists."""
+    prompt; the context cycler uses it to tell the replacement session why it exists. ``sandbox`` (fresh Codex
+    sessions only) is a role's own sandbox mode in place of the one in the Codex configuration."""
     exe = config.exe(vendor)
     wt = str(worktree)
     if vendor == "claude":
@@ -173,6 +177,8 @@ def build_argv(vendor: str, mode: str, worktree: Path, session_id: str | None, m
         argv += ["-m", model]
     if effort:
         argv += ["-c", f'model_reasoning_effort="{effort}"']
+    if sandbox:
+        argv += ["-s", sandbox]
     if prompt:
         argv += ["--", prompt]
     return argv
@@ -338,10 +344,19 @@ def plan(worktree: str | os.PathLike, vendor: str | None = None, account: str | 
         notes.append(f"model {model} (requested)")
         lead_model = model
     startup_prompt = prompt
+    sandbox = None
     if role != "lead" and final_mode == "fresh":
         role_instructions = str(role_block.get("instructions", "")).strip()
         startup_prompt = (prompt + "\n\n" if prompt else "") + f"Baton role bt-{role}:\n{role_instructions}"
-    argv = build_argv(vendor, final_mode, wt, session_id, lead_model, effort, startup_prompt if final_mode == "fresh" else None)
+        # A role may carry its own Codex sandbox mode (routing.toml `sandbox`): the configured workspace-write mode
+        # keeps git metadata read-only, so a lane that has to commit and push its own work is given another one.
+        sandbox = role_block.get("sandbox") if vendor == "codex" else None
+        if sandbox is not None:
+            if sandbox not in CODEX_SANDBOXES:
+                raise ValueError(f"role {role}: sandbox must be one of {', '.join(CODEX_SANDBOXES)}")
+            notes.append(f"sandbox {sandbox} (role {role})")
+    argv = build_argv(vendor, final_mode, wt, session_id, lead_model, effort,
+                      startup_prompt if final_mode == "fresh" else None, sandbox)
     env_name = config.ACCOUNT_ENV[vendor]
     if chosen == "main":
         env_set, env_unset = {}, [env_name]

@@ -578,8 +578,12 @@ def _context_nudge_locked(vendor: str, data: dict, root: Path, now: float) -> st
     """Record the session's context size in the registry; return a hand-over nudge when it is large.
 
     The size and model come from the transcript tail (``harvest.ctx_info``). Above the session's limit
-    (``config.rotate_tokens(vendor, model)``, from ``[policy] rotate_context_tokens``) the nudge is given once, then again for every further ``NUDGE_STEP`` of growth; the last level nudged is kept
-    in the registry record (``nudge_level``) and follows the size down after a compaction.
+    (``config.rotate_tokens(vendor, model)``, from ``[policy] rotate_context_tokens``) a Claude session is told,
+    once and then again for every further ``NUDGE_STEP`` of growth, that it continues and Baton asks for the
+    handover when it cycles it; the last level nudged is kept in the registry record (``nudge_level``) and follows
+    the size down after a compaction. A Codex session has no cycle hook, so it is asked once, when the limit is
+    first passed, to bring now.md up to contract for the owner's ``bt <ws> -Fresh``; its level never follows the
+    size down, so the request is not repeated after a compaction or for further growth.
     """
     session_id = data.get("session_id") or None
     transcript = data.get("transcript_path") or None
@@ -592,22 +596,23 @@ def _context_nudge_locked(vendor: str, data: dict, root: Path, now: float) -> st
     level = tokens // NUDGE_STEP * NUDGE_STEP
     text = ""
     limit = config.rotate_tokens(vendor, model)
-    if tokens > limit and level > prior:
+    if tokens > limit and level > prior and (vendor != "codex" or prior == 0):
         if vendor == "codex":
-            # Codex has no Stop hook, so nothing replaces its process: it is told to leave a current handover for
-            # the owner's `bt <ws> -Fresh`. One line per further NUDGE_STEP tokens (nudge_level above).
+            # Codex has no Stop hook, so nothing replaces its process: it is asked once for a handover the owner's
+            # `bt <ws> -Fresh` starts from (nudge_level stays set for the rest of the session).
             text = (f"Context is ~{round(tokens / 1000)}k tokens (Baton continuity advisory), above this session's "
-                    f"{round(limit / 1000)}k limit. At the next safe boundary bring .baton/now.md up to its contract "
+                    f"{round(limit / 1000)}k limit. Once, at a safe boundary, bring .baton/now.md up to its contract "
                     "(Objective, State with commit shas, In flight, Next; check with `bt now check`); the owner "
                     f"restarts you with `bt {paths.ws_name(root)} -Fresh`. Keep working until then: this is not a "
                     "request to stop or to make a checkpoint commit.")
         else:
             text = (f"Context is ~{round(tokens / 1000)}k tokens (Baton continuity advisory). "
-                    "Continue the active task until Baton requests a managed handoff at a safe boundary. "
-                    "At the next meaningful milestone, update .baton/now.md with the objective, decisions, "
-                    "verification, unfinished operations and queue job IDs, and next action. A context warning is not "
-                    "task completion or a requirement to stop, restart, close out, or create a checkpoint commit.")
+                    "Continue the active task; nothing is needed from you now. Baton asks for the handover when it "
+                    "cycles the session. A context warning is not task completion or a requirement to stop, "
+                    "restart, close out, write notes, or create a checkpoint commit.")
         nudged = level
+    elif vendor == "codex":
+        nudged = prior
     else:
         nudged = min(prior, level)
     fields = dict(session_id=session_id, transcript=transcript, account=config.account_from_env(vendor, os.environ),

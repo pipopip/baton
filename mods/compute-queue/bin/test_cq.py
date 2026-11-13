@@ -28,10 +28,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 STATE_DIR = tempfile.mkdtemp(prefix="cqtest-state")
 atexit.register(shutil.rmtree, STATE_DIR, True)
 os.environ["CQ_STATE"] = STATE_DIR
+# these tests run the laptop executor on any OS (cq.laptop_executes is off elsewhere than Windows by default)
+os.environ.setdefault("CQ_LAPTOP_EXECUTOR", "1")
 for _name in ("CQ_HOST", "LANE_HOST", "CQ_LOAD_CAP", "CQ_HOST_RAM_FLOOR_GB"):
     os.environ.pop(_name, None)
 import cq  # noqa: E402
+import gnu_shims_for_tests  # noqa: E402
 
+gnu_shims_for_tests.install()   # a Mac has no GNU timeout or realpath -e, which the host scripts these tests run locally use
 BASH = cq.bash_exe()
 HAVE_BASH = os.path.isfile(BASH) or shutil.which("bash") is not None
 
@@ -119,6 +123,7 @@ class FakeHost:
         self.launches = []
         self.remoterun_rc = None
         self.remoterun_err = ""
+        self.remoterun_ok_err = ""  # what a launch that succeeds writes to stderr (remote_stage's fallback notes)
         self.slots = None  # the host's HEAVY_SLOTS line, when set
         self.mem_kb = 20000000
         self.cpu = None  # the CPUSTAT jiffies (10 numbers) the host reports; None: a host with no CPU lines
@@ -234,7 +239,7 @@ class FakeHost:
             return 17, f"CQ_EXISTS {jid}\n", ""
         now = int(self.clock[0])
         self.jobs[jid] = dict(exit=None, started=None, launched=now, finished=None, alive=True, src=True, pid=4242)
-        return 0, f"CQ_LAUNCHED {jid}\n", ""
+        return 0, f"CQ_LAUNCHED {jid}\n", self.remoterun_ok_err
 
 
 class Base(unittest.TestCase):
@@ -3046,6 +3051,67 @@ class FixBatchTests(Base):
             self.assertIn(f'rm -rf "$HOME/q/{a}/src"', self.host.calls[-1], status)
             self.assertNotIn("pkill", self.host.calls[-1], status)
 
+    def test_cleanup_of_a_long_backlog_goes_in_commands_a_command_line_holds(self):
+        # 300 finished jobs with a source copy and 300 week-old directories: one command for all of them was about
+        # 150,000 characters, more than ssh can be started with, so nothing was ever removed again
+        now = self.clock[0]
+        names = [f"cq-20261107T{i:06d}-{i:016x}" for i in range(600)]
+        jobs = {n: dict(exit=0, started=1, launched=1, finished=now - (8 * 86400 if i % 2 else 60), cpu=1, alive=False,
+                        src=not i % 2) for i, n in enumerate(names)}
+        record = {"status": "done", "host": cq.HOST, "host_config": {"tmp_root": "/dev/shm/cq"}}
+        sent = []
+
+        def ssh(ctx, job, script, timeout=60):
+            sent.append(script)
+            return 0, "", ""
+        with mock.patch.object(cq, "load_job", side_effect=lambda ctx, name: dict(record, id=name)), \
+                mock.patch.object(cq, "job_ssh", side_effect=ssh):
+            report = {}
+            self.assertEqual(cq.cleanup_host(self.ctx, {"jobs": jobs}, now, report=report), cq.CLEANUP_CALLS)
+            self.assertEqual(len(sent), cq.CLEANUP_CALLS)
+            self.assertGreater(report["left"], 0)   # more than one call's worth
+            sent.clear()
+            self.assertEqual(cq.cleanup_host(self.ctx, {"jobs": jobs}, now, calls=1), 1)   # the leader's tick: one command
+            self.assertEqual(len(sent), 1)
+            sent.clear()
+            self.assertEqual(cq.cleanup_host(self.ctx, {"jobs": jobs}, now), cq.CLEANUP_CALLS)
+            self.assertTrue(all(len(s) <= cq.CLEANUP_SCRIPT_CHARS for s in sent))
+            self.assertTrue(all(s.count("\n") > 20 for s in sent))  # a full command, not a job at a time
+            self.assertTrue(all('/src"' in line for s in sent for line in s.splitlines()))  # source copies come first
+            # the host's listing shrinks as it removes; every job is reached in a bounded number of calls
+            seen, rounds = set(), 0
+            while jobs and rounds < 40:
+                sent.clear()
+                cq.cleanup_host(self.ctx, {"jobs": jobs}, now)
+                for script in sent:
+                    for name in re.findall(r'rm -rf "\$HOME/q/(cq-[\w.-]+?)(?:/src)?"', script):
+                        seen.add(name)
+                        jobs.pop(name, None)
+                rounds += 1
+            self.assertEqual((seen, jobs), (set(names), {}))
+            self.assertLess(rounds, 40)
+            # a command the host did not take ends the call: nothing further is sent on that connection's failure
+            jobs.update({n: dict(exit=0, started=1, launched=1, finished=now - 60, cpu=1, alive=False, src=True) for n in names})
+            sent.clear()
+            with mock.patch.object(cq, "job_ssh", side_effect=lambda *a, **k: (sent.append(a[2]), (255, "", "ssh timed out"))[1]):
+                self.assertEqual(cq.cleanup_host(self.ctx, {"jobs": jobs}, now, report=report), 1)
+            self.assertGreater(report["left"], cq.CLEANUP_CALLS)   # the refused command counts as left
+            few = dict(list(jobs.items())[:3])
+            self.assertEqual((cq.cleanup_host(self.ctx, {"jobs": few}, now, report=report), report["left"]), (1, 0))
+
+        # a record the store cannot read is skipped; the others are still cleaned
+        def load(ctx, name):
+            if name == names[0]:
+                raise cq.CqError("duplicate job ID across ordinary and deferred stores")
+            return "not a record" if name == names[1] else dict(record, id=name)
+        sent.clear()
+        fresh = {n: dict(exit=0, started=1, launched=1, finished=now - 60, cpu=1, alive=False, src=True) for n in names[:6]}
+        with mock.patch.object(cq, "load_job", side_effect=load), mock.patch.object(cq, "job_ssh", side_effect=ssh):
+            self.assertEqual(cq.cleanup_host(self.ctx, {"jobs": fresh}, now), 1)
+        self.assertEqual(re.findall(r'rm -rf "\$HOME/q/(cq-[\w.-]+?)/src"', sent[0]), names[2:6])
+        self.assertEqual(list(cq.script_chunks(["aaaa", "bb", "c" * 30, "d"], 8)), [["aaaa", "bb"], ["c" * 30], ["d"]])
+        self.assertEqual(cq.cleanup_host(self.ctx, {"jobs": {}}, now), 0)
+
     def test_probe_reads_the_hosts_heavy_slots(self):
         self.host.slots = 6
         self.host.held = 1
@@ -3967,6 +4033,71 @@ class HostConfTests(Base):
         for v in ("-oProxyCommand=x", "-", "me @198.51.100.11", "me@198.51.100.11 -v", "me@\t198.51.100.11", "me@198.51.100.11\x00", "me@ 198.51.100.11"):
             self.assertEqual(cq.host_conf(self.write_conf(json.dumps({"address": v}))), {}, repr(v))
         self.assertEqual(cq.host_conf(self.write_conf(json.dumps({"address": " me@198.51.100.11\n"}))), {"address": "me@198.51.100.11"})
+
+
+class StagingStderrTests(Base):
+    """A staging helper that exits 0 may still say something on stderr (remote_stage falls back to the full history and
+    says why); the job's record keeps the end of it as staging_stderr, and status shows it."""
+    FALLBACK = "[remote_stage] incremental staging failed; sending the full history"
+
+    def launch_one(self):
+        a = self.submit()
+        self.tick()
+        cq.dispatch(self.ctx, {"job": a, "where": "host", "slots": 1})
+        cq.launch(self.ctx, a)
+        return a
+
+    def test_stderr_of_a_helper_that_succeeded_is_kept_and_shown(self):
+        self.host.remoterun_ok_err = self.FALLBACK + "\n"
+        a = self.launch_one()
+        self.assertEqual(self.job(a)["status"], "running")
+        self.assertEqual(self.job(a)["staging_stderr"], self.FALLBACK)
+        self.assertEqual(cq.cmd_get(self.ctx, {"job": a, "compact": True})["job"]["staging_stderr"], self.FALLBACK)
+        self.assertEqual(cq.cmd_get(self.ctx, {"job": a})["job"]["staging_stderr"], self.FALLBACK)
+
+    def test_a_finished_job_still_shows_it(self):
+        view = cq.result_view({"id": "x", "status": "done", "exit": 0, "staging_stderr": self.FALLBACK})
+        self.assertEqual(view["staging_stderr"], self.FALLBACK)
+        self.assertNotIn("staging_stderr", cq.result_view({"id": "x", "status": "done", "exit": 0}))
+
+    def test_a_helper_that_said_nothing_adds_no_key(self):
+        for err in ("", "  \n\r\n"):
+            with self.subTest(err=err):
+                self.host.jobs.clear()
+                self.host.remoterun_ok_err = err
+                a = self.launch_one()
+                self.assertEqual(self.job(a)["status"], "running")
+                self.assertNotIn("staging_stderr", self.job(a))
+                self.assertNotIn("staging_stderr", cq.cmd_get(self.ctx, {"job": a, "compact": True})["job"])
+
+    def test_a_failed_staging_is_unchanged_and_keeps_nothing(self):
+        self.host.remoterun_rc, self.host.remoterun_err = 1, "error: cannot lock ref 'refs/heads/x'\n[remoterun] push failed"
+        a = self.submit()
+        self.tick()
+        cq.dispatch(self.ctx, {"job": a, "where": "host", "slots": 1})
+        cq.launch(self.ctx, a)
+        self.assertEqual(self.job(a)["status"], "queued")
+        self.assertNotIn("staging_stderr", self.job(a))
+        self.assertEqual(cq.host_state(self.ctx)["next_probe"], self.clock[0] + 60)
+
+    def test_the_note_is_bounded_to_its_end_and_control_characters_are_made_safe(self):
+        long = "".join(f"line {i}\n" for i in range(1000))
+        note = cq.staging_note(0, long)["staging_stderr"]
+        self.assertEqual(len(note), cq.STAGING_STDERR_CHARS)
+        self.assertTrue(note.endswith("line 999"))
+        self.assertEqual(cq.staging_note(0, "a\x1b[31mb\x00c\r\nd\te\x7f\x85")["staging_stderr"], "a?[31mb?c\nd\te??")
+        self.assertEqual(cq.staging_note(0, "xxxxx")["staging_stderr"], "xxxxx")
+
+    def test_only_an_exit_of_zero_makes_a_note(self):
+        for rc in (1, 17, 75, 255):
+            self.assertEqual(cq.staging_note(rc, "something\n"), {})
+        self.assertEqual(cq.staging_note(0, None), {})
+
+    def test_the_helper_runner_hands_back_stderr_of_a_zero_exit(self):
+        done = subprocess.CompletedProcess([], 0, b"CQ_LAUNCHED x\n", (self.FALLBACK + "\n").encode())
+        with mock.patch.object(cq, "HOST", "me@192.0.2.7"), mock.patch.object(cq, "_run", return_value=done):
+            rc, out, err = cq.real_run_remoterun(["--rev", "abc"], self.tmp)
+        self.assertEqual((rc, cq.staging_note(rc, err)), (0, {"staging_stderr": self.FALLBACK}))
 
 
 class HostPauseTests(Base):

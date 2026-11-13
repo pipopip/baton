@@ -78,6 +78,31 @@ describe('the compute allowlist', () => {
     refused('/usr/bin/python3 scripts/x.py', 'not on the compute allowlist')
   })
 
+  test("a Mac package manager's absolute path to python, bash and go stands for the bare name", () => {
+    allowed('/opt/homebrew/bin/python3 scripts/audit.py')
+    allowed('/opt/homebrew/bin/python3 -u tools/run_oracle.py')
+    allowed('/usr/local/bin/python tools/record_trace.py')
+    allowed('/opt/local/bin/python3 go/x/testdata/mutate.py')
+    allowed('/Library/Frameworks/Python.framework/Versions/3.12/bin/python3 scripts/audit.py')
+    allowed('/opt/homebrew/bin/go test ./...')
+    allowed('go test ./... && /opt/homebrew/bin/python3 scripts/audit.py')
+    allowed('/opt/homebrew/bin/bash .baton/remote/night.sh')
+    // the same rules apply as for the bare name
+    refused('/opt/homebrew/bin/python3 tools/analyze.py', 'not under testdata')
+    refused('/opt/homebrew/bin/python3 -c "print(1)"', 'python runs only a script')
+    refused('/opt/homebrew/bin/python3 -m pytest', 'python runs only a script')
+    refused('/opt/homebrew/bin/python3', 'python runs only a script')
+    refused('/opt/homebrew/bin/python3 /tmp/evil/testdata/x.py', 'relative .py path')
+    // not a bare name, not an install directory, or not a tool on the list
+    refused('/opt/homebrew/bin/curl http://x', 'not on the compute allowlist')
+    refused('/opt/homebrew/bin/python3.12 scripts/x.py', 'not on the compute allowlist')
+    refused('/opt/homebrew/bin/cd x', 'not on the compute allowlist')
+    refused('/opt/homebrew/lib/python3 scripts/x.py', 'not on the compute allowlist')
+    refused('/tmp/evil/bin/python3 scripts/x.py', 'not on the compute allowlist')
+    refused('/opt/homebrew/bin/../../../tmp/python3 scripts/x.py', 'not on the compute allowlist')
+    refused('opt/homebrew/bin/python3 scripts/x.py', 'not on the compute allowlist')
+  })
+
   test('heavy -n N, timeout N and bash -c wrap an allowed command', () => {
     allowed('heavy -n 3 go test ./...')
     allowed('~/bin/heavy -n 2 lake build')

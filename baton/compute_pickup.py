@@ -117,6 +117,16 @@ def job_record(state, jid, host_id):
         return {}
 
 
+def seen_by_session(job):
+    """A finished job whose result the session has already been given: it was not deferred (no `requested_defer`,
+    `defer` empty or `immediate`: it finished while the session was working) and the queue has delivered its
+    completion notice (`notified` is true, set by the notice, a wait/status answer or a review). Such a job needs
+    no `bt compute --reviewed`; a deferred job (`spare`, `overnight`) finished while nobody watched and does."""
+    if job.get('status') not in TERMINAL or job.get('notified') is not True:
+        return False
+    return not job.get('requested_defer') and job.get('defer') in (None, '', 'immediate')
+
+
 def collect(root, state=None, limit=None):
     root = Path(root)
     state = Path(state) if state else config.STATE_DIR / 'compute'
@@ -148,8 +158,9 @@ def collect(root, state=None, limit=None):
         review_dir = receipt_dir / 'reviewed'
         ack = read(review_dir / (jid + '.json')) if local_dir(root, review_dir) else {}
         terminal = job.get('status') in TERMINAL
-        reviewed = terminal and ack.get('fingerprint') == stamp
-        row.update(state=('follow-up' if reviewed and ack.get('resolution') == 'follow-up' else
+        acked = terminal and ack.get('fingerprint') == stamp
+        reviewed = acked or seen_by_session(job)
+        row.update(state=('follow-up' if acked and ack.get('resolution') == 'follow-up' else
                           'reviewed' if reviewed else 'needs-review' if terminal else 'pending'),
                    status=job.get('status'), phase=job.get('deferred_phase'),
                    registered=job.get('deferred_registered') is True, defer=job.get('defer'),
@@ -171,7 +182,10 @@ def summary(root, state=None):
         return '## Deferred compute\n' + str(exc)
     if not rows:
         return ''
-    lines = ['## Deferred compute', 'Use `bt compute --refresh` to reconcile this workstream, then inspect outputs; queued/delivered is not reviewed.']
+    lines = ['## Deferred compute',
+             'Deferred results waiting for pickup and jobs still running. Look at them when this work is picked up '
+             'or a result is needed (`bt compute --refresh`), not on every turn; a finished job whose notice reached '
+             'this session is not listed.']
     for row in rows[:5]:
         durable = 'host-registered' if row.get('registered') else 'local/cached'
         lines.append(f"- {row['id']}: {row['state']}, {row.get('status', 'unknown')}, {durable}; {len(row.get('out_paths', []))} files")
@@ -181,7 +195,7 @@ def summary(root, state=None):
 
 
 def prompt_summary(root, session):
-    """Inject changed state once per session; this receipt does not mark review."""
+    """Inject changed state once per session; this reminder does not mark review."""
     owner = read(Path(root) / '.baton/owner.json')
     if owner.get('session_id') and owner['session_id'] != session:
         return ''

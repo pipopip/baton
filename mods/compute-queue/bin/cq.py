@@ -35,6 +35,7 @@ import subprocess
 import sys
 import tarfile
 import time
+import unicodedata
 import threading
 import zlib
 import artifact_transfer
@@ -71,6 +72,21 @@ def default_ssh(environ=None, name=None, isfile=os.path.isfile, which=shutil.whi
 
 
 SSH = default_ssh()
+
+
+LAPTOP_NOT_EXECUTOR = "not an executor on this machine"
+
+
+def laptop_executes(name=None, environ=None):
+    """Whether this machine runs `where: "laptop"` work. The laptop executor is Windows' (Job Objects, the heavy lock,
+    GlobalMemoryStatusEx); elsewhere it would run the job's script directly with no limit, so it is off unless
+    CQ_LAPTOP_EXECUTOR=1 (the Linux test suite exercises the laptop paths that way). CQ_LAPTOP_EXECUTOR=0 turns it off
+    anywhere. A controller on another machine (a Mac) places jobs on the remote hosts only."""
+    environ = os.environ if environ is None else environ
+    forced = environ.get("CQ_LAPTOP_EXECUTOR")
+    if forced in ("0", "1"):
+        return forced == "1"
+    return (os.name if name is None else name) == "nt"
 
 
 def norm_path(p):
@@ -127,6 +143,15 @@ HOST_CONF_VALID = {
     "go_trimpath": lambda v: isinstance(v, bool),
     # the Linux job sandbox (host/jobbox): off (the default), optional (a job asks with sandbox: true) or required
     "sandbox": lambda v: v in ("off", "optional", "required"),
+    # false: fleet jobs on this host are admitted on their caps, though its helper has the fleet memory pool in effect
+    # (fleet_queue._remote_probe); the default is to admit on the memory a job is expected to use
+    "expected_memory_admission": lambda v: isinstance(v, bool),
+    # true: fleet jobs on this host take the pool slots their earlier runs show they use, not the slots they declare,
+    # which stay their CPU limit (fleet_queue._job_slots, deferred.py charged_slots); the default is the declared slots
+    "expected_cpu_admission": lambda v: isinstance(v, bool),
+    # false: a fleet job that has waited for room is not registered on this host to wait there (fleet_queue._reserve,
+    # hand-over); the default is that it is, so that it starts when room appears even with no controller running
+    "queue_on_host": lambda v: isinstance(v, bool),
 }
 
 
@@ -321,6 +346,20 @@ class FileLock:
         return False
 
 
+def full_fsync(fd, fcntl_module=None):
+    """Flush fd to the drive: F_FULLFSYNC where the platform has it (on macOS fsync leaves the data in the drive's cache),
+    else os.fsync, which is also the fallback when F_FULLFSYNC fails (a file system that does not support it)."""
+    module = fcntl if fcntl_module is None else fcntl_module  # None on Windows, which never has the constant
+    command = getattr(module, "F_FULLFSYNC", None)
+    if command is not None:
+        try:
+            module.fcntl(fd, command)
+            return
+        except OSError:
+            pass
+    os.fsync(fd)
+
+
 def atomic_write(path, data: bytes, durable=False):
     """Write temp + os.replace: a reader sees the old file or the new one, never half of it (S19)."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -330,7 +369,7 @@ def atomic_write(path, data: bytes, durable=False):
             f.write(data)
             f.flush()
             if durable:
-                os.fsync(f.fileno())
+                full_fsync(f.fileno())
         last = None
         for _ in range(60):  # Windows refuses the replace while a reader has the target open
             try:
@@ -348,7 +387,7 @@ def atomic_write(path, data: bytes, durable=False):
                     if durable:
                         directory = os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY)
                         try:
-                            os.fsync(directory)
+                            full_fsync(directory)
                         finally:
                             os.close(directory)
                 return
@@ -544,7 +583,10 @@ def real_ssh(script, timeout=60, host=None, binding=None):
     return r.returncode, r.stdout.decode("utf-8", "replace"), err
 
 
-def real_run_remoterun(argv, cwd, timeout=540, host=None, binding=None):
+def real_run_remoterun(argv, cwd, timeout=540, host=None, binding=None, sandboxed=False):
+    """sandboxed: the job this stages runs in the job sandbox (make_launcher's decision, from job_sandbox). The bundled
+    helper then makes the staged clone self-contained, because the sandbox hides the mirror its objects are borrowed
+    from; the external REMOTERUN helper ignores it."""
     if not _address(host or HOST):
         return 255, "", "cq: configure CQ_HOST, LANE_HOST, or host.conf.json address before remote execution"
     # dispatch binds the execution address, and the helper its ssh client: it would otherwise start whichever
@@ -554,6 +596,9 @@ def real_run_remoterun(argv, cwd, timeout=540, host=None, binding=None):
     env.pop("CQ_REMOTE_MACHINE_ID", None)
     if binding.get("machine_id"):
         env["CQ_REMOTE_MACHINE_ID"] = binding["machine_id"]
+    env.pop("CQ_REMOTE_SANDBOXED", None)  # an inherited value must not decide for this job
+    if sandboxed:
+        env["CQ_REMOTE_SANDBOXED"] = "1"
     try:
         # The external helper starts Git and SSH itself; hiding only the helper
         # does not reliably hide the consoles those children may create.
@@ -572,8 +617,23 @@ def real_run_remoterun(argv, cwd, timeout=540, host=None, binding=None):
     if (os.path.basename(runner) == "remote_stage.py" and fallback and fallback != (host or HOST)
             and r.returncode == 255 and any(s in err for s in SSH_TRANSIENT)):
         return real_run_remoterun(argv, cwd, timeout, fallback,
-                                  {k: v for k, v in binding.items() if k != "fallback_address"})
+                                  {k: v for k, v in binding.items() if k != "fallback_address"}, sandboxed)
     return r.returncode, r.stdout.decode("utf-8", "replace"), err
+
+
+STAGING_STDERR_CHARS = 2000
+
+
+def staging_note(rc, err):
+    """What a staging helper that exited 0 said on stderr, for the job's record: {"staging_stderr": the last
+    STAGING_STDERR_CHARS characters, control characters other than newline and tab shown as "?"}, or {} when it exited
+    otherwise or said nothing. A helper that succeeds after falling back (remote_stage's "incremental staging failed;
+    sending the full history") would otherwise leave no trace of why. Failure paths keep using err as they did."""
+    if rc != 0 or not isinstance(err, str):
+        return {}
+    text = "".join(c if c in "\n\t" or unicodedata.category(c)[0] != "C" else "?"
+                   for c in err.replace("\r\n", "\n")).strip()
+    return {"staging_stderr": text[-STAGING_STDERR_CHARS:]} if text else {}
 
 
 def spawn_detached(argv, env=None, stdout=None, cwd=None):
@@ -1392,6 +1452,9 @@ def cmd_submit(ctx, req):
         raise CqError("where must be host, laptop or any")
     if ctx.host_id and where != "host":
         raise CqError("a remote queue shard requires where host")
+    if where == "laptop" and not laptop_executes():
+        raise CqError(f"where 'laptop' is refused: the laptop is {LAPTOP_NOT_EXECUTOR} (only a Windows controller runs "
+                      "laptop jobs); use where 'host' or 'fleet' to run it on a remote Linux device")
     sandbox, network = sandbox_request(req)
     if sandbox is True and where == "laptop":
         raise CqError(SANDBOX_LINUX_ONLY)
@@ -1581,6 +1644,11 @@ def status_row(job, now, cap=None):
     row = job_summary(job, now)
     status = job.get("status")
     launch = job.get("t_launch") or job.get("t_started")
+    if job.get("handed_over"):
+        # A fleet job registered on its host to wait there for room (fleet_queue._reserve): its launch is the
+        # hand-over, and its wait goes on until its command starts. While it still waits it runs to now, and to
+        # its end if it ended without starting.
+        launch = job.get("t_started") or (now if status == "launching" else job.get("t_finished") or launch)
     run = _mins(job.get("t_finished"), job.get("t_started")) if status in TERMINAL else None
     use = None
     if status == "running" and job.get("placed_where") == "host" and cap:
@@ -2208,14 +2276,17 @@ def probe(ctx, snap=None, err="", attempted=True):
         host.update(down_since=hs["down_since"], down_reason=hs.get("down_reason", err), name=HOST_NAME, slot_vcpu=SLOT_VCPU,
                     slot_ram_gb=SLOT_RAM_GB, ram_floor_gb=HOST_RAM_FLOOR_GB, load_cap=LOAD_CAP)  # load_cap None: plan.ts uses nproc
     save_host_state(ctx, hs)
-    ram = ctx.laptop.free_ram_gb()
-    heavy_jobs = [j for j in all_jobs(ctx) if j.get("placed_where") == "laptop" and j.get("status") in ("launching", "running")
-                  and j.get("slots_eff", j.get("slots", 0)) > 0]
-    laptop = {"heavy_busy": bool(ctx.laptop.heavy_lock_held() or heavy_jobs), "free_ram_gb": ram,
-              "ram_ok": ram >= LAPTOP_RAM_MIN_GB}
-    mem = _laptop_call(ctx.laptop, "mem_stats")
-    if isinstance(mem, dict):
-        laptop.update({k: mem.get(k) for k in ("commit_gb", "commit_limit_gb", "np_gb", "paged_gb", "cache_gb")})
+    if laptop_executes():
+        ram = ctx.laptop.free_ram_gb()
+        heavy_jobs = [j for j in all_jobs(ctx) if j.get("placed_where") == "laptop" and j.get("status") in ("launching", "running")
+                      and j.get("slots_eff", j.get("slots", 0)) > 0]
+        laptop = {"heavy_busy": bool(ctx.laptop.heavy_lock_held() or heavy_jobs), "free_ram_gb": ram,
+                  "ram_ok": ram >= LAPTOP_RAM_MIN_GB}
+        mem = _laptop_call(ctx.laptop, "mem_stats")
+        if isinstance(mem, dict):
+            laptop.update({k: mem.get(k) for k in ("commit_gb", "commit_limit_gb", "np_gb", "paged_gb", "cache_gb")})
+    else:  # this machine only controls: no RAM figure, no lock, no profile of a machine that runs nothing
+        laptop = {"executor": False, "heavy_busy": False, "free_ram_gb": None, "ram_ok": False, "reason": LAPTOP_NOT_EXECUTOR}
     light = light_running(ctx)
     host["light_running"], laptop["light_running"] = light["host"], light["laptop"]
     cap = {"at": now, "host": host, "laptop": laptop}
@@ -2361,9 +2432,18 @@ def caps_override(job, cap):
             and job["slots"] <= h.get("free", 0) and host_cap_room(h) < job["slots"])
 
 
+def _laptop_off(cap):
+    """True when the capacity sample says the laptop is not an executor on the machine that took it (a controller-only Mac)."""
+    return (cap.get("laptop") or {}).get("executor") is False
+
+
 def _light_room(cap):
-    """How many more light (slots 0) jobs or parts each machine takes: LIGHT_CAP less those already launching or running."""
-    return {m: max(0, LIGHT_CAP - int((cap.get(m) or {}).get("light_running", 0) or 0)) for m in ("host", "laptop")}
+    """How many more light (slots 0) jobs or parts each machine takes: LIGHT_CAP less those already launching or running.
+    A laptop that is not an executor takes none."""
+    room = {m: max(0, LIGHT_CAP - int((cap.get(m) or {}).get("light_running", 0) or 0)) for m in ("host", "laptop")}
+    if _laptop_off(cap):
+        room["laptop"] = 0
+    return room
 
 
 def _fits(job, cap, free_host, laptop_free, light=None):
@@ -2374,7 +2454,7 @@ def _fits(job, cap, free_host, laptop_free, light=None):
     if (job["where"] in ("host", "any") and h.get("up") and h.get("usable") and free_host >= job["slots"]
             and (job["slots"] > 0 or (light["host"] > 0 and host_light_ok(h)))):
         out.append("host")
-    if job["where"] in ("laptop", "any") and job["slots"] <= 1:
+    if job["where"] in ("laptop", "any") and job["slots"] <= 1 and not _laptop_off(cap):
         if (job["slots"] == 0 and light["laptop"] > 0) or (job["slots"] == 1 and laptop_free):
             out.append("laptop")
     return out
@@ -2382,7 +2462,8 @@ def _fits(job, cap, free_host, laptop_free, light=None):
 
 def _laptop_heavy_free(cap):
     lp = cap.get("laptop") or {}
-    return (not lp.get("heavy_busy")) and lp.get("free_ram_gb", 0) >= LAPTOP_RAM_MIN_GB
+    return (lp.get("executor") is not False and not lp.get("heavy_busy")
+            and (lp.get("free_ram_gb") or 0) >= LAPTOP_RAM_MIN_GB)
 
 
 def head_window(head, cap, running, now):
@@ -2444,6 +2525,8 @@ def reservations(queued, cap, running=None, now=None):
                 continue
             cands = [j for j in queued if j["slots"] >= 1 and j["where"] in ("host", "any") and (not total or j["slots"] <= total)
                      and (mx is None or j["slots"] <= mx)]
+        elif _laptop_off(cap):
+            continue  # no machine to hold: nothing is reserved on a laptop that runs nothing
         else:
             cands = [j for j in queued if j["slots"] == 1 and j["where"] in ("laptop", "any")]
         if not cands:
@@ -2590,6 +2673,9 @@ def guard(entries, queued, cap, now, mode="haiku", running=None):
             owed = {"host": 0, "laptop": 0}  # J is placed or refused here: nothing is owed after this entry
         if where not in ("host", "laptop"):
             refused.append({"job": jid, "reason": f"where {where!r} is not host or laptop"})
+            continue
+        if where == "laptop" and _laptop_off(cap):
+            refused.append({"job": jid, "reason": f"the laptop is {LAPTOP_NOT_EXECUTOR}"})
             continue
         if job["where"] != "any" and job["where"] != where:
             refused.append({"job": jid, "reason": f"where {where} not allowed: the job says {job['where']}"})
@@ -2839,6 +2925,8 @@ def dispatch(ctx, a):
             return {"ok": False, "error": f"{a['job']} is not queued"}
         if a.get("where") == "host" and HOST_PAUSED:
             return {"ok": False, "error": "host paused (host.conf.json)"}
+        if a.get("where") == "laptop" and not laptop_executes():
+            return {"ok": False, "error": f"the laptop is {LAPTOP_NOT_EXECUTOR}: {a['job']} stays queued"}
         if a.get("where") == "host" and job.get("host_config") and not binding_matches_current(job):
             return {"ok": False, "error": "previous launch is bound to another host/configuration; reconcile it before retrying"}
         if RAM_JOBS and a.get("where") == "host" and not job.get("defer"):
@@ -3005,6 +3093,18 @@ TMP_ENV_RAM = r'''  printf 'export TMPDIR=%q\n' "$T"
 '''
 
 
+def job_sandbox(job):
+    """(boxed, network) for the job as its launcher is made: the one decision make_launcher and the staging calls share.
+    The host setting binds late (fleet placement), so this is the authoritative check of the job's sandbox request.
+    A binding is frozen when the job is first dispatched, so a setting made stricter since then must still apply:
+    where the binding is for the host whose settings are loaded now, the stricter of the two decides."""
+    binding = job.get("host_config") or {}
+    mode = binding.get("sandbox", "off") if binding else None
+    if not binding or binding.get("machine_id") == _CONF.get("machine_id"):
+        mode = stricter_sandbox(mode, _CONF.get("sandbox", "off"))
+    return sandbox_plan(job, {"sandbox": mode})
+
+
 def make_launcher(job):
     binding = job.get("host_config") or {}
     tmp_root = binding.get("tmp_root", TMP_ROOT) if job.get("temp_storage") != "ram" else ""
@@ -3029,6 +3129,21 @@ def make_launcher(job):
             descriptor["resource_policy_version"] = queue_policy.RESOURCE_POLICY_VERSION
         if job.get("fleet"):
             descriptor.update(fleet=True, priority=job.get("priority", "lane"))
+            # the expectation only for a host that admits on it (its helper has the fleet memory pool in effect and the
+            # host is not switched off, as the binding was made from its probe), and only when it is below the cap
+            expected = job.get("memory_expected_gb")
+            if (binding.get("expected_memory_admission") is True and _number(expected)
+                    and 0 < expected < job["memory_max_gb"]):
+                descriptor["memory_expected_gb"] = expected
+            # the CPU expectation likewise: only for a host set to charge it, and only when it is below the declared slots
+            cores = job.get("cpu_expected")
+            if binding.get("expected_cpu_admission") is True and _number(cores) and 0 < cores < job["slots"]:
+                descriptor["cpu_expected"] = cores
+            # when an immediate job was submitted: the host's queue ages a waiting job from then and not from its
+            # registration, so one handed over after a long wait keeps the place its age gives it (deferred.py
+            # queue_order). A helper from before the field ignores it.
+            if job["defer"] == "immediate" and _number(job.get("t_submitted")) and job["t_submitted"] >= 1:
+                descriptor["submitted"] = int(job["t_submitted"])
         data = base64.b64encode(json.dumps(descriptor, separators=(",", ":")).encode()).decode()
         policy_check = 'python3 "$HOME/.local/share/baton/compute-deferred/deferred.py" check >/dev/null'
         if custom_policy:
@@ -3060,13 +3175,7 @@ def make_launcher(job):
                                     '"$HOME/.local/bin/cq-job" start "$ID" --memory-bytes ' +
                                     str(int(job["memory_max_gb"] * 2**30)) + ' --timeout-seconds @TIMEOUT_S@')
         template = template.replace('mkdir -p "$D/tmp"', 'printf ram > "$D/temp_storage"')
-    # the host setting binds late (fleet placement), so this is the authoritative check of the job's sandbox request
-    # A binding is frozen when the job is first dispatched, so a setting made stricter since then must still apply:
-    # where the binding is for the host whose settings are loaded now, the stricter of the two decides.
-    mode = binding.get("sandbox", "off") if binding else None
-    if not binding or binding.get("machine_id") == _CONF.get("machine_id"):
-        mode = stricter_sandbox(mode, _CONF.get("sandbox", "off"))
-    boxed, network = sandbox_plan(job, {"sandbox": mode})
+    boxed, network = job_sandbox(job)
     if boxed:
         # the job runs through the helper, which builds its sandbox or refuses (the job never runs outside it). timeout
         # stays inside, so TERM reaches the job; started is written outside, the job directory is read-only inside.
@@ -3074,8 +3183,10 @@ def make_launcher(job):
         # (RT, read from ramtmp before the job runs) or the directory the RAM service made for a RAM job.
         check = f'[ -f {JOBBOX} ] && [ -x {JOBBOX} ] || {{ echo "CQ_NO_JOBBOX $ID"; echo {shlex.quote(JOBBOX_MISSING)} >&2; exit 79; }}'
         template = template.replace('mkdir -p "$Q"', check + '\nmkdir -p "$Q"', 1)
-        # GOFLAGS: the job's src is a shared clone whose alternates point into the real home, absent in the sandbox, so
-        # git history is unavailable and go build of a main package would fail to get VCS status
+        # GOFLAGS: the bundled staging helper (remote_stage.py) gives a boxed job a self-contained src, but a host that
+        # stages through the external REMOTERUN helper (no portable_runner) still gives it a shared clone whose
+        # alternates point into the real home, absent in the sandbox: no git history there, and go build of a main
+        # package would fail to get VCS status. -buildvcs=false is kept for those jobs.
         template = template.replace("inner='date +%s", 'export CQ_BOX_RW="${RT:-${CQ_RAM_TMP:-}}"\n'
                                     'export GOFLAGS="${GOFLAGS:+$GOFLAGS }-buildvcs=false"\ninner=\'date +%s', 1)
         template = template.replace('exec timeout -k 30',
@@ -3126,6 +3237,8 @@ def launch(ctx, job_id, family=None):
         touch_launch(ctx, family or [job_id])
         if job["placed_where"] == "host":
             launch_host(ctx, job, family or [job_id])
+        elif not laptop_executes():
+            raise CqError(f"the laptop is {LAPTOP_NOT_EXECUTOR}: a laptop job is never started here")
         else:
             launch_laptop(ctx, job)
     except LockTimeout as e:  # busy, not broken: a requeue (a part cannot be requeued: it fails with this reason)
@@ -3198,13 +3311,15 @@ def launch_host(ctx, job, family=None):
             return
         try:
             script = make_launcher(job)
+            boxed = job_sandbox(job)[0]  # the decision make_launcher just made, for the staging helper
         except SandboxError as exc:  # the host's setting changed since submit, or fleet placement bound another host
             requeue_or_fail(ctx, job["id"], str(exc), transient=False)
             return
         b64 = base64.b64encode(script.encode("utf-8")).decode()
         argv = ["--rev", job["sha"], "--subdir", job["subdir"], "--", "bash", "-c", f"echo {b64} | base64 -d | bash"]
         if ctx.run_remoterun is real_run_remoterun:
-            rc, out, err = real_run_remoterun(argv, job["top"], host=job.get("host", HOST), binding=job.get("host_config"))
+            rc, out, err = real_run_remoterun(argv, job["top"], host=job.get("host", HOST), binding=job.get("host_config"),
+                                              sandboxed=boxed)
         else:
             rc, out, err = ctx.run_remoterun(argv, job["top"])
     if f"CQ_NO_JOBBOX {job['id']}" in out:
@@ -3215,7 +3330,7 @@ def launch_host(ctx, job, family=None):
     if job.get("defer"):
         if f"CQ_REGISTERED {job['id']}" in out:
             _launch_result(ctx, job["id"], "launching", deferred_phase="queued", deferred_registered=True, reason="registered on host",
-                           host_dir=f"~/q/{job['id']}")
+                           host_dir=f"~/q/{job['id']}", **staging_note(rc, err))
         else:
             # Any interruption after remote staging can leave an accepted registration.
             # Reconcile the ID at the original endpoint before considering another push.
@@ -3224,7 +3339,8 @@ def launch_host(ctx, job, family=None):
                            reason=f"registration unconfirmed (exit {rc}); reconciling host: {(out + err)[-300:]}")
         return
     if f"CQ_LAUNCHED {job['id']}" in out or rc == 17 or f"CQ_EXISTS {job['id']}" in out:
-        res = _launch_result(ctx, job["id"], "running", host_dir=f"~/q/{job['id']}", log_path=f"{job.get('host', HOST)}:~/q/{job['id']}/run.log")
+        res = _launch_result(ctx, job["id"], "running", host_dir=f"~/q/{job['id']}", log_path=f"{job.get('host', HOST)}:~/q/{job['id']}/run.log",
+                             **staging_note(rc, err))
         if res and (res["status"] == "cancelled" or res.get("cancel_requested")):
             kill_running(ctx, res)
         return
@@ -4184,7 +4300,7 @@ def reap(ctx, snap):
     cleanup_ram(ctx)
     for identity, remote_snap in snapshots.items():
         if remote_snap is not None:
-            cleanup_host(ctx, remote_snap, now, host=identity[0], binding=bindings[identity])
+            cleanup_host(ctx, remote_snap, now, host=identity[0], binding=bindings[identity], calls=1)
     return ended
 
 
@@ -4364,13 +4480,51 @@ def ramtmp_rm(name, tmp_root=None):
             f'{shlex.quote(tmp_root)}/{alnum}) rm -rf "$p";; esac; ')
 
 
-def cleanup_host(ctx, snap, now, host=None, binding=None):
-    """Clean only known completed jobs; unknown remote directories remain owned elsewhere."""
-    script = []
+CLEANUP_SCRIPT_CHARS = 12000  # of one cleanup command: ssh takes the script as an argument, Windows allows a command
+#                               line 32,767 characters and its quoting doubles some of them
+ARTIFACT_KEEP_S = 7 * 86400  # a finished job with an artifact still missing keeps its source copy on the host this long
+CLEANUP_CALLS = 4  # cleanup commands per call of cleanup_host at most; what is left waits for the next one. The leader's
+#                    tick sends one (as it always did): it waits for each, and its lease is 45 s
+
+
+def script_chunks(lines, limit):
+    """lines in order, grouped so that each group joined by newlines stays within limit (a longer line goes alone)."""
+    chunk, size = [], 0
+    for line in lines:
+        if chunk and size + len(line) + 1 > limit:
+            yield chunk
+            chunk, size = [], 0
+        chunk.append(line)
+        size += len(line) + 1
+    if chunk:
+        yield chunk
+
+
+def cleanup_host(ctx, snap, now, host=None, binding=None, calls=CLEANUP_CALLS, report=None):
+    """Clean only known completed jobs; unknown remote directories remain owned elsewhere. The work goes to the host
+    in commands of bounded length, at most `calls` of them: one command for all of it stopped working for good once
+    its length passed what a command line holds (about 110 finished jobs), and every later attempt was longer. Stops
+    and source copies come before week-old directories, which hold little. Returns the number of commands sent;
+    report, a dict, gets `left`: the commands not sent or not taken, so 0 means the host has the whole list."""
+    script, old = [], []
     for name, ent in snap["jobs"].items():
-        job = load_job(ctx, name)
-        if job is None:
+        try:
+            job = load_job(ctx, name)
+        except CqError:
+            continue  # one record this store cannot read does not stop the cleanup of the others
+        if not isinstance(job, dict):
             continue  # another generation/controller may retain its only artifact copy
+        machine = (binding or {}).get("machine_id")
+        if (machine and (job.get("host_config") or {}).get("machine_id") != machine
+                and any(isinstance(r, dict) and r.get("machine_id") == machine and not r.get("removed")
+                        and r.get("address") in (None, host or HOST) for r in job.get("recalled_from") or [])):
+            # a fleet job recalled from this machine before it started (fleet_queue._requeue_recalled): it runs, or
+            # waits, elsewhere, so the directory it left here is of no use, and no rule below would ever take it (the
+            # record is pinned to another host). Never while the record is on this machine, and not once the entry
+            # is marked removed: from then on the job may be staged here again under the same ID.
+            if not ent["alive"]:
+                script.append(f'rm -rf "$HOME/q/{name}"')
+            continue
         if job and job.get("host", HOST) != (host or HOST):
             continue
         if (job and (job.get("host_config") or {}).get("machine_id")
@@ -4380,8 +4534,15 @@ def cleanup_host(ctx, snap, now, host=None, binding=None):
             if job.get("ram_cleaned") and ent["src"]:
                 script.append(f'rm -rf "$HOME/q/{name}/src"')
             continue
-        if job and (job.get("artifact_missing") or job.get('artifact_pending')):
-            continue  # the remote source is the only remaining copy of unfetched artifacts
+        if job.get('artifact_pending'):
+            continue  # a fetch is under way
+        if job.get("artifact_missing"):
+            # the remote source is the only remaining copy of unfetched artifacts: kept ARTIFACT_KEEP_S from the job's
+            # end for a refresh to fetch them, then cleaned like any other (with no limit, 82 fleet jobs in two days
+            # kept a source copy each, most of them failed runs that never wrote the file)
+            ended = job.get("t_finished") or ent["finished"]
+            if not isinstance(ended, (int, float)) or isinstance(ended, bool) or now - ended <= ARTIFACT_KEEP_S:
+                continue
         if job.get("status") not in TERMINAL:
             continue
         if ent["alive"]:
@@ -4393,9 +4554,18 @@ def cleanup_host(ctx, snap, now, host=None, binding=None):
             script.append(ramtmp_rm(name, tmp_root) + f'rm -rf "$HOME/q/{name}/src" "$HOME/q/{name}/tmp"')
         elif ent["finished"] and now - ent["finished"] > 7 * 86400:
             tmp_root = (job.get("host_config") or {}).get("tmp_root")
-            script.append(ramtmp_rm(name, tmp_root) + f'rm -rf "$HOME/q/{name}"')
-    if script:
-        job_ssh(ctx, {"host": host or HOST, "host_config": binding or {}}, "\n".join(script) + "\n", timeout=120)
+            old.append(ramtmp_rm(name, tmp_root) + f'rm -rf "$HOME/q/{name}"')
+    chunks = list(script_chunks(script + old, CLEANUP_SCRIPT_CHARS))
+    sent = taken = 0
+    for chunk in chunks[:max(0, calls)]:
+        sent += 1
+        rc = job_ssh(ctx, {"host": host or HOST, "host_config": binding or {}}, "\n".join(chunk) + "\n", timeout=120)[0]
+        if rc != 0:
+            break  # the host did not take it (or the removal outlasted the wait): the next call lists what is left
+        taken += 1
+    if report is not None:
+        report["left"] = len(chunks) - taken
+    return sent
 
 
 def cmd_reap(ctx, req):
@@ -4481,6 +4651,7 @@ def result_view(job):
     data.pop("tail_digest", None)
     if digests:
         data["artifacts_verified"] = len(digests)
+    data["staging_stderr"] = job.get("staging_stderr")
     return {k: v for k, v in data.items() if v not in (None, "", [], {})}
 
 
@@ -4491,7 +4662,7 @@ def job_brief(job, now):
         return result_view(job)
     row = job_summary(job, now) | {k: job.get(k) for k in ("command", "sha", "base", "source", "submitted", "gets",
                                                            "timeout_minutes", "attempts", "children", "candidates",
-                                                           "placement_reasons", "notice_hold_reason")}
+                                                           "placement_reasons", "notice_hold_reason", "staging_stderr")}
     return {k: v for k, v in row.items() if v is not None and v is not False and v not in ("", [], {})}
 
 
@@ -4756,6 +4927,8 @@ def _host_block(job, cap, res):
 
 def _laptop_block(job, cap, res):
     """Why the laptop does not take the queued `job` now, by the planner's own rules; None: it does."""
+    if _laptop_off(cap):
+        return f"the laptop is {LAPTOP_NOT_EXECUTOR}; this job can only wait for a remote host (resubmit with where 'host' or 'fleet')"
     if job["slots"] > 1:  # _fits: the laptop runs light and 1-slot jobs only
         return "the laptop takes only light and 1-slot jobs"
     if job["slots"] < 1:
@@ -4779,6 +4952,8 @@ def wait_reason(job, cap, res, now, started=None):
         why = _host_block(job, cap, res)
     elif where == "laptop":
         why = _laptop_block(job, cap, res)
+    elif _laptop_off(cap):  # 'any' on a controller that runs nothing itself waits for the host alone
+        why = _host_block(job, cap, res)
     else:
         host, lap = _host_block(job, cap, res), _laptop_block(job, cap, res)
         why = f"{host} | laptop: {lap}" if host and lap else None
@@ -4834,6 +5009,8 @@ def _host_line(h):
 
 
 def _laptop_line(lp):
+    if lp.get("executor") is False:
+        return LAPTOP_NOT_EXECUTOR
     parts = []
     if lp.get("free_ram_gb") is not None:
         parts.append(f"{_n(lp['free_ram_gb'])} GB free (heavy jobs need {LAPTOP_RAM_MIN_GB:g})")

@@ -40,9 +40,42 @@ def claude_slug(worktree: str | os.PathLike) -> str:
 
 
 def claude_project_dir(worktree: str | os.PathLike, config_dir: str | os.PathLike) -> Path:
-    """``<config_dir>/projects/<slug>``, matched case-insensitively against what exists."""
+    """``<config_dir>/projects/<slug>``, matched against what exists.
+
+    The filesystem decides what counts as the same name: the exact slug when that directory exists (on a
+    case-insensitive volume, Windows or default macOS, any casing of it is the same directory), else a scan for a
+    name that differs only in case (a case-sensitive volume). Off Windows the slug of the path with its symbolic
+    links resolved is tried too: Claude Code runs in the physical directory (``getcwd``), while a caller may hold
+    the logical spelling (``~/Code/app`` is ``~/Code/app``). When both spellings have a directory, the one
+    with the newest transcript is the answer (``bt migrate`` puts a project's memory under the logical slug, so that
+    directory can exist without a single session in it); with no transcript in either, the spelling as given.
+    Nothing found: the slug of the path as given.
+    """
     projects = Path(config_dir) / "projects"
-    slug = claude_slug(worktree)
+    spellings = [worktree]
+    if os.name != "nt":
+        try:
+            spellings.append(os.path.realpath(str(worktree)))
+        except (OSError, ValueError):
+            pass
+    found = [d for d in (_project_dir_named(projects, slug) for slug in dict.fromkeys(claude_slug(w) for w in spellings))
+             if d is not None]
+    if len(found) > 1:
+        dated = []
+        for directory in found:
+            newest = _newest_jsonl(directory)
+            try:
+                if newest is not None:
+                    dated.append((newest.stat().st_mtime, directory))
+            except OSError:
+                pass
+        if dated:
+            return max(dated, key=lambda item: item[0])[1]
+    return found[0] if found else projects / claude_slug(worktree)
+
+
+def _project_dir_named(projects: Path, slug: str) -> Path | None:
+    """The directory of that name: the exact one, else one whose name differs only in case; None when there is none."""
     exact = projects / slug
     if exact.is_dir():
         return exact
@@ -53,7 +86,7 @@ def claude_project_dir(worktree: str | os.PathLike, config_dir: str | os.PathLik
                 return child
     except OSError:
         pass
-    return exact
+    return None
 
 
 def _newest_jsonl(directory: Path) -> Path | None:

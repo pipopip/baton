@@ -1,8 +1,9 @@
 """Standing overnight checks: ``bt night plan|submit|report``.
 
 Submits through the existing compute-queue engine and reads existing records. It
-schedules nothing itself and starts no daemon; the queue's deferred "overnight"
-window decides when jobs run.
+starts no daemon; the queue's deferred "overnight" window decides when jobs run.
+``night_schedule`` adds the opt-in evening task that runs the submit for enrolled
+worktrees (``bt night enroll|unenroll|run|schedule``).
 """
 from __future__ import annotations
 
@@ -198,6 +199,9 @@ def parse_manifest(text, source='night.toml'):
     budget = (data.get('budget') or {}).get('slot_hours', DEFAULT_BUDGET)
     if not _num(budget, 0, 1e6):
         raise ManifestError('key budget.slot_hours: must be a non-negative number')
+    own = (data.get('budget') or {}).get('repo_slot_hours')
+    if own is not None and not _num(own, 0, 1e6):
+        raise ManifestError('key budget.repo_slot_hours: must be a non-negative number')
     defaults = data.get('defaults') or {}
     if not isinstance(defaults, dict) or {'name', 'matrix'} & set(defaults):
         raise ManifestError('key defaults: must be a table without name or matrix')
@@ -213,7 +217,7 @@ def parse_manifest(text, source='night.toml'):
         recipes.append(recipe)
     if sum(len(r['variants']) for r in recipes) > MAX_JOBS:
         raise ManifestError(f'more than {MAX_JOBS} jobs in one manifest')
-    return {'budget': float(budget), 'recipes': recipes}
+    return {'budget': float(budget), 'repo_budget': None if own is None else float(own), 'recipes': recipes}
 
 
 def find_manifest(root, override=None):
@@ -492,9 +496,13 @@ def plan(root, manifest, night, rows, budget=None, retry_failed=False):
     # the budget is per night, not per invocation: what earlier submissions for this night still hold counts
     # (finished jobs included: the cap is on what a night requests, not on what is outstanding at this moment).
     # It counts every repository's submissions: the ledger is machine-wide and the cap protects the shared hosts.
-    used = sum((r.get('slots') or 0) * (r.get('est_minutes') or 0) / 60 for r in rows
-               if r.get('kind') == 'submitted' and r.get('night') == night
-               and all(type(r.get(k)) in (int, float) for k in ('slots', 'est_minutes')))
+    tonight = [r for r in rows if r.get('kind') == 'submitted' and r.get('night') == night
+               and all(type(r.get(k)) in (int, float) for k in ('slots', 'est_minutes'))]
+    used = sum(r['slots'] * r['est_minutes'] / 60 for r in tonight)
+    # budget.repo_slot_hours is this repository's own share of that: without it, the first repository to submit
+    # could take the whole machine-wide cap and the ones after it would submit nothing
+    own_budget = manifest.get('repo_budget')
+    own_used = sum(r['slots'] * r['est_minutes'] / 60 for r in tonight if r.get('repo') == repo)
     items = []
     for spec in manifest['recipes']:
         for variant in spec['variants']:
@@ -549,7 +557,12 @@ def plan(root, manifest, night, rows, budget=None, retry_failed=False):
                 item.update(decision='skip', reason=f"over the night budget ({used + item['hours']:g} of {budget:g} slot-hours, "
                             'all repositories)')
                 continue
+            if own_budget is not None and own_used + item['hours'] > own_budget + 1e-9:
+                item.update(decision='skip', reason=f"over this repository's night budget ({own_used + item['hours']:g} of "
+                            f'{own_budget:g} slot-hours)')
+                continue
             used += item['hours']
+            own_used += item['hours']
     return items
 
 
@@ -665,7 +678,8 @@ def _print_plan(items, night, note, manifest, as_json):
         why = f" [{item['why']}]" if item['why'] else ''
         print(f"{item['display']}  {sha}  slots={item['slots']} est={item['est_minutes']}m "
               f"{item['hours']:.2f} slot-h  {item['decision']}{reason}{why}")
-    print(f"to submit: {total['submit']} jobs, {total['slot_hours']:g} slot-hours of budget {total['budget']:g}; "
+    own = '' if manifest.get('repo_budget') is None else f" (this repository: {manifest['repo_budget']:g})"
+    print(f"to submit: {total['submit']} jobs, {total['slot_hours']:g} slot-hours of budget {total['budget']:g}{own}; "
           f"skipped: {total['skipped']}")
 
 
@@ -681,16 +695,24 @@ def cmd_plan(args):
     return 0
 
 
-def cmd_submit(args):
+def cmd_submit(args, stats=None):
+    """``stats``, when given, receives what happened (jobs, submitted, skipped, failed, registered, or error) for a
+    caller that reports on several worktrees (``bt night run``). With ``args.wait_registered`` None the wait for host
+    registration is left to that caller, so the submit lock is not held through it."""
+    stats = {} if stats is None else stats
+    lock = _SubmitLock()
+    if getattr(args, 'lock_wait', None):   # the unattended run waits longer than a session would
+        lock.WAIT = args.lock_wait
     try:
-        with _SubmitLock():
-            return _submit_locked(args)
+        with lock:
+            return _submit_locked(args, stats)
     except ValueError as exc:  # the lock is held by another submitter
+        stats['error'] = str(exc)
         print(f'bt night: {exc}', file=sys.stderr)
         return 2
 
 
-def _submit_locked(args):
+def _submit_locked(args, stats):
     try:
         root, manifest, now, night, note = _setup(args)
         session = compute_pickup._owner(root, args.session)
@@ -699,6 +721,7 @@ def _submit_locked(args):
         append_rows(fresh)
         items = plan(root, manifest, night, rows + fresh, retry_failed=args.retry_failed)
     except (ValueError, OSError) as exc:  # includes ManifestError
+        stats['error'] = str(exc)
         print(f'bt night: {exc}', file=sys.stderr)
         return 2
     if note:
@@ -729,11 +752,16 @@ def _submit_locked(args):
             failed += 1
             print(f"WARNING {item['display']}: job {job} was accepted but could not be recorded in the ledger ({exc}); "
                   'do not submit again tonight and review it with `bt compute`', file=sys.stderr)
-    if jobs:
+    stats.update(jobs=list(jobs), submitted=len(jobs), failed=failed,
+                 skipped=sum(1 for i in items if i['decision'] == 'skip'), registered=0)
+    if jobs and args.wait_registered is None:
+        pass
+    elif jobs:
         state = wait_registered(engine, jobs, args.wait_registered, sleep=time.sleep, clock=time.monotonic)
         for job, (ok, phase) in state.items():
             print(f"{job}: {'host-registered' if ok else 'NOT yet registered (' + str(phase) + ')'}")
         done = [j for j, (ok, _) in state.items() if ok]
+        stats['registered'] = len(done)
         waiting = [j for j in jobs if j not in done]
         print(f'{len(done)} of {len(jobs)} submitted jobs are host-registered (safe with the laptop asleep); '
               f'{len(waiting)} not yet' + (': ' + ', '.join(waiting) + '. Keep the laptop awake; do not resubmit, '
@@ -905,7 +933,14 @@ def build_report(night, rows, state=None):
                'not_finished': sum(1 for e in entries if not e['terminal']), 'slot_hours_used': round(used, 2),
                'slot_hours_requested': round(requested, 2),
                'skipped_unchanged': sum(1 for s in skipped if s['reason'].startswith('unchanged'))}
-    return {'night': night, 'summary': summary, 'entries': entries, 'skipped': skipped}
+    runs = {}
+    for row in rows:  # the scheduled submit (bt night run): the last run of each worktree for this night
+        if row.get('kind') == 'run' and row.get('night') == night:
+            runs[str(row.get('root'))] = row
+    stuck = [f"{_clean(r.get('repo'))}/{_clean(r.get('workstream'))}: {_clean(text, 300)}"
+             for r in runs.values() for text in [r.get('problem'), *(r['notes'] if isinstance(r.get('notes'), list) else [])]
+             if isinstance(text, str) and text]
+    return {'night': night, 'summary': summary, 'entries': entries, 'skipped': skipped, 'scheduled': stuck}
 
 
 def summary_line(model):
@@ -952,7 +987,10 @@ def render_markdown(model):
     disk = model.get('disk') or []
     if disk:
         out += ['### Laptop disk'] + [f'- {w}' for w in disk] + ['']
-    if not attention and not warnings and not disk:
+    scheduled = model.get('scheduled') or []
+    if scheduled:
+        out += ['### Scheduled submit'] + [f'- {w}' for w in scheduled] + ['']
+    if not attention and not warnings and not disk and not scheduled:
         out += ['None.', '']
     out += ['## Passed', '']
     passed = [e for e in model['entries'] if e['passed']]
@@ -994,7 +1032,10 @@ def render_html(model):
     disk = model.get('disk') or []
     if disk:
         body.append('<h3>Laptop disk</h3><ul>' + ''.join(f'<li>{esc(w)}</li>' for w in disk) + '</ul>')
-    if not attention and not warnings and not disk:
+    scheduled = model.get('scheduled') or []
+    if scheduled:
+        body.append('<h3>Scheduled submit</h3><ul>' + ''.join(f'<li>{esc(w)}</li>' for w in scheduled) + '</ul>')
+    if not attention and not warnings and not disk and not scheduled:
         body.append('<p>None.</p>')
     for title, rows in (('Passed', [f"{e['display']}: {_timing(e)}, job {e['job']}" for e in model['entries'] if e['passed']]),
                         ('Not finished', [f"{e['display']}: {e['status']}, {e['phase'] or 'unknown'}, "
@@ -1046,14 +1087,15 @@ def cmd_report(args):
         except ValueError:
             print(f'bt night: --night must be YYYY-MM-DD: {args.night}', file=sys.stderr)
             return 2
-    night = args.night or max((r['night'] for r in rows if r.get('kind') == 'submitted' and isinstance(r.get('night'), str)
-                               and re.fullmatch(r'\d{4}-\d{2}-\d{2}', r['night'])), default=None)
+    # A scheduled run counts as well as a submission: the night on which the run submitted nothing, because every
+    # worktree failed, is the one the morning report is for.
+    latest = max((r['night'] for r in rows if r.get('kind') in ('submitted', 'run') and isinstance(r.get('night'), str)
+                  and re.fullmatch(r'\d{4}-\d{2}-\d{2}', r['night'])), default=None)
+    night = args.night or latest
     if night is None:
         print('No night submissions recorded.')
         return 0
     model = build_report(night, rows, state)
-    latest = max((r['night'] for r in rows if r.get('kind') == 'submitted' and isinstance(r.get('night'), str)
-                  and re.fullmatch(r'\d{4}-\d{2}-\d{2}', r['night'])), default=None)
     if night == latest:  # the laptop's memory is today's: a report of an earlier night written now does not carry it
         try:
             model['laptop'] = laptop_memory(state)
@@ -1109,3 +1151,5 @@ def register(sub):
     report_p.add_argument('--html', action='store_true')
     report_p.add_argument('--json', action='store_true')
     report_p.set_defaults(func=cmd_report)
+    from . import night_schedule  # it imports this module
+    night_schedule.register(actions)

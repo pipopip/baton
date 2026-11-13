@@ -184,6 +184,6 @@ export function statusLine(cap: Capacity | null | undefined, w: WatchCounts | nu
       !h.up ? `${name} DOWN` : h.paused ? `${name} PAUSED${h.pause === 'host.conf.json' ? ' (host.conf.json)' : ''}` : `${name} ${h.held}/${h.total}`
   const host = device(cap.host.name || 'ember', cap.host, cap.at)
   const extra = Object.entries(cap.hosts ?? {}).map(([id, remote]) => device(remote.name || id, remote, remote.sample_at))
-  const laptop = cap.laptop.heavy_busy ? 'busy' : 'free'
+  const laptop = cap.laptop.executor === false ? 'off' : cap.laptop.heavy_busy ? 'busy' : 'free'
   return [host, ...extra, `laptop ${laptop}`, `${w?.queued ?? 0} queued`, mineText(w, alerts)].join(' · ')
 }

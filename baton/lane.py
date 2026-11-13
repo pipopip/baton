@@ -39,10 +39,34 @@ def _native_codex() -> str:
     return exe
 
 
+APPROVAL_KEY, APPROVAL_VALUE = "default_tools_approval_mode", "approve"
+
+
 def _wanted_mcp(install_home: Path, exe: str) -> dict:
+    """The compute-queue server as it must stand in a Codex home. Its tools are pre-approved (owner decision
+    2026-11-11): with `approval_policy = "never"` Codex refuses every MCP tool that would need approval, so
+    without this a Codex session cannot submit or cancel a job at all. Claude sessions call the same tools
+    without a prompt."""
     return {"command": str(config.PYTHON),
             "args": ["-X", "utf8", str(install_home / "mods/compute-queue/bin/codex_bridge.py")],
-            "env": {"BATON_CODEX_EXE": exe}}
+            "env": {"BATON_CODEX_EXE": exe}, APPROVAL_KEY: APPROVAL_VALUE}
+
+
+def _with_approval(text: str) -> str:
+    """config.toml text with the approval line directly under the [mcp_servers.compute-queue] header (`codex mcp
+    add` cannot write it). Unchanged when the table is absent or already carries the key."""
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if line.strip() == "[mcp_servers.compute-queue]":
+            end = next((i for i in range(index + 1, len(lines)) if lines[i].lstrip().startswith("[")), len(lines))
+            if any(l.split("=")[0].strip() == APPROVAL_KEY for l in lines[index + 1:end]):
+                return text
+            newline = "\r\n" if line.endswith("\r\n") else "\n"
+            if not line.endswith(("\n", "\r")):
+                lines[index] = line + newline
+            lines.insert(index + 1, f'{APPROVAL_KEY} = "{APPROVAL_VALUE}"{newline}')
+            return "".join(lines)
+    return text
 
 
 def _unrelated_config(data: dict) -> dict:
@@ -74,6 +98,10 @@ def _mcp_action(home: Path, install_home: Path, exe: str, stamp: str, dry_run: b
             raise ValueError(f"custom compute-queue MCP collision in {path}; left untouched")
         if any(key not in wanted for key in current) or set(current.get("env", {})) - {"BATON_CODEX_EXE"}:
             raise ValueError(f"custom compute-queue MCP options in {path}; left untouched")
+        # The key is in `wanted`, so the check above lets another value through, and `codex mcp add` rewrites the
+        # table without the key: _with_approval would then replace the owner's value with "approve".
+        if isinstance(current, dict) and APPROVAL_KEY in current and current[APPROVAL_KEY] != APPROVAL_VALUE:
+            raise ValueError(f"custom compute-queue MCP options in {path}; left untouched")
     if dry_run:
         return f"would configure compute-queue MCP in {path}"
     _backup(path, stamp)
@@ -87,6 +115,10 @@ def _mcp_action(home: Path, install_home: Path, exe: str, stamp: str, dry_run: b
                             text=True, timeout=30, creationflags=config.CREATE_NO_WINDOW)
         if cp.returncode:
             raise ValueError(f"codex mcp add failed for {home} (exit {cp.returncode})")
+        written = path.read_bytes()
+        approved = _with_approval(written.decode("utf-8")).encode("utf-8")
+        if approved != written:
+            path.write_bytes(approved)
         actual = tomllib.loads(path.read_text(encoding="utf-8"))
         if actual.get("mcp_servers", {}).get("compute-queue") != wanted:
             raise ValueError(f"codex mcp add did not install the expected bridge in {path}")

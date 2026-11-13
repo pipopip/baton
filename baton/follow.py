@@ -804,7 +804,7 @@ def build_command(spec: dict, prompt: str, sibling: Path, out_file: Path, allowe
 
 
 def _kill_tree(proc: "subprocess.Popen") -> None:
-    if os.name == "nt":
+    if procs.platform_name() == "windows":
         try:
             subprocess.run(
                 ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
@@ -812,6 +812,8 @@ def _kill_tree(proc: "subprocess.Popen") -> None:
             )
         except (OSError, subprocess.SubprocessError):
             pass
+    else:
+        procs.kill_process_group(proc)   # the CLI leads its own group (see _run_cli): its children go with it
     try:
         proc.kill()
     except OSError:
@@ -825,10 +827,19 @@ def _run_cli(argv, cwd: Path, env: dict, timeout_s: float, stdin_text):
         stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=str(cwd), env=env,
         text=True, encoding="utf-8", errors="replace", creationflags=config.CREATE_NO_WINDOW,
+        **procs.popen_group_kwargs(),   # POSIX: own session and group, so the timeout can end the CLI's children too
     )
     try:
         stdout, stderr = proc.communicate(input=stdin_text, timeout=timeout_s)
         return proc.returncode, stdout or "", stderr or "", False
+    except KeyboardInterrupt:
+        # in its own session the CLI no longer gets the terminal's Ctrl+C (`bt follow run` can be run by hand)
+        _kill_tree(proc)
+        try:
+            proc.wait(timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        raise
     except subprocess.TimeoutExpired:
         _kill_tree(proc)
         try:

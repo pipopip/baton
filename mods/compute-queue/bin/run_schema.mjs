@@ -19,7 +19,7 @@ export default {
         "any",
         "fleet"
       ],
-      "description": "fleet selects a compatible configured device using independent CPU and RAM requirements. host (the default) with slots >= 1 and no host_id runs as a contained fleet job on ember: CPU held to the slots, memory capped (memory_max_gb, else the larger of 8 GB and 4 GB per slot). host with a host_id, slots 0, split, self_heavy and RAM jobs keep the ordinary queue."
+      "description": "fleet selects a compatible configured device using independent CPU and RAM requirements. host (the default) with slots >= 1 and no host_id, or host_id ember, runs as a contained fleet job on ember: CPU held to the slots, memory capped (memory_max_gb, else the larger of 8 GB and 4 GB per slot). Another host's id (or an alias) does the same only when that host's host.conf.json sets host_jobs_to_fleet true. Otherwise, and for slots 0, split, self_heavy and RAM jobs, the ordinary queue keeps the job."
     },
     "platform": {
       "type": "string",

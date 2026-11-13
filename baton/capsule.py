@@ -10,6 +10,7 @@ import importlib
 import json
 import os
 import re
+import stat
 import sys
 import threading
 import time
@@ -27,7 +28,7 @@ CAPS = {"claude": 9000, "codex": 6000}   # additionalContext caps
 GIT_TIMEOUT = 4              # seconds per git call
 
 # The now.md contract, defined once here: the template, the lint (``now_problems``), the capsule and the cycle
-# prompts all use it. ``bt wt new`` writes the header lines; the body fields are the session's to keep current.
+# prompts all use it. ``bt wt new`` writes the header lines; the body fields are filled in at the handover.
 HEADER_FIELDS = ("Purpose", "Exit", "Base", "Parent")
 BODY_FIELDS = ("Objective", "State", "In flight", "Decisions", "Next")
 CONTRACT = (
@@ -50,11 +51,13 @@ BODY_TEMPLATE = (
 TEMPLATE = "# Now — {ws}\nPurpose:\nExit:\n" + BODY_TEMPLATE
 
 RULES = (
+    "Work on the task; do not keep notes, logs or status files current while working. .baton/now.md is the handover: "
+    "write it when the session ends or pauses, when the deliverable is complete, or when Baton asks for it (a context "
+    "cycle); `bt now check` lints it. Git, the queue's own records and this capsule carry the rest. "
     "Explore freely inside this worktree. Do not create worktrees: only the lead creates them, "
     "with `bt wt new <name> --exit ...`, within the cap; retire finished ones with `bt wt retire`. "
-    "Commit at each working milestone; followers start from your commits and report here; merge "
-    "them with `bt merge <role>`. Keep .baton/now.md current (Objective, State with commit shas, In flight, "
-    "Decisions, Next, Exit; check with `bt now check`) at milestones only; no other handover or pickup bookkeeping. Delegate by role: cheapest role that "
+    "Followers start from your commits and report here; merge "
+    "them with `bt merge <role>`. Delegate by role: cheapest role that "
     "fits. Goals need a token budget. Compaction preserves the active task: continue from the "
     "objective and unfinished operations; choose a fresh session only for an intentional handoff. "
     "Release completed owned child agents through the client's supported close/unload/archive action "
@@ -63,19 +66,22 @@ RULES = (
 
 LOG_MAX_LINES = 200
 
-NOW_HEADING = "## Now  (.baton/now.md — Objective, State, In flight, Decisions, Next; keep current at milestones; ≤40 lines)"
+MIGRATION_NOTES = "migration-notes.md"      # written by `bt migrate import` into a moved checkout's .baton
+MIGRATION_DAYS = 30                         # the capsule mentions the notes for this long
+MIGRATION_MAX_BYTES = 256 * 1024            # a notes file larger than this is not what the import wrote: no line
+
+NOW_HEADING = "## Now  (.baton/now.md — the handover: Objective, State, In flight, Decisions, Next; written at session end, pause or completion; ≤40 lines)"
 COMPACT_HEADING = "## Last compaction  (.baton/compact.md)"
-NEW_NOTE = "(new — fill in Objective and Next once the task is clear)"
-LEGACY_NOTE = "(legacy note; move the live part into .baton/now.md)"
-REPAIR_TITLE = "now.md needs repair before other work:"
-REPAIR_MAX_LINES = 6
+NEW_NOTE = "(new — empty; it is written at the handover when the session ends)"
+LEGACY_NOTE = "(legacy note; the handover moves its live part into .baton/now.md)"
+REPAIR_CAP = 160             # chars of the problem named in the one-line stale-note notice
 INBOX_HINT = "(merge with `bt merge <role>`, dismiss with `bt inbox done <name>`)"
 TRUNCATED = "\n...[truncated to fit the context cap]"
 
 # Lowest number = kept first when the cap forces truncation.
-PRIORITY = ("warning", "header", "mismatch", "now", "compute", "inbox", "compact", "rules", "roles")
+PRIORITY = ("warning", "header", "migration", "mismatch", "now", "compute", "inbox", "compact", "rules", "roles")
 # Order in which the sections appear.
-DISPLAY = ("warning", "header", "mismatch", "now", "compute", "compact", "inbox", "rules", "roles")
+DISPLAY = ("warning", "header", "migration", "mismatch", "now", "compute", "compact", "inbox", "rules", "roles")
 
 
 # --------------------------------------------------------------------------- file helpers
@@ -227,13 +233,13 @@ def now_problems(text: str, *, mtime: float | None = None, head_time: float | No
 
 
 def repair_block(problems: list[str]) -> str:
-    """The capsule's repair notice: title plus at most ``REPAIR_MAX_LINES`` problem lines ("" when none)."""
+    """The capsule's one-line notice for a stale or malformed now.md ("" when none). It asks for nothing now: the
+    note is rewritten at the next handover, which is the only time a session is asked to write it."""
     if not problems:
         return ""
-    shown = problems[:REPAIR_MAX_LINES]
-    if len(problems) > REPAIR_MAX_LINES:
-        shown = problems[:REPAIR_MAX_LINES - 1] + [f"(+{len(problems) - REPAIR_MAX_LINES + 1} more: `bt now check`)"]
-    return REPAIR_TITLE + "\n" + "\n".join(f"- {p}" for p in shown)
+    first = _clip(problems[0], REPAIR_CAP)
+    more = f" (+{len(problems) - 1} more: `bt now check`)" if len(problems) > 1 else ""
+    return f"now.md is stale or malformed ({first}){more}; it will be rewritten at the next handover."
 
 
 def _exit_required(root: Path) -> bool:
@@ -653,6 +659,29 @@ def inbox_lines(notes: list[tuple[str, str]], budget: int = INBOX_BUDGET) -> str
     return "\n".join(kept + [f"(+{len(lines) - len(kept)} more: `bt inbox`)"])
 
 
+def migration_section(root: Path, now: float | None = None) -> str:
+    """One line while ``.baton/migration-notes.md`` (written by ``bt migrate import``) is less than 30 days old."""
+    try:
+        path = Path(root) / ".baton" / MIGRATION_NOTES
+        st = path.stat()
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MIGRATION_MAX_BYTES:         # a directory, a device, a huge file: no line
+            return ""
+        now = time.time() if now is None else now
+        if now - st.st_mtime >= MIGRATION_DAYS * 86400:
+            return ""
+        with open(path, "rb") as fh:
+            head = fh.read(600)                                                         # only what the date needs
+        if b"\0" in head:                                                                # binary
+            return ""
+        text = head.decode("utf-8", errors="replace")
+        m = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", text)
+        date = m.group(1) if m else time.strftime("%Y-%m-%d", time.localtime(st.st_mtime))
+        return (f"This checkout was moved from Windows to this machine on {date}: "
+                f"read .baton/{MIGRATION_NOTES} before running scripts or tests.")
+    except Exception:  # noqa: BLE001 - nothing about this optional line may cost the session its capsule
+        return ""
+
+
 def inbox_section(root: Path) -> str:
     notes = inbox_notes(root)
     if not notes:
@@ -683,12 +712,14 @@ def sections(root: Path, vendor: str, source: str, account: str | None = None, *
     elif source == "compact":
         if create:
             record_baseline(root)
+        out["migration"] = migration_section(root)
         out["mismatch"] = brief_mismatch(root)
         out["now"] = now_section(root, ws, create)
         out["inbox"] = inbox_section(root)
         out["rules"] = f"## Working rules\n{RULES}"
     else:  # startup, clear, fork, anything unknown
         out["header"] = header(root, ws, paths.repo_name(root), use_git)
+        out["migration"] = migration_section(root)
         if create:
             record_baseline(root)
         out["mismatch"] = brief_mismatch(root)

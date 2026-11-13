@@ -20,7 +20,7 @@ import tomllib
 from datetime import datetime
 from pathlib import Path
 
-from . import config, procs
+from . import config, procs, terminal
 from .hook import _pid_alive
 
 CLAUDE_JUNCTIONS = (
@@ -39,7 +39,7 @@ CODEX_FILE_PATTERNS = ("config.toml", "hooks.json", "AGENTS.md", "*.config.toml"
 PROTECTED_FILES = frozenset({".credentials.json", "auth.json"})
 UTILISATION_KEYS = ("session", "weekly", "primary", "secondary")
 CREDENTIAL_FILE = {"claude": ".credentials.json", "codex": "auth.json"}
-WIDGET_CONFIG = Path("C:/Work/usage-widget/config.json")
+WIDGET_CONFIG = config.CODE_ROOT / "usage-widget" / "config.json"
 USAGE_TIMEOUT = 45
 SNAPSHOT_MAX_AGE_FACTOR = 2     # the widget snapshot is usable up to usage_cache_seconds * this
 NEGATIVE_CACHE_SECONDS = 60     # no retry of Get-Usage.ps1 after a failed or timed-out run
@@ -145,12 +145,20 @@ def _without_stale(data: dict, fetched_at: float) -> dict:
 
 
 def _run_usage_script() -> str | None:
-    """Run Get-Usage.ps1 -Json; None when no script is configured."""
+    """Run Get-Usage.ps1 -Json; None when no script is configured, found, or a PowerShell host is installed."""
     script = _policy().get("usage_script")
-    if not script or not config.expand(script).is_file():
+    if not script:
+        return None
+    path = config.expand(script)
+    if not path.is_absolute():
+        path = config.CODE_ROOT / path
+    if not path.is_file():
+        return None
+    shell = shutil.which("powershell") or shutil.which("pwsh")
+    if not shell:
         return None
     cp = subprocess.run(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(config.expand(script)), "-Json"],
+        [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(path), "-Json"],
         capture_output=True,
         timeout=USAGE_TIMEOUT,
         stdin=subprocess.DEVNULL,
@@ -374,8 +382,9 @@ def has_errors(actions: list[str]) -> bool:
 
 
 def _is_junction(path: Path) -> bool:
+    """A shared-directory link: an NTFS junction on Windows, a symbolic link elsewhere."""
     try:
-        return os.path.isjunction(path)
+        return os.path.isjunction(path) if config.WINDOWS else os.path.islink(path)
     except (OSError, AttributeError):
         return False
 
@@ -385,6 +394,9 @@ def _strip_extended(value: str) -> str:
 
 
 def _same_target(link: Path, target: Path) -> bool:
+    if not config.WINDOWS:
+        # readlink may give a relative path, so resolve both sides rather than compare text
+        return config.norm(os.path.realpath(link)) == config.norm(os.path.realpath(target))
     try:
         resolved = _strip_extended(os.readlink(link))
     except OSError:
@@ -393,6 +405,10 @@ def _same_target(link: Path, target: Path) -> bool:
 
 
 def _mklink_junction(link: Path, target: Path) -> None:
+    """Make ``link`` a junction (Windows) or a symbolic link (elsewhere) to the directory ``target``."""
+    if not config.WINDOWS:
+        os.symlink(os.path.abspath(target), link, target_is_directory=True)
+        return
     cp = subprocess.run(
         ["cmd", "/c", "mklink", "/J", str(link), str(target)],
         capture_output=True,
@@ -404,6 +420,14 @@ def _mklink_junction(link: Path, target: Path) -> None:
     )
     if cp.returncode != 0:
         raise OSError((cp.stdout + cp.stderr).strip() or f"mklink exited {cp.returncode}")
+
+
+def _remove_link(link: Path) -> None:
+    """Remove a link without following it: rmdir takes a junction, a symbolic link needs unlink."""
+    if config.WINDOWS:
+        os.rmdir(link)
+    else:
+        os.unlink(link)
 
 
 def _backup_name(path: Path, stamp: str) -> Path:
@@ -450,7 +474,7 @@ def _ensure_junction(run: _Run, link: Path, target: Path, stamp: str, second: Pa
         if _is_junction(link):
             if _same_target(link, target):
                 return
-            if not run.do(f"remove stale junction {link.name}", lambda: os.rmdir(link)):
+            if not run.do(f"remove stale junction {link.name}", lambda: _remove_link(link)):
                 return
         elif link.is_dir() and not link.is_symlink():
             if not any(link.iterdir()):
@@ -810,7 +834,7 @@ def link(vendor: str, account: str, dry_run: bool = False, *, primary=None, seco
     written = _read_json(_sync_path()).get("written")
     written = written.get(key) if isinstance(written, dict) else None
     run = _Run(dry_run, dict(written) if isinstance(written, dict) else {})
-    if account == "main" or config.norm(primary) == config.norm(second):
+    if account == "main" or config.lexical(primary) == config.lexical(second):      # spellings: a second that is a link to the primary is refused below
         run.note(f"{vendor}:{account} is the primary account; nothing to link")
         return run.actions
     if not primary.is_dir():
@@ -1128,27 +1152,19 @@ def login_refusal(vendor: str, account: str, force: bool = False) -> str | None:
             f"Use --force only if no session is running on it. {live} live session(s) found on {home}.")
 
 
-def login_tab_command(vendor: str, account: str) -> str:
-    """PowerShell the login tab runs: select the account's directory (none for main), vendor login, status, next steps."""
-    def lit(text: str) -> str:
-        return "'" + str(text).replace("'", "''") + "'"
-    steps = ["claude auth login", "claude auth status"] if vendor == "claude" else ["codex login", "codex login status"]
-    steps.append(f"Write-Host {lit(LOGIN_NEXT[vendor])}")
-    prefix = []
-    if account != "main":
-        var = config.ACCOUNT_ENV[vendor]
-        prefix.append(f"$env:{var}={lit(config.account_dir(vendor, account))}")
-    return "; ".join(prefix + steps)
-
-
-def login_wt_argv(vendor: str, account: str, wt: str = "wt.exe") -> list[str]:
-    from .startup import encode_command      # startup imports launch, which imports this module
-    return [wt, "-w", "0", "new-tab", "--title", f"login {vendor}:{account}", "-d", str(Path.home()),
-            "pwsh", "-NoExit", "-EncodedCommand", encode_command(login_tab_command(vendor, account))]
+def login_tab(vendor: str, account: str, be: terminal.Backend | None = None) -> terminal.Tab:
+    """The login tab: select the account's directory (none for main), vendor login, status, next steps; it stays open."""
+    # Windows Terminal: the bare name (the tab inherits PATH). macOS: the full path, since the tab is a fresh login shell.
+    program = terminal.Word(vendor) if isinstance(be or terminal.backend(), terminal.WindowsTerminal) else config.exe(vendor)
+    words = (("auth", "login"), ("auth", "status")) if vendor == "claude" else (("login",), ("login", "status"))
+    steps = tuple((program, *map(terminal.Word, w)) for w in words)
+    env = () if account == "main" else ((config.ACCOUNT_ENV[vendor], str(config.account_dir(vendor, account))),)
+    return terminal.Tab(cwd=str(Path.home()), title=f"login {vendor}:{account}",
+                        launch=terminal.Launch(steps=steps, env=env, message=LOGIN_NEXT[vendor], keep_open=True))
 
 
 def account_login(vendor: str, account: str, *, force: bool = False, dry_run: bool = False, out=print) -> int:
-    """Open one Windows Terminal tab that logs ``vendor:account`` in; refuse when that would disturb a running session."""
+    """Open one terminal tab that logs ``vendor:account`` in; refuse when that would disturb a running session."""
     names = config.account_names(vendor) if vendor in config.VENDORS else []
     if account not in names:
         out(f"unknown {vendor} account {account!r}; configured: {', '.join(names) or 'none'}")
@@ -1160,16 +1176,18 @@ def account_login(vendor: str, account: str, *, force: bool = False, dry_run: bo
     home = config.account_dir(vendor, account)
     if dry_run:
         out(f"dry run: would open a login tab for {vendor}:{account} ({home})")
-        out(f"  tab command: {login_tab_command(vendor, account)}")
+        out(f"  tab command: {terminal.backend().command_text(login_tab(vendor, account))}")
         return 0
     try:
         home.mkdir(parents=True, exist_ok=True)
-        env = config.clean_env()
-        env.pop(config.ACCOUNT_ENV[vendor], None)     # the tab's own variable is set inside its command
-        subprocess.Popen(login_wt_argv(vendor, account, shutil.which("wt.exe") or "wt.exe"), env=env,
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
     except OSError as exc:
         out(f"error: could not open a login tab for {vendor}:{account}: {exc}")
+        return 1
+    env = config.clean_env()
+    env.pop(config.ACCOUNT_ENV[vendor], None)         # the tab's own variable is set inside its command
+    opened = terminal.backend().open([login_tab(vendor, account)], env=env)
+    if not opened:
+        out(f"error: could not open a login tab for {vendor}:{account}: {opened.error}")
         return 1
     out(f"opened a login tab for {vendor}:{account}; finish the login there")
     return 0

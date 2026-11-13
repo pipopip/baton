@@ -1,4 +1,5 @@
 """Shared, backwards-compatible compute host policy validation."""
+import math
 import re
 
 RESOURCE_POLICY_VERSION = 2
@@ -43,3 +44,36 @@ def policy_fields(raw, pool_slots=None, validate_zone=False):
 
 def policy_is_default(raw):
     return policy_fields(raw) == DEFAULTS
+
+
+# Memory of fleet jobs on a Linux host (host/deferred.py, host/install_deferred.py, fleet_queue.py).
+# All fleet units run in one systemd slice whose memory limit is the host's total less its RAM floor. A job may be
+# admitted on the memory it is expected to use only while that limit is in effect on every running fleet job and the
+# rest of the machine leaves room for it (host/deferred.py expected_mode), and the caps of the jobs running together
+# may then add up to POOL_OVERCOMMIT times what the pool can hold.
+FLEET_SLICE = 'cq-fleet.slice'
+POOL_OVERCOMMIT = 2
+CPU_OVERCOMMIT = 2                   # the declared slots (CPU quotas) of the fleet jobs on a host, as a multiple of its fleet
+                                     # slots, when jobs are charged the CPU they are expected to use (deferred.py charged_slots)
+CPU_QUOTA_WAIT = 'fleet CPU quotas exceed the overcommit bound'   # the reason both sides give when that bound is reached
+
+
+def fleet_slice_cpu_quota(pool_slots, foreground_slots):
+    """CPUQuota of the fleet slice, in percent: all fleet jobs together get the CPU of the fleet's slots and no more,
+    whatever their own quotas add up to. With every job charged what it declares this never binds; where jobs are
+    charged the CPU they are expected to use it is what keeps the foreground slots free when they burst together."""
+    return max(1, pool_slots - foreground_slots) * 100
+POOL_MARGIN_BYTES = 1024 ** 3        # of the RAM floor that memory held outside the fleet jobs may not use (expected_mode)
+POOL_MIN_BYTES = 2 * 1024 ** 3       # a pool smaller than this gets no limit, and so no expected-use admission
+POOL_SLACK_BYTES = 256 * 1024 ** 2   # an installed limit may exceed the host's memory less the floor by this: MemTotal
+                                     # moves by some MB between kernels, and the margin above covers it
+# A failed job's reason when the kernel killed its unit for memory starts with this text; it matches the
+# controller's telemetry test for out-of-memory reasons (fleet_telemetry._OOM).
+OOM_REASON_PREFIX = 'out of memory (oom-kill)'
+
+
+def fleet_slice_limit(total_bytes, ram_floor_gb):
+    """MemoryMax of the fleet slice for a host with this much memory and this RAM floor, or None when the pool
+    would be under POOL_MIN_BYTES (no limit is written then)."""
+    limit = int(total_bytes - math.ceil(ram_floor_gb * 1024 ** 3))
+    return limit if limit >= POOL_MIN_BYTES else None

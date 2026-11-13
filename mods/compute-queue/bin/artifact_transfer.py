@@ -59,9 +59,22 @@ def _components(relative):
     return parts
 
 
-def _open_directory_posix(path):
-    """Open an absolute directory path without traversing any links."""
+def _open_directory_posix(path, own=False):
+    """Open a root directory so that nothing below it can be reached through a link.
+
+    The path leading to a root is the controller's own and may hold links (macOS keeps temporary directories and
+    the like behind ``/var`` -> ``/private/var``): it is resolved once here and the resolved path is walked without
+    following links. What is resolved depends on whose directory the root is. ``own``: the controller's state
+    directory, which may itself be a link to another disk, is resolved whole. Otherwise the root is a per-job
+    directory (``<state>/run/<job>/src``, ``~/q/<job>/src``) that a job can replace, so only its parent is resolved
+    and a link in the root's own place is refused. Every link below either kind of root is refused (``O_NOFOLLOW``
+    on each component here and in every later open).
+    """
     absolute = os.path.abspath(path)
+    if own:
+        absolute = os.path.realpath(absolute)
+    else:
+        absolute = os.path.join(os.path.realpath(os.path.dirname(absolute)), os.path.basename(absolute))
     fd = os.open(os.path.sep, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         for part in absolute.split(os.path.sep):
@@ -315,7 +328,7 @@ def destination_parent(root, relative):
         if not hasattr(os, 'O_NOFOLLOW') or not hasattr(os, 'O_DIRECTORY'):
             raise OSError('safe destination traversal unavailable')
         try:
-            fd = _open_directory_posix(root)
+            fd = _open_directory_posix(root, own=True)      # the queue's state directory, not a job's
             handles.append(fd)
             for part in parts[:-1]:
                 try:

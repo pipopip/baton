@@ -74,6 +74,52 @@ class ComputeTests(unittest.TestCase):
         self.job['out_paths'].append('late.mp4'); self.write()
         self.assertEqual(compute.collect(self.root)[0]['state'], 'needs-review')
 
+    def test_a_delivered_immediate_job_needs_no_review_and_is_not_listed(self):
+        self.job.update(defer='immediate', requested_defer=None, status='done', exit=0, notified=True); self.write()
+        self.assertFalse((self.receipts / 'reviewed').exists())          # no ack file
+        self.assertEqual(compute.collect(self.root)[0]['state'], 'reviewed')
+        self.assertEqual(compute.summary(self.root), '')
+        self.assertEqual(compute.prompt_summary(self.root, 'owner'), '')
+        self.job.update(defer=None, status='failed', exit=1); self.write()   # a host job record has no defer at all
+        self.assertEqual(compute.summary(self.root), '')
+
+    def test_an_undelivered_immediate_job_is_listed(self):
+        self.job.update(defer='immediate', requested_defer=None, status='done', exit=0, notified=False); self.write()
+        self.assertEqual(compute.collect(self.root)[0]['state'], 'needs-review')
+        self.assertIn('needs-review', compute.summary(self.root))
+        self.assertIn('needs-review', compute.prompt_summary(self.root, 'owner'))
+        self.job.update(notified=True); self.write()                     # the notice is delivered: it clears itself
+        self.assertEqual(compute.summary(self.root), '')
+
+    def test_a_running_immediate_job_is_listed_as_pending(self):
+        self.job.update(defer='immediate', requested_defer=None, status='running', notified=False); self.write()
+        self.assertEqual(compute.collect(self.root)[0]['state'], 'pending')
+        self.assertIn('cq-example: pending', compute.summary(self.root))
+
+    def test_a_finished_deferred_job_still_needs_the_explicit_review_even_when_notified(self):
+        for defer in ('overnight', 'spare'):
+            self.job.update(defer=defer, requested_defer=defer, status='done', exit=0, notified=True); self.write()
+            self.assertEqual(compute.collect(self.root)[0]['state'], 'needs-review', defer)
+            self.assertIn('needs-review', compute.summary(self.root), defer)
+        # a fleet job that asked for a deferral keeps `requested_defer` whatever `defer` says
+        self.job.update(defer='immediate', requested_defer='overnight'); self.write()
+        self.assertEqual(compute.collect(self.root)[0]['state'], 'needs-review')
+
+    def test_follow_up_still_shows_for_a_delivered_immediate_job(self):
+        self.job.update(defer='immediate', requested_defer=None, status='done', exit=0, notified=True); self.write()
+        with contextlib.redirect_stdout(io.StringIO()):
+            compute.run(argparse.Namespace(
+                worktree=str(self.root), session='owner', refresh=False, reviewed='cq-example',
+                resolution='follow-up', note='check the render', json=True))
+        self.assertEqual(compute.collect(self.root)[0]['state'], 'follow-up')
+        self.assertIn('follow-up', compute.summary(self.root))
+
+    def test_the_list_lead_line_asks_for_nothing_routine(self):
+        self.job.update(status='done', exit=0); self.write()
+        text = compute.summary(self.root)
+        self.assertIn('not on every turn', text)
+        self.assertNotIn('queued/delivered is not reviewed', text)
+
     def test_generation_two_receipts_find_only_their_isolated_job(self):
         for host, suffix, folder in [('ember', 'example', 'deferred-jobs'),
                                      ('fleet', 'fleet-example', 'fleet/jobs')]:
