@@ -29,8 +29,8 @@ migrate.toml (next to accounts.toml; ``.state/migrate.local.toml`` is appended t
     [repos.app]               # per repository: the same carry / leave
     carry = ["docs/local/**"]
     [[extra_repos]]                 # git repositories outside the root
-    path = "D:/AI/WanGP"
-    target = "AI/WanGP"             # where the import puts it, relative to NEWROOT (or NEWHOME with base = "home")
+    path = "E:/Elsewhere/some-repo"
+    target = "Elsewhere/some-repo"  # where the import puts it, relative to NEWROOT (or NEWHOME with base = "home")
     [[extra_dirs]]                  # plain directories outside the root
     path = "C:/Users/<you>/plugins/app"
     target = "plugins/app"

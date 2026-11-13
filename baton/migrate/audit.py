@@ -67,7 +67,7 @@ def example_toml(ctx: c.Ctx, survey: dict) -> str:
     for n in survey["nonrepo"]:
         lines.append(f"#   \"{n['name']}\",  # {n['files']}{'+' if n['approx'] else ''} files, {c.human(n['bytes'])}")
     lines += ["# ]", "# extra_repos / extra_dirs: sources outside the root, with a target relative to NEWROOT (or NEWHOME with base = \"home\").",
-              "# [[extra_repos]]", "# path = \"D:/AI/WanGP\"", "# target = \"AI/WanGP\"", "# [[extra_dirs]]", "# path = \"C:/Users/<you>/plugins/app\"",
+              "# [[extra_repos]]", "# path = \"E:/Elsewhere/some-repo\"", "# target = \"Elsewhere/some-repo\"", "# [[extra_dirs]]", "# path = \"C:/Users/<you>/plugins/app\"",
               "# target = \"plugins/app\"", "# base = \"home\""]
     return "\n".join(lines) + "\n"
 

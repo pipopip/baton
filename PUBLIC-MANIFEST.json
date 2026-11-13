@@ -100,10 +100,10 @@
       "output_sha256": "2ca1e92b324e280ca878284333f2664029f24e6254768afc86be98a9cb6825d9"
     },
     "baton/migrate/__init__.py": {
-      "output_sha256": "ded1db6dab70ed93cef294ff59e409ec1227fe7049d4241d021a7c874244367f"
+      "output_sha256": "ab91c23fd4fdc7176d4d757eaef54fbcfc0e64f137a7fe522b409eb4bb1e3d18"
     },
     "baton/migrate/audit.py": {
-      "output_sha256": "d0db0a17d01785256501c75e3e02c5164882ed8f7dec76fd1ab4611d0cd38bda"
+      "output_sha256": "ff1033693c4a33e6d8a6a7b36238a61185235ccf0c1c0298dffafbbd4e601f5d"
     },
     "baton/migrate/common.py": {
       "output_sha256": "d8cb9814a7d1a0bdefcc0c87c800d2c9e56b6f8e5186243898391b1aff79e308"
@@ -442,5 +442,5 @@
       "output_sha256": "5f593b9cb13fa3e73a51771c4ff6e505224c21421c44f02f170e0a7e65f1d8bc"
     }
   },
-  "source_head": "37447e267814ded78b638327a7e84eba11f84f9c"
+  "source_head": "ae5c5d92f731f4ed09b40e349f274688aca79aca"
 }
