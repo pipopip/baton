@@ -22,7 +22,7 @@ Clone into a path without spaces on Windows:
 ```powershell
 git clone https://github.com/pipopip/baton.git C:\Work\baton
 cd C:\Work\baton
-python bt.py --help
+python bt.py help
 python bt.py install --claude --codex --profile --dry-run
 ```
 
@@ -36,7 +36,7 @@ bt my-project/feature -Vendor codex
 # Or: bt my-project/feature -Vendor claude
 ```
 
-Start with `bt` so ownership and the capsule are established. Update `.baton/now.md` with the objective, decisions, verification and next action. A worktree's declared exit governs retirement; a PR worktree remains until its work is merged. See `bt wt --help`.
+Start with `bt` so ownership and the capsule are established. Update `.baton/now.md` with the objective, decisions, verification and next action. A worktree's declared exit governs retirement; a PR worktree remains until its work is merged. `bt help` lists every command by task; `bt help wt` shows the worktree options.
 
 ## Optional compute queue
 

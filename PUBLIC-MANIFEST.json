@@ -13,7 +13,7 @@
       "output_sha256": "3ef007108fa6105fb5f85c3c6570011b23a23199908b4298c159ddff159196f9"
     },
     "README.md": {
-      "output_sha256": "261ac5aa4741c3f19852fe8ff00c2d2fc802ecdaee82eab515242cf50023d30d"
+      "output_sha256": "cd64b3acb1006f8f3fb9d986e9e87fa14ef3f3a15cb802a701d8a15d62df7d25"
     },
     "ROADMAP.md": {
       "output_sha256": "8022c5c5d3afcbf8259407ef88ff23b9a56a19aeea0f699244044c6776a01ee5"
@@ -43,7 +43,7 @@
       "output_sha256": "460b9c2c397e7824fda07825977d8bf1679bed0c039c499444ac51fa8d990c7a"
     },
     "baton/cli.py": {
-      "output_sha256": "1ad54150fb8f6305570180340d9c3558b9eff4b1131436a6c6fa0d5f749b71e2"
+      "output_sha256": "5623097c7c02f1443c87ee1c31fb6b84cc2899a2f7d8bd29b88ac93ceda8475a"
     },
     "baton/close.py": {
       "output_sha256": "49fa0f727bc91fdb3c4f4822090bedbbccbc0b475512d91989e1042fd580fc09"
@@ -80,6 +80,9 @@
     },
     "baton/harvest.py": {
       "output_sha256": "b22c4b91ad84d9d99b1baa8c33c7632bffecbb68f2c895e5faedb11937c02af8"
+    },
+    "baton/help.py": {
+      "output_sha256": "3e8eb1a8dfa0c78005c6babc02f23579a7283cf0ce1ebcd42ac2784185cac7b0"
     },
     "baton/hook.py": {
       "output_sha256": "8aa8ccca86b2ecb19baaae6fd8b897d4c8d99548c68bd3cddc24195551bbed80"
@@ -187,7 +190,7 @@
       "output_sha256": "030dd2508163bc4bf9dfd57dfdde45eb7c8e6c40ccae495055e9cf11605334cd"
     },
     "bt.ps1": {
-      "output_sha256": "98f1a99e58f3950ad359fa249733366ec9f9e82574d44f4b4429a147218ee73a"
+      "output_sha256": "896b704893e19c5f8d25110a6ef4d10f2b7b17e1bebae4c2023043d6ff3704a1"
     },
     "bt.py": {
       "output_sha256": "6c6e505dd6ca674f260549bb5a05f2777ce66892302ef204f05ea22c0266e3f2"
@@ -232,7 +235,7 @@
       "output_sha256": "64a9c2871fb656e58eeac08b417e1e24bdb7940dd445893ecc2709b7bc06beb2"
     },
     "mods/compute-queue/bin/fleet_telemetry.py": {
-      "output_sha256": "54088249f7f848414e50491e5a68c40ef514ed6dd325de6700872d9a6eeb11cd"
+      "output_sha256": "f7005e060d8466b4941341232d79ca55bb2611d27266e281d776cf2f2d31e48b"
     },
     "mods/compute-queue/bin/gnu_shims_for_tests.py": {
       "output_sha256": "4fa37a04c194dd937bd83709949101c4e992553aa0ee431fd53b5be94f7b9ff2"
@@ -313,7 +316,7 @@
       "output_sha256": "4cc852f98e6ca44337e480dfad6a591e2d2d43edfe1e7a06c4b22a33a27f9d7d"
     },
     "mods/compute-queue/bin/test_fleet_telemetry.py": {
-      "output_sha256": "c8f75fa6c498d92df97436b310f8dcfe5e10806d33fe415fe52e003901dc21f5"
+      "output_sha256": "5bce4c75c8a0cf496a965c65ae5cef691a7ea9bf05a8ce8c89989a09beb05a42"
     },
     "mods/compute-queue/bin/test_host_stop.py": {
       "output_sha256": "5f69b6e1b3460a09eb399b6464b409c92346f0bdd91b050daa775b87cd4b745a"
@@ -442,5 +445,5 @@
       "output_sha256": "5f593b9cb13fa3e73a51771c4ff6e505224c21421c44f02f170e0a7e65f1d8bc"
     }
   },
-  "source_head": "ae5c5d92f731f4ed09b40e349f274688aca79aca"
+  "source_head": "9d653a544bea60cc518594f39c606afbca486d53"
 }

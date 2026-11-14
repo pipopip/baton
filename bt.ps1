@@ -4,12 +4,13 @@
 #   bt [worktree] [-Vendor claude|codex] [-Account x] [-Fresh|-Resume] [-NewTab] [-DryRun] [-Force] [-Prompt text] [-Model id] [-Role name]
 #   bt switch [worktree] [-Account x]     fresh session on the other account
 #   bt <subcommand> ...                   passed through to bt.py (status, accounts, list, ...)
+#   bt help [command]                     a guide to the commands, or one command's options
 #   bt                                    outside a worktree: pick one with fzf and start an agent (bt <worktree>)
 #
 # Keep this file ASCII: Windows PowerShell 5.1 reads BOM-less files as ANSI.
 
 $script:BatonHome = $PSScriptRoot
-$script:BatonSubcommands = @('status', 'accounts', 'account', 'plan', 'routing', 'follow', 'merge', 'inbox', 'install', 'now', 'close', 'doctor', 'attach', 'keepalive', 'list', 'wt', 'backup', 'startup', 'cycle', 'compute', 'fleet', 'night', 'migrate', 'shell')
+$script:BatonSubcommands = @('status', 'accounts', 'account', 'plan', 'routing', 'follow', 'merge', 'inbox', 'install', 'now', 'close', 'doctor', 'attach', 'keepalive', 'list', 'wt', 'backup', 'startup', 'cycle', 'compute', 'fleet', 'night', 'migrate', 'shell', 'help')
 
 function Invoke-BatonPython {
     # Runs bt.py with UTF-8 console decoding. Output goes to the pipeline; exit code is in $LASTEXITCODE.

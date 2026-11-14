@@ -9,7 +9,7 @@ import argparse
 import importlib
 import sys
 
-MODULES = ("launch", "accounts", "routing", "follow", "capsule", "install", "close", "doctor", "attach", "worktrees", "backup", "startup", "cycle", "compute_pickup", "compute_status", "night", "migrate", "shell")
+MODULES = ("launch", "accounts", "routing", "follow", "capsule", "install", "close", "doctor", "attach", "worktrees", "backup", "startup", "cycle", "compute_pickup", "compute_status", "night", "migrate", "shell", "help")
 
 
 def build_parser() -> argparse.ArgumentParser:

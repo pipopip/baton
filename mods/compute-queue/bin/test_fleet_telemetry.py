@@ -371,6 +371,15 @@ class StatusLineTests(unittest.TestCase):
         self.assertFalse(ft.summarize(self.state, self.now)['dispatch_blocked'])
         self.capacity(ember={'eligible': False, 'reason': 'CPU slots unavailable', 'slots_used': 4})  # full, not blocked
         self.assertFalse(ft.summarize(self.state, self.now)['dispatch_blocked'])
+        # free slots too few for the waiting job are busy as well: 3 of 4 used, the job needs 2
+        self.capacity(ember={'eligible': False, 'reason': 'CPU slots unavailable', 'slots_used': 3},
+                      laptop={'eligible': False, 'reason': 'physical or commit RAM floor'})
+        summary = ft.summarize(self.state, self.now)
+        self.assertFalse(summary['dispatch_blocked'])
+        self.assertTrue(summary['line'].startswith('ember 3/4 · laptop 0/4 RAM floor'), summary['line'])
+        # an unknown refusal with free slots still blocks
+        self.capacity(ember={'eligible': False, 'reason': 'something else', 'slots_used': 3})
+        self.assertTrue(ft.summarize(self.state, self.now)['dispatch_blocked'])
         self.job('q', status='done', t_finished=self.now)
         self.capacity(ember={'eligible': False, 'reason': 'legacy work active or waiting'})
         summary = ft.summarize(self.state, self.now)

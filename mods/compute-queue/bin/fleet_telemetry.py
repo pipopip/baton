@@ -98,8 +98,9 @@ def _read_jobs(directory):
 
 
 # The status line. Device words: UPPERCASE for a host that is down, stale or paused (somebody can act); lowercase for
-# a limit that is working as designed (a RAM floor, the legacy queue holding the host). A device that is merely full
-# shows its numbers alone. Lifetime or 24 h totals of failures and missing artifacts are not in the line: they never
+# a limit that is working as designed (a RAM floor, the legacy queue holding the host). A device that is merely full,
+# or whose free slots are too few for the waiting work, shows its numbers alone and does not count toward DISPATCH
+# BLOCKED, which means work waits and every fresh device refuses it for some other reason. Lifetime or 24 h totals of failures and missing artifacts are not in the line: they never
 # clear. They stay in `alerts` for the fleet view.
 DISPLAY_ORDER = ('ember', 'hearth', 'laptop')
 LINE_WIDTH = 100
@@ -172,9 +173,12 @@ def _compose(devices, order, counts, tops, sessions, truncated, started=0):
     fresh = [d for d in devices.values() if d.get('present') is not False and not d.get('stale')]
 
     def can_take(d):
+        # Full is busy, not blocked: every slot is taken, or the free ones are too few for the waiting work (the
+        # placement reason the label also shows as numbers alone). Running jobs will free them.
         used, total = d.get('slots_used'), d.get('slots_total')
         full = used is not None and total is not None and used >= total
-        return d.get('up') is not False and (d.get('eligible') is not False or full)
+        busy = full or (bool(d.get('reason')) and _reason_word(d.get('reason')) == '')
+        return d.get('up') is not False and (d.get('eligible') is not False or busy)
     blocked = waiting > 0 and bool(fresh) and not any(can_take(d) for d in fresh)
     if blocked:
         attention.append('dispatch blocked')
