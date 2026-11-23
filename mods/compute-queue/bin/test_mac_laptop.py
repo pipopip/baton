@@ -34,6 +34,9 @@ class Fixture(unittest.TestCase):
         patcher = patch.dict(os.environ, MAC)
         patcher.start()
         self.addCleanup(patcher.stop)
+        lock = patch.object(fq._engine(), 'HEAVY_LOCK', str(self.state / 'heavy' / 'heavy.lock'))   # never the real one
+        lock.start()
+        self.addCleanup(lock.stop)
 
     def probe(self, available=30, cpus=18, pressure=1, battery=False, total=48):
         return dict(host='laptop', at=self.clock[0], data=dict(

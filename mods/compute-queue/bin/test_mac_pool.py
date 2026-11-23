@@ -15,6 +15,9 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+if os.name == "nt":       # mac_pool runs on macOS only; Linux CI still runs its platform-neutral tests
+    raise unittest.SkipTest("mac_pool is the macOS laptop pool")
+
 import mac_pool as pool
 
 DARWIN = sys.platform == "darwin"

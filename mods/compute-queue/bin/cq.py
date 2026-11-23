@@ -678,6 +678,7 @@ class Laptop:
 
     def heavy_lock_held(self):
         try:
+            os.makedirs(os.path.dirname(HEAVY_LOCK) or ".", exist_ok=True)   # a new state folder: nobody holds it yet
             fd = os.open(HEAVY_LOCK, os.O_RDWR | os.O_CREAT)
         except OSError:
             return True

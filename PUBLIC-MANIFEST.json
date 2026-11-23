@@ -232,7 +232,7 @@
       "output_sha256": "c76f018b5b6854850a3e978e39849f1fb560ddbc20d180a1220d34d7b47061fc"
     },
     "mods/compute-queue/bin/cq.py": {
-      "output_sha256": "9bca15e69286812bd24b3622f0a6abb09d3e5c4536f73919ef2cef5c551763ac"
+      "output_sha256": "984e551b4857370bddf38f785b85354b79dc1568b8cff14a7b42de5f27cd8281"
     },
     "mods/compute-queue/bin/cq_stats.py": {
       "output_sha256": "0b87e972f3590d88e8e82da0bb31276140832b2a401588e904d965f486849bf6"
@@ -253,7 +253,7 @@
       "output_sha256": "0c217d4f3c2896092c6b9a4297dfc2df1592ae3065d901204b11aeb03be2ff93"
     },
     "mods/compute-queue/bin/mac_pool.py": {
-      "output_sha256": "3ff125a96a98435626f65be983b38b7be5ae690b9733737fe034dddc28d4437e"
+      "output_sha256": "8b12508d6ef1c1edc4205221de92a815c8afcd413c9cf29b779e143aabac6ef8"
     },
     "mods/compute-queue/bin/multi_host.py": {
       "output_sha256": "bab19c9328035ce446ceb9df16bd6546b1a06f22c6de31734c07c623f8ecc488"
@@ -334,10 +334,10 @@
       "output_sha256": "5f69b6e1b3460a09eb399b6464b409c92346f0bdd91b050daa775b87cd4b745a"
     },
     "mods/compute-queue/bin/test_mac_laptop.py": {
-      "output_sha256": "678994f0b7f9992e76c54d64d68d159c8335bd5c6b8d89a38da1fb9e192c9857"
+      "output_sha256": "d0240d908787c3f5cadd21b4fe310bf6fa6389bc648ff4a37f51758a7b49db79"
     },
     "mods/compute-queue/bin/test_mac_pool.py": {
-      "output_sha256": "f4c412bb2ea35cec7324a2ac456ebdeda0ca659f462e4d39872acbc3df57fb5b"
+      "output_sha256": "fd83916d5d23897e604bd1ddb6cf14dac6fa545889f58fc06c0c0aabe8e34605"
     },
     "mods/compute-queue/bin/test_multi_host.py": {
       "output_sha256": "96bab109dbc77d501515c95e4cfc3486a933f926e8aba72979637d22632b670a"
@@ -463,5 +463,5 @@
       "output_sha256": "5f593b9cb13fa3e73a51771c4ff6e505224c21421c44f02f170e0a7e65f1d8bc"
     }
   },
-  "source_head": "a8b9489573842fe9c16246163fea8b257e14bf79"
+  "source_head": "0a05625dbee72159dfac031a5bed566d0bc6f57d"
 }

@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
-import fcntl
 import json
 import os
 import re
@@ -52,6 +51,11 @@ import sys
 import threading
 import time
 import uuid
+
+try:
+    import fcntl
+except ImportError:   # Windows: the module is imported there (the pool selector, the tests) but never run
+    fcntl = None
 
 from windows_pool import (_atomic, _claim, _descriptor_hash, _load_descriptor, claim_fingerprint, claim_path,  # noqa: F401
                           read_claim)
@@ -583,7 +587,7 @@ def probe():
 
 class SharedLock:
     """flock on the heavy-lock file, shared: the legacy laptop path and a cohort owner take it exclusively."""
-    mode = fcntl.LOCK_SH
+    mode = fcntl.LOCK_SH if fcntl else None
 
     def __init__(self, path):
         self.fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
@@ -605,7 +609,7 @@ class SharedLock:
 
 
 class ExclusiveLock(SharedLock):
-    mode = fcntl.LOCK_EX
+    mode = fcntl.LOCK_EX if fcntl else None
 
 
 def heavy_lock_held(path):
