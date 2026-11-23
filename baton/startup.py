@@ -23,7 +23,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import config, harvest, launch, launchd, registry, terminal, worktrees
+from . import config, harvest, launch, launchd, locking, registry, terminal, worktrees
 from .hook import _pid_alive
 from .paths import find_worktree_root, key_for, main_checkout
 from .sessions import _rollout_meta
@@ -101,27 +101,8 @@ def claude_live() -> list[dict]:
     return found
 
 
-def _lock_held(lock: Path) -> bool:
-    """A running Codex holds a lock on its thread lock file. On Windows it is a byte-range lock and reading the
-    file fails; elsewhere it is an advisory ``flock``, which reading ignores: a shared lock is asked for instead
-    and refused while the writer holds its exclusive one."""
-    if os.name != "nt":
-        import fcntl
-        try:
-            with open(lock, "rb") as fh:
-                try:
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    return True
-        except OSError:
-            pass
-        return False
-    try:
-        with open(lock, "rb") as fh:
-            fh.read(1)
-        return False
-    except OSError:
-        return True
+def _lock_held(path: Path) -> bool:
+    return locking.codex_writer_lock(path) is locking.WriterLockState.HELD
 
 
 def codex_live() -> list[dict]:

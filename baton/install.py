@@ -486,9 +486,9 @@ def install_profile(stamp: str, dry_run: bool, text: str | None = None) -> str:
 def install_iterm_profile(stamp: str, dry_run: bool, home: str | os.PathLike | None = None) -> str | None:
     """macOS: write Baton's iTerm2 dynamic profile (``baton.iterm.profile_text``) to ``DynamicProfiles/baton.json``
     under ``home`` (default: the user's home). None off macOS; a one-line note when iTerm2 is not installed or
-    ``[policy] iterm_profile`` is empty (Baton's tabs then use the default profile). Idempotent; a changed file is backed
-    up once per run, beside the folder rather than in it (iTerm2 reads every file in the folder, and one that is not a
-    valid property list stops it from reading any)."""
+    ``[policy] iterm_profile`` is empty (Baton's tabs then use the default profile). Reinstalls retain each profile's
+    alert settings. A changed file is backed up once per run, beside the folder rather than in it (iTerm2 reads every
+    file in the folder, and one that is not a valid property list stops it from reading any)."""
     if not config.MACOS:
         return None
     from . import terminal
@@ -498,12 +498,17 @@ def install_iterm_profile(stamp: str, dry_run: bool, home: str | os.PathLike | N
     if not name:
         return "skipped the iTerm2 profile: [policy] iterm_profile is empty, so tabs use the default profile"
     target = iterm.profile_path(home)
-    text = iterm.profile_text(name)
     try:
-        if target.read_bytes() == text.encode("utf-8"):
-            return f"unchanged {target}"
-    except OSError:
-        pass
+        current = target.read_bytes()
+    except FileNotFoundError:
+        current = None
+    try:
+        previous = json.loads(current) if current is not None else None
+    except ValueError:
+        previous = None
+    text = iterm.profile_text(name, previous)
+    if current == text.encode("utf-8"):
+        return f"unchanged {target}"
     if dry_run:
         return f"would write {target}"
     if target.exists():

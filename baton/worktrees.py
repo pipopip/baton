@@ -19,7 +19,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import capsule, config, gitutil, harvest, paths, registry
+from . import capsule, config, gitutil, harvest, locking, paths, registry
 
 LINEAGE_NAME = "worktrees.json"
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -326,12 +326,10 @@ def live_cwds() -> list[str]:
         except OSError:
             continue
         for lock in files:
-            try:
-                with open(lock, "rb") as fh:
-                    fh.read(1)
-                continue            # readable: nobody holds the byte-range lock
-            except OSError:
-                pass
+            state = locking.codex_writer_lock(lock)
+            if state in (locking.WriterLockState.UNLOCKED, locking.WriterLockState.MISSING):
+                continue
+            # For retirement, a matching rollout with an unreadable lock still counts as potentially live.
             rollout = find_rollout(lock.stem, [home], deadline)
             meta = _rollout_meta(rollout) if rollout else None
             if meta and isinstance(meta.get("cwd"), str):

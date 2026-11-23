@@ -1,4 +1,5 @@
 """The ssh client the queue starts, and the git-free worktree top; no network access."""
+import json
 import os
 import shutil
 import subprocess
@@ -144,10 +145,12 @@ class AttachedRequest(unittest.TestCase):
         self.own(self.SESSION)
 
     def book(self, session, worktree):
-        cq.write_json(str(self.state.parent / "attached.json"), {session: {"worktree": str(worktree), "vendor": "claude"}})
+        cq.write_json(str(self.state.parent / "attached.json"), {
+            session: {"worktree": str(worktree), "vendor": "claude", "account": "main"}})
 
-    def own(self, session):
-        cq.write_json(str(self.work / ".baton" / "owner.json"), {"session_id": session, "vendor": "claude"})
+    def own(self, session, *, vendor="claude", account="main"):
+        cq.write_json(str(self.work / ".baton" / "owner.json"), {
+            "session_id": session, "vendor": vendor, "account": account})
 
     def req(self, **extra):
         return {"root": str(self.start), "session": self.SESSION, **extra}
@@ -180,6 +183,23 @@ class AttachedRequest(unittest.TestCase):
         self.own("someone-else")
         req = self.req()
         self.assertIs(cq.attached_request(self.ctx, req), req)
+
+    def test_scoped_binding_requires_matching_owner_and_an_unambiguous_id(self):
+        request = self.req()
+        sid = self.SESSION
+        book = str(self.state.parent / "attached.json")
+        key = json.dumps(["claude", "main", sid], separators=(",", ":"))
+        sibling_key = json.dumps(["claude", "second", sid], separators=(",", ":"))
+        row = {"worktree": str(self.work), "vendor": "claude", "account": "main", "session_id": sid}
+        cq.write_json(book, {key: row})
+        self.assertTrue(cq.same_path(cq.attached_request(self.ctx, request)["root"], str(self.work)))
+        self.own(sid, account="second")
+        self.assertIs(cq.attached_request(self.ctx, request), request)
+        self.own(sid, vendor="codex")
+        self.assertIs(cq.attached_request(self.ctx, request), request)
+        self.own(sid)
+        cq.write_json(book, {key: row, sibling_key: {**row, "account": "second"}})
+        self.assertIs(cq.attached_request(self.ctx, request), request)
 
     def test_unchanged_without_a_record_owner_file_or_worktree(self):
         req = self.req()

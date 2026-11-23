@@ -6,7 +6,7 @@
 //   cd <relative path>
 //   go test|vet|build|run                          (not -exec / -toolexec)
 //   lake build|exe|env|test                        (`lake env` runs only an allowed command or lean)
-//   python|python3|pyfrozen|<path>/.venv/.../python <script>.py     (the script under testdata/, .baton/remote/,
+//   python|python3|python3.N|pyfrozen|<path>/.venv/.../python <script>.py     (the script under testdata/, .baton/remote/,
 //                                                   scripts/, or named gen_*, record*, mutate*, *oracle*)
 //   heavy -n N <allowed>      timeout N <allowed>      bash -c '<allowed>'
 //   bash|sh .baton/remote/<name>.sh [words]        (relative, name [A-Za-z0-9_.-]+, words [A-Za-z0-9_./:=-]+)
@@ -53,13 +53,14 @@ function program(t: string): string | null {
     case 'python': case 'python3': case 'pyfrozen': return 'python'
     case 'lean': return 'lean'
   }
+  if (/^python3\.\d{1,2}$/.test(q)) return 'python'   // a versioned interpreter: a Mac's Homebrew python3.12, say
   if (/^(?:~|[A-Za-z]:)?\/(?:[^/]+\/)*bin\/go(?:\.exe)?$/.test(q)) return 'go'
   if (/^(?:~|[A-Za-z]:)?\/(?:[^/]+\/)*\.elan\/bin\/lake$/.test(q)) return 'lake'
   if (/^(?:~|[A-Za-z]:)?\/(?:[^/]+\/)*bin\/heavy$/.test(q)) return 'heavy'
   if (/(^|\/)\.venv\/(?:Scripts|bin)\/python(?:3)?(?:\.exe)?$/i.test(q)) return 'python'
   // A Mac's package managers install the bare names under /opt/homebrew/bin, /usr/local/bin, /opt/local/bin and the
   // python.org framework: such an absolute path stands for the bare name. /usr/bin is not one (Apple's own stubs).
-  const installed = /^\/(?:opt\/homebrew|usr\/local|opt\/local|Library\/Frameworks\/Python\.framework\/Versions\/[\d.]+)\/bin\/([a-z0-9]+)$/.exec(q)
+  const installed = /^\/(?:opt\/homebrew|usr\/local|opt\/local|Library\/Frameworks\/Python\.framework\/Versions\/[\d.]+)\/bin\/([a-z0-9]+(?:\.\d{1,2})?)$/.exec(q)
   if (installed !== null && installed[1] !== 'cd') return program(installed[1] as string)
   return null
 }

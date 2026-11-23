@@ -148,6 +148,16 @@ class MacExecutorCapacityTests(ControllerOnly):
         self.assertEqual(line, "2/18 fleet slots, 16 GB free, memory pressure warn, on battery, fleet jobs only")
         self.assertNotEqual(line, "not an executor on this machine")
 
+    def test_one_capacity_sample_probes_once(self):
+        snap = dict(supported=True, available_gb=21.04, pressure=2, on_battery=True, total_gb=48, logical_cpus=18)
+        self.laptop.mac_probe = mock.Mock(return_value=snap)
+        self.laptop.free_ram_gb = mock.Mock(side_effect=AssertionError("read separately"))
+        with mock.patch.object(fq, "laptop_figures", return_value={}) as figures:
+            lp = self.tick()["capacity"]["laptop"]
+        self.assertEqual((lp["free_ram_gb"], lp["memory_pressure"], lp["on_battery"]), (21.0, "warn", True))
+        self.laptop.mac_probe.assert_called_once()
+        figures.assert_called_once_with(self.ctx, snap)
+
     def test_the_capacity_carries_the_admission_figures(self):
         figures = dict(slots_total=12, slots_used=2, ram_floor_gb=0, needs_ac=True)
         self.laptop.memory_pressure = lambda: 4

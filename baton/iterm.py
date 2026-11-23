@@ -6,8 +6,9 @@
 * Tab state: a few escape sequences the hooks write to the session's tty (``BATON_TTY``, recorded by ``bt <ws>``): badge
   and tab title with the workstream name always. Then one of two modes (``tab_mode``). *status* (iTerm2 3.7.5 or later):
   the tab colour names the repository, and the session's status is the Program Status Protocol's (OSC 7501), which iTerm2
-  shows on the tab: Claude Code reports it itself, and Baton reports it for Codex, which does not. *classic* (older
-  iTerm2): the tab colour is the state (green: ready, amber: needs input) with a notification, for both agents.
+  shows on the tab: Claude Code reports it itself, and Baton reports it for Codex. iTerm2 handles notifications
+  for those reports. *classic* (older iTerm2): the tab colour is the state (green: ready, amber: needs input) with
+  a legacy notification, for both agents.
 * ``bt iterm prefs``: the few application-wide settings that keep many agent tabs readable, as ``defaults write`` lines.
 * Jump to the tab of a workstream that is already open (``SELECT_SCRIPT``) and open an image pane (``bt img``,
   ``SPLIT_SCRIPT`` and the ``--draw`` side).
@@ -43,6 +44,15 @@ PROFILE_GUID = "E6C9C545-9A68-4673-B6A2-AA55A2C96E5D"
 SHELL_PROFILE = "Baton Shell"                  # the look for ordinary tabs (titles left to the shell); iTerm2's default
 SHELL_GUID = "0B5D7A2E-6C1F-4E8B-9A3D-7F2C4B1E9D60"
 PROFILE_FILE = "baton.json"
+PROFILE_ALERT_KEYS = (
+    "BM Growl",
+    "Send Bell Alert",
+    "Send Idle Alert",
+    "Send New Output Alert",
+    "Send Session Ended Alert",
+    "Send Terminal Generated Alerts",
+    "Suppress Alerts in Active Session",
+)
 
 SESSION_VAR = "BATON_ITERM_SESSION"            # the ITERM_SESSION_ID of the session `bt <ws>` started the agent in
 TTY_VAR = "BATON_TTY"                          # that session's tty, which the hooks write escape sequences to
@@ -104,7 +114,7 @@ def look_entry(look: str) -> dict:
         "Columns": 132, "Rows": 40, "Scrollback Lines": 20000, "Unlimited Scrollback": False,
         "Option Key Sends": 2, "Right Option Key Sends": 0,           # 0 normal, 1 meta, 2 Esc+
         "Silence Bell": True, "Visual Bell": False, "Flashing Bell": False,
-        "Minimum Contrast": 0.12, "Transparency": 0, "Faint Text Alpha": _FAINT_ALPHA, "Cursor Type": 2,
+        "Minimum Contrast": 0, "Transparency": 0, "Faint Text Alpha": _FAINT_ALPHA, "Cursor Type": 2,
         "Badge Max Width": 0.24, "Badge Max Height": 0.055, "Badge Top Margin": 12, "Badge Right Margin": 18,
         "Use Separate Colors for Light and Dark Mode": look == "auto",
     }
@@ -146,6 +156,9 @@ _BAR = {"background": "#0a0d12", "text": "#8f99a8", "strong": "#e3e7ee", "separa
         "cpu": "#72aaf5", "memory": "#c49df5", "git": "#7ed69a", "path": "#c3cad5"}
 
 
+GIT_POLL_SECONDS = 30       # the git component runs git in every tab that has it: iTerm2's few-second default adds up
+
+
 def _bar_advanced() -> dict:
     return {"algorithm": 0, "remove empty components": True, "font": ".AppleSystemUIFont 11", "auto-rainbow style": 0,
             "background color": _color(_BAR["background"]), "default text color": _color(_BAR["text"]),
@@ -166,7 +179,8 @@ def status_bar(agent: bool) -> dict:
     lead = ([_bar_component("SwiftyString", 9, "strong", expression=r"\(user.baton_ws)"),
              _bar_component("SwiftyString", 6, None, expression=r"\(user.baton_agent)")] if agent else
             [_bar_component("WorkingDirectory", 8, "path")])
-    return {"components": lead + [_bar_component("Git", 7, "git"), _bar_component("CPUUtilization", 5, "cpu"),
+    return {"components": lead + [_bar_component("Git", 7, "git", iTermStatusBarGitComponentPollingIntervalKey=GIT_POLL_SECONDS),
+                                  _bar_component("CPUUtilization", 5, "cpu"),
                                   _bar_component("MemoryUtilization", 5, "memory")],
             "advanced configuration": _bar_advanced()}
 
@@ -205,19 +219,27 @@ def shell_profile_entry(look: str) -> dict:
     return entry
 
 
-def profile_document(name: str) -> dict:
-    """The file's content: ``{"Profiles": [<profile>, <shell profile>]}``; the shell profile only with a look of Baton's
-    ("inherit" leaves the look, and so ordinary tabs, to the user's own profiles)."""
+def profile_document(name: str, previous: dict | None = None) -> dict:
+    """Generate Baton's profiles and retain each installed profile's alert settings by GUID."""
     look = look_name()
     profiles = [profile_entry(name, look)]
     if look != "inherit":
         profiles.append(shell_profile_entry(look))
+    old_profiles = previous.get("Profiles") if isinstance(previous, dict) else None
+    if isinstance(old_profiles, list):
+        old_by_guid = {
+            p["Guid"]: p for p in old_profiles
+            if isinstance(p, dict) and p.get("Guid") in (PROFILE_GUID, SHELL_GUID)
+        }
+        for profile in profiles:
+            old = old_by_guid.get(profile["Guid"], {})
+            profile.update({key: old[key] for key in PROFILE_ALERT_KEYS if key in old})
     return {"Profiles": profiles}
 
 
-def profile_text(name: str) -> str:
+def profile_text(name: str, previous: dict | None = None) -> str:
     """The file as ``bt install`` writes it: JSON, sorted keys, two-space indent, trailing newline."""
-    return json.dumps(profile_document(name), indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    return json.dumps(profile_document(name, previous), indent=2, sort_keys=True, ensure_ascii=False) + "\n"
 
 
 def profiles_dir(home=None) -> Path:
@@ -374,8 +396,8 @@ STATES = ("start", "working", "ready", "input", "idle", "end")
 def state_sequences(state: str, label: str, mode: str = "classic", vendor: str = "", repo: str = "", detail: str = "") -> str:
     """The escape sequences of one tab state, concatenated (``label`` and ``detail``: sanitised here); "" when the
     state needs none. *classic*: the tab colour is the state. *status*: the tab colour is the repository's, and the
-    state is a Program Status report, sent only for an agent that does not report for itself (``SELF_REPORTING``),
-    with a notification when it finished or needs the user."""
+    state is a Program Status report, sent only for an agent that does not report for itself (``SELF_REPORTING``).
+    iTerm2 uses its native notification preferences for these reports."""
     if state not in STATES:
         raise ValueError(f"not a tab state: {state!r}")
     label = sanitise(label) or "baton"
@@ -405,9 +427,8 @@ def state_sequences(state: str, label: str, mode: str = "classic", vendor: str =
     if state == "idle":
         return status_report("idle", vendor)
     if state == "ready":
-        return status_report("done", vendor, msg="ready for you") + notify(sanitise(f"{label}: ready for you"))
-    return (status_report("blocked", vendor, kind="permission", msg=detail or "needs your input")
-            + notify(sanitise(f"{label} needs your input")))
+        return status_report("done", vendor, msg="ready for you")
+    return status_report("blocked", vendor, kind="permission", msg=detail or "needs your input")
 
 
 def label_for(environ=None, fallback: str | os.PathLike = "") -> str:
@@ -788,6 +809,7 @@ GROUPS_TABLE = "iterm_groups"
 ARRANGE_SETTING = "iterm_arrange"           # "auto" (default), "manual" (only `bt iterm arrange`) or "off"
 API_PACKAGE = "iterm2==2.30"
 AGENTS = ("claude", "codex")
+RESTYLE_FROM = ("Default",)                 # the stock profile: a tab on a profile of the user's own keeps it
 NEUTRAL = (58, 65, 78)                      # an agent tab outside any worktree: slate
 PARENT_DEPTH = 6
 
@@ -836,7 +858,7 @@ def group_of(root, table: dict | None = None) -> tuple[str, int]:
     """``(group, rank)`` of the worktree at ``root``: the first `[policy.iterm_groups]` entry naming the worktree (by its
     workstream name) or its repository, looked up along the chain of ``Parent:`` lines; else the repository at the top of
     that chain. ``rank`` orders the group's tabs: the position of the matching name in the entry, workstreams before
-    repositories."""
+    repositories; without an entry, the depth in the Parent chain (a lead, which names no parent, first)."""
     from . import paths
     table = groups_table() if table is None else table
     chain, node = [], Path(root)
@@ -851,14 +873,15 @@ def group_of(root, table: dict | None = None) -> tuple[str, int]:
         for name, items in table.items():
             if repo in items:
                 return name, len(items) + items.index(repo)
-    return paths.repo_name(chain[-1]), 0
+    return paths.repo_name(chain[-1]), len(chain) - 1
 
 
 def plan_arrangement(sessions: list[dict], table: dict | None = None, roots=None) -> dict:
     """What `bt iterm arrange` does, as data (pure: ``roots`` maps a session's path to its worktree root, by default
     ``paths.find_worktree_root`` under the code root). Each session: ``session``, ``tab``, ``window``, ``profile``,
     ``job``, ``path``, ``ws`` (user.baton_ws), ``group`` (user.baton_group), ``tab_title`` (the tab's title override
-    format) and ``window_title``. Returns ``{"sessions": [{"session", "profile"?, "inject"?, "tab", "title"?}],
+    format) and ``window_title``. Only agent tabs are touched; a profile is switched only from iTerm2's stock "Default"
+    (a tab on a profile of the user's own keeps it, and a plain shell is never touched). Returns ``{"sessions": [{"session", "profile"?, "inject"?, "tab", "title"?}],
     "windows": [{"group", "tabs", "window"}]}``: profiles to switch to, escape sequences to inject (identity and colour,
     only when the session lacks them), tab titles to set, and the tabs of each group of two or more, in order, with the
     window already titled with the group's name (or None: move the first tab to a new window)."""
@@ -871,7 +894,8 @@ def plan_arrangement(sessions: list[dict], table: dict | None = None, roots=None
             except OSError:
                 inside = False
             return found if inside else None
-    out, members = [], {}
+    out, members, grouped = [], {}, set()
+    table = groups_table() if table is None else table
     for s in sessions:
         job = (s.get("job") or "").lower()
         root = roots(s.get("path")) if job in AGENTS or s.get("ws") else None
@@ -879,9 +903,8 @@ def plan_arrangement(sessions: list[dict], table: dict | None = None, roots=None
         if root is not None:
             ws = s.get("ws") or paths.ws_name(root)
             group, rank = group_of(root, table)
-            baton = profile_name() or PROFILE_DEFAULT
-            if s.get("profile") != baton:
-                item["profile"] = baton
+            if s.get("profile") in RESTYLE_FROM:
+                item["profile"] = profile_name() or PROFILE_DEFAULT
             if s.get("ws") != ws or s.get("group") != group:
                 color = repo_color(group)
                 item["inject"] = (badge(ws) + user_var("baton_ws", ws) + user_var("baton_group", group)
@@ -889,18 +912,18 @@ def plan_arrangement(sessions: list[dict], table: dict | None = None, roots=None
                                   + (tab_color(*color) if color else ""))
             if s.get("tab_title") != TAB_TITLE:
                 item["title"] = TAB_TITLE
-            members.setdefault(group, []).append((rank, ws, s))
+            if s["tab"] not in grouped:                 # a tab belongs to the group of its first agent, never two
+                grouped.add(s["tab"])
+                members.setdefault(group, []).append((rank, ws, s))
         elif job in AGENTS:
             folder = Path(s.get("path") or "~").name or "~"
             title = f"{job} · {folder}"
-            if s.get("profile") not in (SHELL_PROFILE, PROFILE_DEFAULT):
+            if s.get("profile") in RESTYLE_FROM:
                 item["profile"] = SHELL_PROFILE
             if s.get("tab_title") != title:
                 item["title"] = title
             if s.get("group") != "-":
                 item["inject"] = user_var("baton_group", "-") + user_var("baton_agent", job) + tab_color(*NEUTRAL)
-        elif s.get("profile") not in (SHELL_PROFILE, PROFILE_DEFAULT):
-            item["profile"] = SHELL_PROFILE
         if len(item) > 2:
             out.append(item)
     windows = []
@@ -922,26 +945,18 @@ def arrange_mode() -> str:
     return value if value in ("auto", "manual", "off") else "auto"
 
 
-def _cookie(runner) -> str | None:
-    """A Python API cookie from iTerm2 (AppleScript ``request cookie``): the script then connects without a prompt."""
-    done = runner(["osascript", "-e", f'tell application id "{ITERM_BUNDLE_ID}" to request cookie'],
-                  capture_output=True, text=True, timeout=10)
-    cookie = done.stdout.strip() if done.returncode == 0 else ""
-    return cookie or None
-
-
 def run_api(action: str, extra=(), runner=None, detach: bool = False) -> int:
-    """Run ``baton.iterm_api <action>`` in the iterm2 virtualenv with a cookie; 2 when the virtualenv is missing (run
-    `bt install`), 1 when iTerm2 gives no cookie. ``detach`` starts it in its own session and returns at once (hooks)."""
+    """Run ``baton.iterm_api <action>`` in the iterm2 virtualenv; 2 when the virtualenv is missing (run `bt install`).
+    The ``iterm2`` package asks iTerm2 for a cookie itself (AppleScript ``request cookie and key``, which iTerm2 grants
+    a program started from one of its sessions without a prompt), so nothing here waits on iTerm2. ``detach`` starts it
+    in its own session and returns at once (hooks)."""
     import subprocess
     runner = runner or subprocess.run
     python = api_python()
     if not python.exists():
         return 2
-    cookie = _cookie(runner)
-    if not cookie:
-        return 1
-    env = dict(os.environ, ITERM2_COOKIE=cookie, PYTHONPATH=str(config.BATON_HOME))
+    env = {k: v for k, v in os.environ.items() if k not in ("ITERM2_COOKIE", "ITERM2_KEY")}
+    env["PYTHONPATH"] = str(config.BATON_HOME)
     argv = [str(python), "-m", "baton.iterm_api", action, *extra]
     if detach:
         log = config.STATE_DIR / "iterm-arrange.log"
@@ -979,8 +994,8 @@ def run_iterm(args, runner=None, sleep=None, spawn=None) -> int:
         code = run_api("arrange", ("--dry-run",) if getattr(args, "dry_run", False) else (), runner=runner)
         if code == 2:
             print(f"bt iterm arrange: no {api_python()}: run `bt install` (it installs {API_PACKAGE} there)", file=sys.stderr)
-        elif code == 1 and not getattr(args, "dry_run", False):
-            print("bt iterm arrange: iTerm2 gave no Python API cookie (Settings > General > Magic > Enable Python API)",
+        elif code:
+            print("bt iterm arrange: could not reach iTerm2's Python API (Settings > General > Magic > Enable Python API)",
                   file=sys.stderr)
         return code
     if getattr(args, "live", False):

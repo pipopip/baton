@@ -3474,6 +3474,248 @@ class RobustnessTests(Base):
         self.assertEqual(self.decisions()[-1]["kind"], "bypass")
 
 
+class ClaudeReadTests(Base):
+    def read(self, command, *, authority=None, **request):
+        if authority is None:
+            authority = {"root": self.repo, "session": "sess-A", "vendor": "claude"}
+        return cq.execute(self.ctx, command, {"read_authority": authority, **request})
+
+    def test_account_home_is_bound_even_if_session_id_matches(self):
+        jid = self.submit()
+        mine = {"vendor": "claude", "root": self.repo, "session": "sess-A", "home": str(Path(self.tmp) / "mine")}
+        owner_path = os.path.join(self.repo, ".baton", "owner.json")
+        owner = {"vendor": "claude", "session_id": "sess-A", "account": "second", "config_home": mine["home"]}
+        cq.write_json(owner_path, owner)
+        self.assertTrue(self.read("status", job=jid, authority=mine)["ok"])
+        with self.assertRaisesRegex(cq.CqError, cq.JOB_UNAVAILABLE):
+            self.read("status", job=jid, authority=dict(mine, home=str(Path(self.tmp) / "other")))
+
+    def test_status_denies_foreign_top_even_when_legacy_path_comparison_matches(self):
+        jid = self.submit()
+        other = os.path.join(self.tmp, "other-worktree")
+        os.makedirs(other)
+        job = self.job(jid)
+        job.update(top=other, worktree_identity=None)
+        cq.save_job(self.ctx, job)
+        with mock.patch.object(cq, "same_path", return_value=True):
+            with self.assertRaisesRegex(cq.CqError, cq.JOB_UNAVAILABLE):
+                self.read("status", job=jid)
+        self.assertEqual(cq.execute(self.ctx, "status", {"job": jid})["job"]["id"], jid)
+
+    def test_full_status_rejects_changed_incarnation_and_another_vendor(self):
+        jid = self.submit()
+        job = self.job(jid)
+        self.assertEqual(self.read("status", job=jid)["job"]["command"], job["command"])
+        invalid = dict(self.job(jid), worktree_identity=dict(job["worktree_identity"], inode=-1))
+        cq.save_job(self.ctx, invalid)
+        with self.assertRaisesRegex(cq.CqError, cq.JOB_UNAVAILABLE):
+            self.read("status", job=jid)
+        cq.save_job(self.ctx, job)
+        cq.write_json(os.path.join(self.repo, ".baton", "owner.json"), {"vendor": "codex", "session_id": "sess-A"})
+        with self.assertRaisesRegex(cq.CqError, cq.JOB_UNAVAILABLE):
+            self.read("status", job=jid)
+
+    def test_aggregate_contains_only_owned_rows_and_sanitized_fleet_data(self):
+        mine, other = self.submit(), self.submit(label="private other label")
+        outside = os.path.join(self.tmp, "outside")
+        os.makedirs(outside)
+        cq.save_job(self.ctx, dict(self.job(other), top=outside, worktree_identity=cq.worktree_identity(outside)))
+        cq.write_json(self.ctx.p("leader.json"), {"root": outside})
+        cq.write_json(self.ctx.p("fleet", "capacity.json"), {"at": self.clock[0], "devices": {
+            "ember": {"up": True, "eligible": False, "reason": "paused by private job detail"},
+        }})
+        aggregate = self.read("status")
+        self.assertEqual([row["id"] for row in aggregate["queue"]], [mine])
+        self.assertEqual(set(aggregate), {"ok", "fleet", "queue", "recent"})
+        self.assertEqual(aggregate["fleet"]["devices"]["ember"]["reason"], "PAUSED")
+        self.assertNotIn("private job detail", json.dumps(aggregate))
+        self.assertNotIn("private other label", json.dumps(aggregate))
+        public = self.read("status", view="fleet", authority={"vendor": "claude", "root": outside, "session": "elsewhere"})
+        self.assertEqual(set(public), {"ok", "fleet"})
+        self.assertEqual(public["fleet"], aggregate["fleet"])
+        self.assertIn(other, [row["id"] for row in cq.execute(self.ctx, "status", {})["queue"]])
+
+    def test_attached_session_reads_bound_job_and_marks_a_main_loop_result(self):
+        jid = self.submit()
+        outside = os.path.join(self.tmp, "outside")
+        os.makedirs(outside)
+        cq.write_json(os.path.join(self.repo, ".baton", "owner.json"), {"vendor": "claude", "account": "main", "session_id": "sess-A"})
+        cq.write_json(os.path.join(self.tmp, "attached.json"), {"sess-A": {"worktree": self.repo, "vendor": "claude", "account": "main"}})
+        cq.finish(self.ctx, jid, "done", 0)
+        authority = {"root": outside, "session": "sess-A", "vendor": "claude"}
+        result = self.read("status", authority=authority, job=jid, compact=True)
+        self.assertFalse(result["delivered"])
+        result = self.read("status", authority=authority, job=jid, compact=True,
+                           seen_by={"root": outside, "session": "sess-A"})
+        self.assertTrue(result["delivered"])
+
+    def test_refresh_refuses_after_owner_changes_before_the_leaf(self):
+        import queue_generations
+        jid = self.submit(defer="spare", where="host", host_id="ember", memory_max_gb=1)
+        route = queue_generations.execute
+
+        def handoff(*args):
+            cq.write_json(os.path.join(self.repo, ".baton", "owner.json"), {"vendor": "claude", "session_id": "sess-B"})
+            return route(*args)
+
+        with mock.patch.object(queue_generations, "execute", side_effect=handoff) as dispatched, mock.patch.object(cq, "refresh_deferred") as refresh:
+            with self.assertRaisesRegex(cq.CqError, cq.JOB_UNAVAILABLE):
+                self.read("status", job=jid, refresh=True)
+        dispatched.assert_called_once()
+        refresh.assert_not_called()
+
+    def test_wait_rechecks_current_owner_each_time_it_loads_the_job(self):
+        jid = self.submit()
+
+        def handoff(_interval):
+            cq.finish(self.ctx, jid, "done", 0)
+            cq.write_json(os.path.join(self.repo, ".baton", "owner.json"), {"vendor": "claude", "session_id": "sess-B"})
+
+        with mock.patch.object(cq.time, "sleep", side_effect=handoff):
+            with self.assertRaisesRegex(cq.CqError, cq.JOB_UNAVAILABLE):
+                self.read("wait", job=jid, timeout_s=1, seen_by={"root": self.repo, "session": "sess-A"})
+        self.assertFalse(self.job(jid).get("notified"))
+
+    def test_wait_allows_same_owner_to_renew_the_claim(self):
+        jid = self.submit()
+
+        def renew(_interval):
+            cq.finish(self.ctx, jid, "done", 0)
+            cq.write_json(os.path.join(self.repo, ".baton", "owner.json"), {"vendor": "claude", "session_id": "sess-A", "claimed_at": "later"})
+
+        with mock.patch.object(cq.time, "sleep", side_effect=renew):
+            self.assertTrue(self.read("wait", job=jid, timeout_s=1)["ended"])
+
+
+class ClaudeHookOwnershipTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.home = str(Path(self.tmp) / "claude-one")
+        self.other_home = str(Path(self.tmp) / "claude-two")
+        self.owner_path = Path(self.repo) / ".baton" / "owner.json"
+        self.owner = {"vendor": "claude", "account": "one", "session_id": "sess-A", "config_home": self.home}
+        cq.write_json(str(self.owner_path), self.owner)
+        self.ctx.claude_home = self.home
+
+    def call(self, operation, **request):
+        return cq.execute(self.ctx, operation, {"root": self.repo, "session": "sess-A", **request})
+
+    def test_submit_and_cancel_refuse_other_homes_and_vendor_with_same_session(self):
+        jid = self.submit()
+        transcript = str(Path(self.home, "projects", "worktree", "sess-A.jsonl"))
+        legacy = {"vendor": "claude", "account": "one", "session_id": "sess-A", "transcript": transcript}
+        for owner in (self.owner, legacy, dict(self.owner, vendor="codex")):
+            with self.subTest(owner=owner):
+                cq.write_json(str(self.owner_path), owner)
+                self.ctx.claude_home = self.other_home if owner["vendor"] == "claude" else self.home
+                with mock.patch.object(cq, "snapshot") as snapshot:
+                    with self.assertRaisesRegex(cq.CqError, "current worktree owner"):
+                        self.call("submit", command="go test ./pkg")
+                snapshot.assert_not_called()
+                with self.assertRaisesRegex(cq.CqError, "current worktree owner"):
+                    self.call("cancel", job=jid)
+                self.assertEqual(self.job(jid)["status"], "queued")
+        cq.write_json(str(self.owner_path), legacy)
+        self.ctx.claude_home = self.home
+        self.assertEqual(self.call("cancel", job=jid)["status"], "cancelled")
+
+    def test_fleet_submission_rechecks_home_under_acceptance_lock(self):
+        import fleet_queue
+        import queue_generations
+        snapshot = cq.snapshot
+
+        def handoff(*args):
+            result = snapshot(*args)
+            cq.write_json(str(self.owner_path), dict(self.owner, config_home=self.other_home))
+            return result
+
+        with mock.patch.object(cq, "snapshot", side_effect=handoff) as captured, mock.patch.object(fleet_queue, "ensure_controller") as controller:
+            with self.assertRaisesRegex(cq.CqError, "owner changed before acceptance"):
+                self.call("submit", command="go test ./pkg", where="fleet", candidates=["ember"], memory_gb=1)
+        captured.assert_called_once()
+        controller.assert_not_called()
+        self.assertEqual(queue_generations.all_jobs(cq, self.ctx), [])
+
+    def test_watch_authorize_ack_and_result_mark_bind_home_in_both_generations_and_shards(self):
+        import fleet_queue
+        import multi_host
+        import queue_generations
+        legacy_id = self.submit()
+        cq.finish(self.ctx, legacy_id, "done", 0)
+        template = self.job(legacy_id)
+        cq.write_json(self.ctx.p("hosts.json"), {"version": 1, "hosts": {"hearth": {"state": "hosts/hearth", "enabled": True}}})
+        modern = queue_generations.context(cq, self.ctx, 2)
+        registry = multi_host._registry(cq, modern)
+        shard = multi_host._context(cq, modern, "hearth", registry)
+        cq.write_json(shard.p("host.conf.json"), {"host_id": "hearth", "address": "fixture@hearth"})
+        shard_id = "cq-v2--hearth-20261123T120000-0123456789abcdef"
+        fleet_id = "cq-v2--fleet-20261123T120000-0123456789abcdef"
+        cq.save_job(shard, dict(template, id=shard_id, host_id="hearth"))
+        cq.save_job(modern, dict(template, id=fleet_id, fleet=True))
+        ids = [legacy_id, shard_id, fleet_id]
+        owner = {"owner_root": self.repo, "owner_session": "sess-A"}
+        with mock.patch.object(fleet_queue, "ensure_controller"):
+            self.ctx.claude_home = self.other_home
+            watch = self.call("watch", notice_protocol=2)["watch"]
+            self.assertEqual(watch["to_notify"], [])
+            self.assertNotIn("top", watch)
+            self.assertFalse(self.call("notice_authorize", ids=ids)["ok"])
+            self.assertFalse(self.call("notified", ids=ids, **owner)["ok"])
+            self.assertFalse(cq.mark_delivered(self.ctx, legacy_id, {"root": self.repo, "session": "sess-A"}, "status"))
+            self.assertTrue(all(not queue_generations.load_job(cq, self.ctx, jid)["notified"] for jid in ids))
+            self.ctx.claude_home = self.home
+            self.assertCountEqual([job["id"] for job in self.call("watch", notice_protocol=2)["watch"]["to_notify"]], ids)
+            self.assertCountEqual([job["id"] for job in self.call("notice_authorize", ids=ids)["jobs"]], ids)
+            self.assertTrue(self.call("notified", ids=ids, **owner)["ok"])
+        self.assertTrue(all(queue_generations.load_job(cq, self.ctx, jid)["notified"] for jid in ids))
+
+    def test_tick_leads_with_no_access_to_another_homes_result(self):
+        jid = self.submit()
+        cq.finish(self.ctx, jid, "done", 0)
+        self.ctx.claude_home = self.other_home
+        with mock.patch.object(cq, "ensure_deferred_controller"):
+            tick = self.call("tick", watch_session="sess-A")
+        self.assertTrue(tick["leader"])
+        self.assertEqual(tick["watch"]["to_notify"], [])
+        self.assertNotIn("top", tick["watch"])
+        self.assertNotEqual(cq.read_json(self.ctx.p("leader.json"))["session"], "sess-A")
+
+    def test_read_rejects_a_different_transport_home_even_with_matching_payload_home(self):
+        jid = self.submit()
+        self.ctx.claude_home = self.other_home
+        with self.assertRaisesRegex(cq.CqError, cq.JOB_UNAVAILABLE):
+            self.call("status", job=jid, read_authority={"vendor": "claude", "root": self.repo, "session": "sess-A", "home": self.home})
+
+    def test_cli_uses_the_hook_home_only_when_supplied_by_the_launcher(self):
+        jid = self.submit()
+        request = json.dumps({"job": jid, "root": self.repo, "session": "sess-A"})
+        argv = [sys.executable, cq.__file__, "cancel", "--state", self.ctx.state]
+        env = dict(os.environ, CQ_CLAUDE_HOOK_HOME=self.other_home)
+        bound = subprocess.run(argv, input=request, env=env, text=True, capture_output=True, timeout=15)
+        self.assertEqual(bound.returncode, 1, bound.stderr)
+        self.assertIn("current worktree owner", json.loads(bound.stdout)["error"])
+        env.pop("CQ_CLAUDE_HOOK_HOME")
+        admin = subprocess.run(argv, input=request, env=env, text=True, capture_output=True, timeout=15)
+        self.assertEqual(admin.returncode, 0, admin.stdout)
+        self.assertEqual(json.loads(admin.stdout)["status"], "cancelled")
+
+    def test_attachment_to_checkout_wins_over_released_git_launch_root(self):
+        target = Path(self.repo)
+        launch = target.with_name("old-checkout")
+        sh(str(target.parent), "clone", "-q", str(target), str(launch))
+        jid = self.submit()
+        cq.finish(self.ctx, jid, "done", 0)
+        key = json.dumps(["claude", "one", "sess-A"], separators=(",", ":"))
+        cq.write_json(os.path.join(self.tmp, "attached.json"), {key: {
+            "vendor": "claude", "account": "one", "session_id": "sess-A", "worktree": str(target),
+        }})
+        request = {"root": str(launch), "session": "sess-A"}
+        self.assertEqual(cq.attached_request(self.ctx, request), request)
+        self.assertEqual([job["id"] for job in self.call("watch", root=str(launch))["watch"]["to_notify"]], [jid])
+        self.assertEqual(self.call("status", job=jid, read_authority={"vendor": "claude", **request})["job"]["id"], jid)
+        self.assertTrue(self.call("notified", ids=[jid], owner_root=str(launch), owner_session="sess-A")["ok"])
+
+
 class StatusTests(Base):
     """status and list rows (times, exit, cores), the wait reason of a queued job by the planner's rules, the capacity
     summary and the submit note's estimate hint."""

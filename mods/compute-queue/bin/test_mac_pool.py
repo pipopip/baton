@@ -202,6 +202,31 @@ def descriptor(tmp, argv, **kw):
     return d
 
 
+class SpawnEnvironmentTests(unittest.TestCase):
+    def test_spawn_passes_runtime_and_queue_metadata_only(self):
+        runtime = dict(PATH="/opt/homebrew/bin:/usr/bin:/bin", HOME="/Users/worker", TMPDIR="/private/tmp/worker/",
+                       LANG="en_US.UTF-8", LC_CTYPE="UTF-8")
+        controller = dict(runtime, OPENAI_API_KEY="fixture", SSH_AUTH_SOCK="/tmp/agent.sock",
+                          GITHUB_TOKEN="fixture", BASH_ENV="/tmp/controller-start.sh", CQ_SRC="controller-src")
+        with tempfile.TemporaryDirectory() as tmp:
+            metadata = dict(CQ_JOB="unit", CQ_SHA="a" * 40, CQ_BASE="b" * 40,
+                            CQ_SRC=str(Path(tmp, "src $(literal)")), GIT_CEILING_DIRECTORIES=tmp)
+            supplied = dict(metadata, PATH="/tmp/tool-shims", HOME="/tmp/other-home", ENV="/tmp/sh-start.sh",
+                            BASH_ENV="/tmp/bash-start.sh", DYLD_INSERT_LIBRARIES="/tmp/fixture.dylib",
+                            CQ_FLEET_JOB="forged-tag", CQ_UNKNOWN="not-queue-metadata")
+            d = descriptor(tmp, ["bash", "command.sh"], env=supplied)
+            with mock.patch.dict(os.environ, controller, clear=True), mock.patch.object(pool.subprocess, "Popen") as popen:
+                _, go = pool._spawn(d)
+                os.close(go)
+            popen.assert_called_once()
+            self.assertEqual(popen.call_args.kwargs["env"], dict(runtime, **metadata, CQ_FLEET_JOB=pool._job_name(d)))
+
+    def test_absent_controller_path_uses_the_system_search_path(self):
+        d = descriptor("/private/tmp", ["true"])
+        with mock.patch.dict(os.environ, clear=True):
+            self.assertEqual(pool._job_environment(d), {"PATH": os.defpath, pool.TAG_ENV: pool._job_name(d)})
+
+
 def gone(pid):
     info = pool._bsd(pid)
     return info is None or info[0] == pool._SZOMB
@@ -344,12 +369,33 @@ class NativeTests(unittest.TestCase):
         self.assertIn("declared cap of 0.15 GB", log)
         self.assertGreater(state["peak_private_bytes"], 0.15 * 2 ** 30)
 
-    def test_a_cap_the_submitter_did_not_state_is_never_enforced(self):
-        self.prepare([sys.executable, "-c", self.ALLOCATE % 1.5], memory_max_gb=0.15, memory_cap_declared=False)
-        with mock.patch.object(pool, "memory_pressure", return_value=4):     # even critical: the kernel's job
-            state = pool.run(str(self.path))
-        self.assertEqual((state["phase"], state["exit"]), ("done", 0))
-        self.assertNotIn("enforced only", Path(self.d["log_path"]).read_text())
+    def test_a_derived_cap_is_enforced_at_critical_pressure_only_and_at_one_and_a_half_times(self):
+        # the job uses about 0.4 GB; the derived cap is 0.15 GB, so 0.225 GB is the line
+        for level in (1, 2):
+            with self.subTest(level=level), tempfile.TemporaryDirectory() as other:
+                self.dir = Path(other)
+                self.path = self.dir / "descriptor.json"
+                self.prepare([sys.executable, "-c", self.ALLOCATE % 1.5], memory_max_gb=0.15, memory_cap_declared=False)
+                with mock.patch.object(pool, "memory_pressure", return_value=level):
+                    state = pool.run(str(self.path))
+                self.assertEqual((state["phase"], state["exit"]), ("done", 0))
+                self.assertNotIn("enforced only", Path(self.d["log_path"]).read_text())   # no cap was declared: nothing to say
+        with tempfile.TemporaryDirectory() as other:
+            self.dir = Path(other)
+            self.path = self.dir / "descriptor.json"
+            self.prepare([sys.executable, "-c", self.ALLOCATE % 60], memory_max_gb=0.15, memory_cap_declared=False)
+            with mock.patch.object(pool, "memory_pressure", return_value=4):
+                state = pool.run(str(self.path))
+            self.assertEqual((state["phase"], state["exit"]), ("failed", 137))
+            self.assertIn("critical memory pressure", state["reason"])
+            self.assertIn("0.15", state["reason"])
+        with tempfile.TemporaryDirectory() as other:     # 0.3 x 1.5 = 0.45 GB: a 0.4 GB job is under the line
+            self.dir = Path(other)
+            self.path = self.dir / "descriptor.json"
+            self.prepare([sys.executable, "-c", self.ALLOCATE % 1.5], memory_max_gb=0.3, memory_cap_declared=False)
+            with mock.patch.object(pool, "memory_pressure", return_value=4):
+                state = pool.run(str(self.path))
+            self.assertEqual((state["phase"], state["exit"]), ("done", 0))
 
     def test_pressure_that_turns_up_later_enforces_the_cap(self):
         levels = iter([1, 1, 4, 4, 4, 4, 4, 4])

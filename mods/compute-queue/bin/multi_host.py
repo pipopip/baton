@@ -85,8 +85,9 @@ def _context(engine, ctx, host_id, registry, create=True):
                        run_remoterun=ctx.run_remoterun, spawn=ctx.spawn,
                        laptop=ctx.laptop, sync=ctx.sync)
     child.host_id = host_id
-    if hasattr(ctx, 'artifact_stream'):
-        child.artifact_stream = ctx.artifact_stream
+    for attr in ('artifact_stream', 'claude_home'):
+        if hasattr(ctx, attr):
+            setattr(child, attr, getattr(ctx, attr))
     return child
 
 

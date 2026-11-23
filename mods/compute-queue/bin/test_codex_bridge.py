@@ -30,6 +30,7 @@ import cq
 
 SESSION = '01a14e7f-5edf-7e83-b3e7-7a6dd17ad2e7'
 OTHER = '01a14e7f-5edf-7e83-b3e7-7a6dd17ad2e8'
+JOB_ID = 'cq-20261123T120000-0123456789abcdef'
 
 
 class BridgeTests(unittest.TestCase):
@@ -71,7 +72,7 @@ class BridgeTests(unittest.TestCase):
                       dict(vendor=vendor, account='main', session_id=session,
                            transcript=str(home / 'sessions' / ('rollout-' + session + '.jsonl')), **extra))
 
-    def job(self, job_id='j1', **extra):
+    def job(self, job_id=JOB_ID, **extra):
         value = dict(id=job_id, root=str(self.root), top=str(self.root), session=OTHER,
                      status='done', notified=False, notify=True,
                      worktree_identity=cq.worktree_identity(str(self.root)))
@@ -170,14 +171,14 @@ class BridgeTests(unittest.TestCase):
 
     def test_cancel_only_owned_worktree_and_shared_engine(self):
         self.job(status='queued')
-        self.b.call('cancel', {'root': str(self.root), 'job': 'j1'})
-        self.assertEqual(self.calls[-1], ('cancel', {'job': 'j1', 'root': str(self.root), 'session': SESSION}))
+        self.b.call('cancel', {'root': str(self.root), 'job': JOB_ID})
+        self.assertEqual(self.calls[-1], ('cancel', {'job': JOB_ID, 'root': str(self.root), 'session': SESSION}))
         self.job(root=str(self.base / 'somewhere-else'))
         with self.assertRaises(bridge.Refusal):
-            self.b.call('cancel', {'root': str(self.root), 'job': 'j1'})
+            self.b.call('cancel', {'root': str(self.root), 'job': JOB_ID})
 
     def test_shard_jobs_are_read_for_cancel_and_delivery(self):
-        shard = dict(id='cq-hearth-123', root=str(self.root), top=str(self.root), session=OTHER,
+        shard = dict(id='cq-hearth-20261123T120000-0123456789abcdef', root=str(self.root), top=str(self.root), session=OTHER,
                      status='done', notified=False, notify=True,
                      worktree_identity=cq.worktree_identity(str(self.root)))
         registry = types.SimpleNamespace(all_jobs=mock.Mock(return_value=[shard]),
@@ -192,13 +193,138 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(len(self.deliveries), 1)
 
     def test_wait_cap_and_no_dispatch_exposed(self):
-        self.b.call('wait', {'job': 'j1'})
-        self.assertEqual(self.calls[-1], ('wait', {'job': 'j1', 'timeout_s': 60}))
+        self.job()
+        self.b.call('wait', {'job': JOB_ID})
+        name, request = self.calls[-1]
+        self.assertEqual(name, 'wait')
+        self.assertEqual(request['job'], JOB_ID)
+        self.assertEqual(request['timeout_s'], 60)
         with self.assertRaises(bridge.Refusal):
-            self.b.call('wait', {'job': 'j1', 'timeout_s': 61})
+            self.b.call('wait', {'job': JOB_ID, 'timeout_s': 61})
         with self.assertRaises(bridge.Refusal):
-            self.b.call('dispatch', {'job': 'j1'})
+            self.b.call('dispatch', {'job': JOB_ID})
         self.assertEqual({t['name'] for t in bridge.TOOLS}, {'run', 'status', 'wait', 'cancel'})
+
+    def test_job_status_wait_and_refresh_refuse_other_worktree_and_unknown_ids_identically(self):
+        foreign = self.base / 'foreign'
+        foreign.mkdir()
+        self.job('foreign', top=str(foreign), root=str(foreign), worktree_identity=cq.worktree_identity(foreign),
+                 defer='spare', tail=['private result'])
+        with mock.patch.object(bridge, 'read_notice_receipts') as receipts:
+            for name, options in (('status', {}), ('status', {'refresh': True}), ('wait', {})):
+                for job_id in ('foreign', 'missing'):
+                    for root in ({}, {'root': str(self.root)}):
+                        with self.subTest(name=name, job=job_id, root=root), \
+                                self.assertRaisesRegex(bridge.Refusal, bridge.JOB_UNAVAILABLE):
+                            self.b.call(name, {'job': job_id, **options, **root})
+            receipts.assert_not_called()
+        self.assertEqual(self.calls, [])
+
+    def test_job_read_requires_explicit_root_and_session_without_process_thread(self):
+        self.job()
+        self.owners.session = None
+        for name in ('status', 'wait'):
+            with self.subTest(name=name):
+                for identity in ({}, {'root': str(self.root)}, {'session_id': SESSION}):
+                    with self.assertRaisesRegex(bridge.Refusal, 'requires an absolute worktree root'):
+                        self.b.call(name, {'job': JOB_ID, **identity})
+                self.assertTrue(self.b.call(name, {'job': JOB_ID, 'root': str(self.root), 'session_id': SESSION})['ok'])
+        self.owners.session = OTHER
+        with self.assertRaisesRegex(bridge.Refusal, bridge.JOB_UNAVAILABLE):
+            self.b.call('status', {'job': JOB_ID, 'root': str(self.root), 'session_id': SESSION})
+        self.assertEqual([name for name, _ in self.calls], ['status', 'wait'])
+
+    def test_job_reads_allow_successors_and_hold_legacy_jobs_when_session_changes(self):
+        self.job('modern', session=SESSION, tail=['authorized result'])
+        self.job('legacy', session=SESSION, worktree_identity=None)
+        client = bridge.Bridge(self.ctx, self.owners)
+        self.assertEqual(client.call('status', {'job': 'legacy'})['job']['id'], 'legacy')
+        self.owner(session=OTHER)
+        with self.assertRaisesRegex(bridge.Refusal, bridge.JOB_UNAVAILABLE):
+            client.call('status', {'job': 'modern'})
+        self.owners.session = OTHER
+        self.assertEqual(client.call('status', {'job': 'modern'})['job']['tail'], ['authorized result'])
+        self.assertTrue(client.call('wait', {'job': 'modern'})['ended'])
+        with self.assertRaisesRegex(bridge.Refusal, bridge.JOB_UNAVAILABLE):
+            client.call('status', {'job': 'legacy'})
+
+    def test_job_reads_refuse_other_account_and_recreated_worktree(self):
+        self.job()
+        self.owner(home=self.base / 'other-account')
+        with self.assertRaisesRegex(bridge.Refusal, bridge.JOB_UNAVAILABLE):
+            self.b.call('status', {'job': JOB_ID})
+        self.root.rename(self.base / 'previous-repo')
+        self.root.mkdir()
+        self.owner()
+        for name in ('status', 'wait'):
+            with self.assertRaisesRegex(bridge.Refusal, bridge.JOB_UNAVAILABLE):
+                self.b.call(name, {'job': JOB_ID})
+        self.assertEqual(self.calls, [])
+
+    def test_jobless_summary_shows_aggregate_and_only_explicitly_scoped_rows(self):
+        self.job('mine-active', status='queued')
+        self.job('mine-recent', status='done', t_finished=1)
+        self.job('old-tree', status='queued', worktree_identity={'device': -1, 'inode': -1, 'birth_ns': None})
+        self.job('legacy-unknown-owner', status='done', worktree_identity=None)
+        self.job('other-active', status='queued', root=str(self.base / 'other'), top=str(self.base / 'other'),
+                 label='private label', command='private command')
+        client = bridge.Bridge(self.ctx, self.owners)
+        self.assertEqual(set(client.call('status', {})), {'ok', 'fleet'})
+        self.assertEqual(client.call('status', {}), client.call('status', {'view': 'fleet'}))
+        result = client.call('status', {'root': str(self.root)})
+        self.assertEqual(set(result), {'ok', 'fleet', 'queue', 'recent'})
+        self.assertEqual([job['id'] for job in result['queue']], ['mine-active'])
+        self.assertEqual([job['id'] for job in result['recent']], ['mine-recent'])
+        self.assertNotIn('private', json.dumps(result))
+
+    def test_job_refresh_rechecks_reloaded_record_before_host_work(self):
+        self.job(defer='spare')
+        def engine(name, req):
+            self.job(defer='spare', worktree_identity={'device': -1, 'inode': -1, 'birth_ns': None})
+            return cq.execute(self.ctx, name, req)
+        self.b.engine = engine
+        with mock.patch.object(cq, 'refresh_deferred') as refresh:
+            with self.assertRaisesRegex(bridge.Refusal, bridge.JOB_UNAVAILABLE):
+                self.b.call('status', {'job': JOB_ID, 'refresh': True})
+            refresh.assert_not_called()
+
+    def test_wait_checks_ownership_again_after_poll_sleep(self):
+        self.job(status='running')
+        client = bridge.Bridge(self.ctx, self.owners)
+        def handoff(_seconds):
+            self.owner(session=OTHER)
+            self.job(status='done', tail=['private result after handoff'])
+        with mock.patch.object(cq.time, 'sleep', side_effect=handoff) as sleep:
+            with self.assertRaisesRegex(bridge.Refusal, bridge.JOB_UNAVAILABLE):
+                client.call('wait', {'job': JOB_ID})
+        sleep.assert_called_once()
+        self.assertFalse(cq.load_job(self.ctx, JOB_ID)['notified'])
+
+    def test_job_read_scope_reaches_generation_two_fleet_job(self):
+        import queue_generations
+        fleet = queue_generations.context(cq, self.ctx, 2)
+        jid = 'cq-v2--fleet-20261123T124000-0123456789abcdef'
+        job = dict(id=jid, root=str(self.root), top=str(self.root), session=OTHER, fleet=True,
+                   worktree_identity=cq.worktree_identity(self.root), status='running', host_id='ember')
+        cq.save_job(fleet, job)
+        client = bridge.Bridge(self.ctx, self.owners)
+        self.assertEqual(client.call('status', {'job': jid})['job'], job)
+        result = client.call('status', {'root': str(self.root)})
+        self.assertEqual([row['id'] for row in result['queue']], [jid])
+        with mock.patch('fleet_queue._remote_reconcile', return_value={'ok': True}) as refresh:
+            self.assertTrue(client.call('status', {'job': jid, 'refresh': True})['refresh']['ok'])
+            refresh.assert_called_once()
+            self.owner(session=OTHER)
+            with self.assertRaisesRegex(bridge.Refusal, bridge.JOB_UNAVAILABLE):
+                client.call('status', {'job': jid, 'refresh': True})
+            refresh.assert_called_once()
+
+    def test_job_status_refuses_foreign_split_child_data(self):
+        self.job(children=['child'])
+        self.job('child', parent=JOB_ID, root=str(self.base / 'other'), top=str(self.base / 'other'))
+        client = bridge.Bridge(self.ctx, self.owners)
+        with self.assertRaisesRegex(bridge.Refusal, bridge.JOB_UNAVAILABLE):
+            client.call('status', {'job': JOB_ID})
 
     def test_idle_cycle_never_probes_or_claims_leader(self):
         self.b.cycle()
@@ -210,7 +336,7 @@ class BridgeTests(unittest.TestCase):
             self.b.cycle()
         self.assertEqual(scan.call_count, 1)
         self.assertEqual(len(self.deliveries), 1)
-        self.assertTrue(cq.load_job(self.ctx, 'j1')['notified'])
+        self.assertTrue(cq.load_job(self.ctx, JOB_ID)['notified'])
 
     def test_active_cycle_rescans_after_tick_completion(self):
         self.job(status='running')
@@ -224,7 +350,7 @@ class BridgeTests(unittest.TestCase):
             self.b.cycle()
         self.assertEqual(scan.call_count, 2)
         self.assertEqual(len(self.deliveries), 1)
-        self.assertTrue(cq.load_job(self.ctx, 'j1')['notified'])
+        self.assertTrue(cq.load_job(self.ctx, JOB_ID)['notified'])
 
     def test_direct_deliver_scans_current_jobs(self):
         self.b.deliver()
@@ -245,23 +371,24 @@ class BridgeTests(unittest.TestCase):
         self.assertFalse(self.deliveries)
         self.b.cycle()
         self.assertEqual(len(self.deliveries), 1)
-        self.assertTrue(cq.load_job(self.ctx, 'j1')['notified'])
+        self.assertTrue(cq.load_job(self.ctx, JOB_ID)['notified'])
 
     def test_idle_snapshot_reloads_changed_candidates_under_lock(self):
-        self.job('stale')
-        self.job('cancelled')
+        stale, cancelled = 'cq-20261123T120001-bbbb', 'cq-20261123T120002-aaaa'
+        self.job(stale)
+        self.job(cancelled)
         real_scan = self.b.all_jobs
         def scan_then_change():
             snapshot = real_scan()
-            self.job('stale', notify=False)
-            self.job('cancelled', status='cancelled')
+            self.job(stale, notify=False)
+            self.job(cancelled, status='cancelled')
             return snapshot
         with mock.patch.object(self.b, 'all_jobs', side_effect=scan_then_change):
             self.b.cycle()
         self.assertEqual(len(self.deliveries), 1)
         self.assertIn('cancelled', self.deliveries[0][-1])
-        self.assertFalse(cq.load_job(self.ctx, 'stale')['notified'])
-        self.assertTrue(cq.load_job(self.ctx, 'cancelled')['notified'])
+        self.assertFalse(cq.load_job(self.ctx, stale)['notified'])
+        self.assertTrue(cq.load_job(self.ctx, cancelled)['notified'])
 
     def test_fresh_claude_leader_keeps_control(self):
         self.job(status='queued')
@@ -293,11 +420,11 @@ class BridgeTests(unittest.TestCase):
         self.job(session='old-claude-session')
         self.b.runner = mock.Mock(return_value=subprocess.CompletedProcess([], 1))
         self.b.deliver()
-        self.assertFalse(cq.load_job(self.ctx, 'j1')['notified'])
+        self.assertFalse(cq.load_job(self.ctx, JOB_ID)['notified'])
         self.owner(session=OTHER)
         self.b.runner.return_value = subprocess.CompletedProcess([], 0, f'Queued message {SESSION} for thread {OTHER}.\n')
         self.b.deliver()
-        self.assertTrue(cq.load_job(self.ctx, 'j1')['notified'])
+        self.assertTrue(cq.load_job(self.ctx, JOB_ID)['notified'])
         argv = self.b.runner.call_args.args[0]
         self.assertEqual(argv[:4], ['C:/tools/codex.exe', 'queue', '--thread', OTHER])
         self.b.deliver()
@@ -309,10 +436,10 @@ class BridgeTests(unittest.TestCase):
         self.b.engine = lambda name, req: {'ok': False, 'error': 'busy'} if name == 'notified' else real_engine(name, req)
         self.b.deliver()
         self.assertEqual(len(self.deliveries), 1)
-        self.assertFalse(cq.load_job(self.ctx, 'j1')['notified'])
+        self.assertFalse(cq.load_job(self.ctx, JOB_ID)['notified'])
         other = bridge.Bridge(self.ctx, self.owners, engine=real_engine, runner=self.b.runner)
         other.deliver()
-        self.assertTrue(cq.load_job(self.ctx, 'j1')['notified'])
+        self.assertTrue(cq.load_job(self.ctx, JOB_ID)['notified'])
         self.assertEqual(len(self.deliveries), 1)
 
     def test_crash_during_enqueue_holds_uncertain_attempt_across_restart(self):
@@ -323,12 +450,12 @@ class BridgeTests(unittest.TestCase):
         peer = bridge.Bridge(self.ctx, self.owners, engine=self.b.engine, runner=mock.Mock())
         peer.deliver()
         peer.runner.assert_not_called()
-        self.assertEqual(peer.call('status', {'job': 'j1'})['notice_delivery']['state'], 'uncertain')
-        self.assertFalse(cq.load_job(self.ctx, 'j1')['notified'])
+        self.assertEqual(peer.call('status', {'job': JOB_ID})['notice_delivery']['state'], 'uncertain')
+        self.assertFalse(cq.load_job(self.ctx, JOB_ID)['notified'])
         self.owner(session=OTHER)
         peer.runner = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, f'Queued message {SESSION} for thread {OTHER}.\n')
         peer.deliver()
-        self.assertTrue(cq.load_job(self.ctx, 'j1')['notified'])
+        self.assertTrue(cq.load_job(self.ctx, JOB_ID)['notified'])
 
     def test_old_owner_memory_does_not_hide_new_owner_uncertain_attempt(self):
         self.job()
@@ -340,7 +467,7 @@ class BridgeTests(unittest.TestCase):
             peer.deliver()
         self.b.deliver()
         self.assertEqual(len(self.deliveries), 1)
-        self.assertFalse(cq.load_job(self.ctx, 'j1')['notified'])
+        self.assertFalse(cq.load_job(self.ctx, JOB_ID)['notified'])
 
     def test_uncertain_attempt_survives_a_to_b_to_a_after_restarts(self):
         self.job()
@@ -356,12 +483,12 @@ class BridgeTests(unittest.TestCase):
         restarted = bridge.Bridge(self.ctx, self.owners, engine=self.b.engine, runner=mock.Mock())
         restarted.deliver()
         restarted.runner.assert_not_called()
-        self.assertFalse(cq.load_job(self.ctx, 'j1')['notified'])
-        self.assertEqual(len(bridge.read_notice_receipts(self.ctx.p('notify', 'j1.accepted.json'))), 2)
+        self.assertFalse(cq.load_job(self.ctx, JOB_ID)['notified'])
+        self.assertEqual(len(bridge.read_notice_receipts(self.ctx.p('notify', JOB_ID + '.accepted.json'))), 2)
 
     def test_legacy_receipt_is_preserved_for_prior_owner_after_handoff(self):
         self.job()
-        path = self.ctx.p('notify', 'j1.accepted.json')
+        path = self.ctx.p('notify', JOB_ID + '.accepted.json')
         old = dict(root=bridge.canonical(self.root), session=SESSION, home=bridge.canonical(self.home),
                    identity=cq.worktree_identity(str(self.root)), state='uncertain')
         cq.write_json(path, old)
@@ -377,16 +504,16 @@ class BridgeTests(unittest.TestCase):
 
     def test_legacy_accepted_receipt_retries_mark_without_requeue(self):
         self.job()
-        path = self.ctx.p('notify', 'j1.accepted.json')
+        path = self.ctx.p('notify', JOB_ID + '.accepted.json')
         cq.write_json(path, dict(root=bridge.canonical(self.root), session=SESSION,
                                 home=bridge.canonical(self.home), identity=cq.worktree_identity(str(self.root))))
         self.b.deliver()
         self.assertFalse(self.deliveries)
-        self.assertTrue(cq.load_job(self.ctx, 'j1')['notified'])
+        self.assertTrue(cq.load_job(self.ctx, JOB_ID)['notified'])
 
     def test_later_owner_mark_does_not_delete_prior_uncertain_receipt(self):
         self.job()
-        path = self.ctx.p('notify', 'j1.accepted.json')
+        path = self.ctx.p('notify', JOB_ID + '.accepted.json')
         old = dict(root=bridge.canonical(self.root), session=SESSION, home=bridge.canonical(self.home),
                    identity=cq.worktree_identity(str(self.root)), state='uncertain')
         cq.write_json(path, old)
@@ -394,7 +521,7 @@ class BridgeTests(unittest.TestCase):
         peer = bridge.Bridge(self.ctx, self.owners, engine=self.b.engine,
                              runner=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, f'Queued message {SESSION} for thread {OTHER}.\n'))
         peer.deliver()
-        self.assertTrue(cq.load_job(self.ctx, 'j1')['notified'])
+        self.assertTrue(cq.load_job(self.ctx, JOB_ID)['notified'])
         self.assertEqual(bridge.read_notice_receipts(path), {bridge.notice_receipt_key(old): old})
 
     def test_failed_attempt_write_never_calls_enqueue(self):
@@ -403,16 +530,16 @@ class BridgeTests(unittest.TestCase):
             self.b.deliver()
             self.b.deliver()
         self.assertFalse(self.deliveries)
-        self.assertEqual(self.b.call('status', {'job': 'j1'})['notice_delivery']['state'], 'uncertain')
+        self.assertEqual(self.b.call('status', {'job': JOB_ID})['notice_delivery']['state'], 'uncertain')
 
     def test_unreadable_receipt_is_held_instead_of_replayed(self):
         self.job()
-        path = Path(self.ctx.p('notify', 'j1.accepted.json'))
+        path = Path(self.ctx.p('notify', JOB_ID + '.accepted.json'))
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('{broken', encoding='utf-8')
         self.b.deliver()
         self.assertFalse(self.deliveries)
-        self.assertEqual(self.b.call('status', {'job': 'j1'})['notice_delivery']['state'], 'uncertain')
+        self.assertEqual(self.b.call('status', {'job': JOB_ID})['notice_delivery']['state'], 'uncertain')
 
     def test_failed_acceptance_write_remains_uncertain_after_restart(self):
         self.job()
@@ -429,11 +556,12 @@ class BridgeTests(unittest.TestCase):
         peer = bridge.Bridge(self.ctx, self.owners, engine=self.b.engine, runner=mock.Mock())
         peer.deliver()
         peer.runner.assert_not_called()
-        self.assertEqual(peer.call('status', {'job': 'j1'})['notice_delivery']['state'], 'uncertain')
+        self.assertEqual(peer.call('status', {'job': JOB_ID})['notice_delivery']['state'], 'uncertain')
 
     def test_busy_notice_does_not_block_later_completions(self):
-        self.job('busy')
-        self.job('ready')
+        busy, ready = 'cq-20261123T120001-aaaa', 'cq-20261123T120002-bbbb'
+        self.job(busy)
+        self.job(ready)
         original = cq.FileLock
         class Busy:
             def __enter__(self):
@@ -441,18 +569,18 @@ class BridgeTests(unittest.TestCase):
             def __exit__(self, *args):
                 pass
         def lock(path, timeout=30):
-            return Busy() if str(path).endswith('busy.lock') else original(path, timeout)
+            return Busy() if str(path).endswith(busy + '.lock') else original(path, timeout)
         with mock.patch.object(cq, 'FileLock', side_effect=lock):
             self.b.deliver()
-        self.assertFalse(cq.load_job(self.ctx, 'busy')['notified'])
-        self.assertTrue(cq.load_job(self.ctx, 'ready')['notified'])
+        self.assertFalse(cq.load_job(self.ctx, busy)['notified'])
+        self.assertTrue(cq.load_job(self.ctx, ready)['notified'])
 
     def test_successful_exit_without_exact_queue_acceptance_remains_retryable(self):
         self.job()
         for stdout in ('done', f'Queued message {SESSION} for thread {OTHER}.\n'):
             self.b.runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0, stdout))
             self.b.deliver()
-            self.assertFalse(cq.load_job(self.ctx, 'j1')['notified'])
+            self.assertFalse(cq.load_job(self.ctx, JOB_ID)['notified'])
 
     def test_completed_or_crashed_thread_is_not_resumed_by_a_completion(self):
         self.job()
@@ -460,7 +588,7 @@ class BridgeTests(unittest.TestCase):
         self.b.runner = mock.Mock()
         self.b.deliver()
         self.b.runner.assert_not_called()
-        self.assertFalse(cq.load_job(self.ctx, 'j1')['notified'])
+        self.assertFalse(cq.load_job(self.ctx, JOB_ID)['notified'])
 
     def test_owner_change_during_delivery_does_not_mark_completion_for_new_owner(self):
         self.job()
@@ -469,10 +597,10 @@ class BridgeTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, f'Queued message {SESSION} for thread {SESSION}.\n')
         self.b.runner = runner
         self.b.deliver()
-        self.assertFalse(cq.load_job(self.ctx, 'j1')['notified'])
+        self.assertFalse(cq.load_job(self.ctx, JOB_ID)['notified'])
         self.b.runner = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, f'Queued message {SESSION} for thread {OTHER}.\n')
         self.b.deliver()
-        self.assertTrue(cq.load_job(self.ctx, 'j1')['notified'])
+        self.assertTrue(cq.load_job(self.ctx, JOB_ID)['notified'])
 
     def test_reused_worktree_path_does_not_receive_a_prior_completion(self):
         identity = cq.worktree_identity(str(self.root))
@@ -480,13 +608,13 @@ class BridgeTests(unittest.TestCase):
         self.job(worktree_identity=identity)
         self.b.deliver()
         self.assertFalse(self.deliveries)
-        self.assertFalse(cq.load_job(self.ctx, 'j1')['notified'])
+        self.assertFalse(cq.load_job(self.ctx, JOB_ID)['notified'])
 
     def test_legacy_completion_is_held_for_a_different_session(self):
         self.job(session=OTHER, worktree_identity=None)
         self.b.deliver()
         self.assertFalse(self.deliveries)
-        self.assertFalse(cq.load_job(self.ctx, 'j1')['notified'])
+        self.assertFalse(cq.load_job(self.ctx, JOB_ID)['notified'])
 
     def test_completion_uses_recipient_home_without_parent_session_or_auth_override(self):
         self.job()
@@ -538,7 +666,7 @@ class BridgeTests(unittest.TestCase):
         self.owners.git = changed_owner
         self.b.deliver()
         self.assertFalse(self.deliveries)
-        self.assertFalse(cq.load_job(self.ctx, 'j1')['notified'])
+        self.assertFalse(cq.load_job(self.ctx, JOB_ID)['notified'])
 
     def test_shared_lock_rereads_notified_to_prevent_duplicate(self):
         self.job()
@@ -561,16 +689,37 @@ class BridgeTests(unittest.TestCase):
         first.join(2)
         self.assertEqual(len(calls), 1)
 
-    def test_notice_logs_are_bounded_quoted_and_controls_scrubbed(self):
-        text = bridge.notice_text({'id': 'j', 'label': 'bad\x1b\nlabel',
-                                   'tail': ['x' * 400 + '\x1b\u202e'] * 45})
-        lines = text.splitlines()
-        quoted = [line for line in lines if line.startswith('[compute-queue] > ')]
-        self.assertEqual(len(quoted), 40)
-        self.assertTrue(all(len(line.removeprefix('[compute-queue] > ')) == 300 for line in quoted))
-        self.assertNotIn('\x1b', text)
-        self.assertNotIn('\u202e', text)
-        self.assertIn('not instructions', text)
+    def test_notice_sends_only_machine_id_status_and_exit(self):
+        payload = "payload-sentinel"
+        self.job(exit=0, label=payload, reason=payload, host_id=payload, placed_where=payload,
+                 log_path=payload, minutes=payload, tail=[payload], parts_info=[{'log': payload}],
+                 out_paths=[payload], artifact_missing=[payload], artifact_digests=[{'path': payload}],
+                 artifact_text=[{'path': payload, 'lines': [payload]}])
+
+        self.b.deliver()
+
+        self.assertEqual(self.deliveries[0][-1], f'[compute-queue] Job {JOB_ID} ended (done, exit 0).'
+                         ' Use compute-queue status with this job ID for details.')
+        self.assertTrue(cq.load_job(self.ctx, JOB_ID)['notified'])
+
+    def test_malformed_notice_fields_cannot_block_a_later_completion(self):
+        invalid = self.job('cq-spoofed-id', label='invalid machine ID')
+        bad_status = self.job('cq-20261123T120001-bbbb', status='invented status')
+        ready = self.job('cq-fleet-20261123T120000-0123456789abcdef', status='timeout',
+                         exit='invalid exit code')
+        self.b.deliver([invalid, bad_status, ready])
+
+        self.assertEqual([argv[-1] for argv in self.deliveries],
+                         [f'[compute-queue] Job {ready["id"]} ended (timeout).'
+                          ' Use compute-queue status with this job ID for details.'])
+        self.assertFalse(cq.load_job(self.ctx, invalid['id'])['notified'])
+        self.assertFalse(cq.load_job(self.ctx, bad_status['id'])['notified'])
+        self.assertTrue(cq.load_job(self.ctx, ready['id'])['notified'])
+
+    def test_notice_exit_rejects_booleans_floats_and_large_integers(self):
+        for exit_code in (True, 1.5, 2**32, -(2**31) - 1):
+            with self.subTest(exit_code=exit_code):
+                self.assertIn('ended (failed).', bridge.notice_text(JOB_ID, 'failed', exit_code))
 
     def test_headless_and_role_never_start_scheduler(self):
         self.b.interactive = False
@@ -580,15 +729,6 @@ class BridgeTests(unittest.TestCase):
         other = bridge.Bridge(self.ctx, self.owners)
         other.start()
         self.assertIsNone(other.worker)
-
-    def test_successful_command_can_have_incomplete_artifact_delivery(self):
-        text = bridge.notice_text({'id': 'j', 'status': 'done', 'exit': 0,
-                                  'artifact_missing': ['movie.mp4'],
-                                  'artifact_digests': [{'path': 'frame.png', 'sha256': 'a' * 64}]})
-        self.assertIn('Incomplete artifact delivery', text)
-        self.assertIn('movie.mp4', text)
-        self.assertIn('does not establish that all requested files were delivered', text)
-        self.assertIn('Verified artifact digests', text)
 
     def test_pollers_share_lock_but_both_serve_status_and_transfer_after_release(self):
         entered, release, released, second_entered = (threading.Event() for _ in range(4))
@@ -622,7 +762,7 @@ class BridgeTests(unittest.TestCase):
     def test_old_poller_lock_does_not_block_private_controller_or_notice(self):
         import hashlib
         ensured, delivered = threading.Event(), threading.Event()
-        self.job('private-job', defer='spare')
+        self.job(defer='spare')
         original_engine, original_runner = self.b.engine, self.b.runner
         def engine(name, req):
             if name == 'ensure_deferred':
@@ -641,7 +781,7 @@ class BridgeTests(unittest.TestCase):
             self.b.start()
             self.assertTrue(ensured.wait(2))
             self.assertTrue(delivered.wait(2))
-        self.assertTrue(cq.load_job(self.ctx, 'private-job')['notified'])
+        self.assertTrue(cq.load_job(self.ctx, JOB_ID)['notified'])
 
     def test_process_death_releases_poller_lock(self):
         import hashlib
@@ -683,7 +823,7 @@ class BridgeTests(unittest.TestCase):
         peer = bridge.Bridge(self.ctx, self.owners, engine=self.b.engine, runner=mock.Mock())
         peer.deliver()
         peer.runner.assert_not_called()
-        self.assertFalse(cq.load_job(self.ctx, 'j1')['notified'])
+        self.assertFalse(cq.load_job(self.ctx, JOB_ID)['notified'])
 
     def test_transient_poll_lock_error_retries_without_log_flood(self):
         entered = threading.Event()
@@ -827,6 +967,7 @@ class BridgeTests(unittest.TestCase):
         self.b.engine = engine
         requests = [{'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {}}]
         for ident in (2, 3, 4):
+            self.job(str(ident))
             requests.append({'jsonrpc': '2.0', 'id': ident, 'method': 'tools/call',
                              'params': {'name': 'wait', 'arguments': {'job': str(ident)}}})
         requests.append({'jsonrpc': '2.0', 'id': 5, 'method': 'tools/call', 'params': {'name': 'status'}})

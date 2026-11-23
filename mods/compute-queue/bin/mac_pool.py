@@ -25,7 +25,8 @@ macOS has neither cgroups nor Job Objects, so containment is a set of process-le
                  sums the physical footprint of the tree every MEM_POLL_S and, only while the pressure level is warn or
                  critical and the submitter declared a cap, kills the tree above that cap and records exit 137. At
                  normal pressure a job may exceed its cap (macOS compresses and swaps); that is written to the job log
-                 once. A watchdog, not a kernel limit: a job can exceed its cap between two looks.
+                 once. A cap the queue derived (none stated) is enforced only at critical pressure and at 1.5 times its
+                 size, so a runaway is stopped. A watchdog, not a kernel limit: a job can exceed its cap between looks.
   CPU            admission only (cpu_slots against the pool). Nothing caps a running job's CPU time.
   sleep          `caffeinate -i -w <job>` keeps the Mac awake while the job runs. Closing the lid still sleeps it.
   orphans        a guard process (`mac_pool.py --guard`), started before the job and told its pid through a pipe,
@@ -71,6 +72,9 @@ TERMINAL_PHASES = ("done", "failed", "cancelled", "timeout")
 MEMORY_KIND = "macos-footprint"
 PS_MAX_AGE_S = 1.0      # a process-table sample is shared by every runner thread of this process for this long
 TAG_ENV = "CQ_FLEET_JOB"   # exported for observability; no decision reads it
+RUNTIME_ENV = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_COLLATE", "LC_CTYPE",
+               "LC_MESSAGES", "LC_MONETARY", "LC_NUMERIC", "LC_TIME")
+JOB_METADATA_ENV = ("CQ_JOB", "CQ_SHA", "CQ_BASE", "CQ_SRC", "GIT_CEILING_DIRECTORIES")
 SWAP_RE = re.compile(r"used\s*=\s*([0-9.]+)([KMGT])", re.I)
 
 
@@ -525,6 +529,7 @@ def boot_identity():
         return None
 
 
+DERIVED_CAP_FACTOR = 1.5   # a queue-derived (unstated) cap is enforced at this multiple, at critical pressure only
 PRESSURE_NAMES = {1: "normal", 2: "warn", 4: "critical"}   # kern.memorystatus_vm_pressure_level (DISPATCH_MEMORYPRESSURE_*)
 PRESSURE_SYSCTL = "kern.memorystatus_vm_pressure_level"
 
@@ -634,6 +639,17 @@ def _job_name(d):
     return "cq-fleet-" + d["id"] + "-" + d["nonce"]
 
 
+def _job_environment(d):
+    # PATH and HOME keep installed tools and per-user toolchains available. Descriptor variables
+    # are limited to queue metadata because this environment also starts the shell that gates launch.
+    env = {name: os.environ[name] for name in RUNTIME_ENV if name in os.environ}
+    env.setdefault("PATH", os.defpath)
+    metadata = d["env"]
+    env.update((name, metadata[name]) for name in JOB_METADATA_ENV if name in metadata)
+    env[TAG_ENV] = _job_name(d)
+    return env
+
+
 def tree_path(d):
     return os.path.join(os.path.dirname(os.path.abspath(d["result_path"])), "tree.json")
 
@@ -703,9 +719,7 @@ def _spawn(d):
     """Start the job in its own session, tagged, at normal priority, held at a pipe: it runs its command (by exec, so the
     pid stays) when the returned fd gets a line, and exits when the fd is closed unwritten. The runner registers the
     pid with the tracker first, so the job's first fork is seen. Returns (Popen, go fd)."""
-    env = dict(os.environ)
-    env.update(d["env"])
-    env[TAG_ENV] = _job_name(d)
+    env = _job_environment(d)
     read_end, write_end = os.pipe()
     log = os.open(d["log_path"], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
@@ -911,7 +925,14 @@ def run(descriptor_path, gate=None, on_claim=None, expected_hash=None):
                 try:
                     found, used = audit()
                     state.update(active_processes=len(found), peak_private_bytes=max(state["peak_private_bytes"], used))
-                    if used > cap_bytes and enforce:
+                    if used > cap_bytes and not enforce and used > cap_bytes * DERIVED_CAP_FACTOR and memory_pressure() == 4:
+                        # no cap was stated, so none is enforced; but a runaway at critical pressure is stopped at the
+                        # queue-derived cap x DERIVED_CAP_FACTOR (at warn or normal pressure nothing happens)
+                        outcome, code = "failed", 137
+                        state["reason"] = ("memory cap exceeded under critical memory pressure: the job's processes use %.2f GB, "
+                                           "the queue-derived cap is %g GB (enforced at %g x it, as none was stated)"
+                                           % (used / 2 ** 30, d["memory_max_gb"], DERIVED_CAP_FACTOR))
+                    elif used > cap_bytes and enforce:
                         level = memory_pressure()
                         if level in (2, 4):
                             outcome, code = "failed", 137

@@ -629,8 +629,9 @@ def _owner_process(owner: dict, worktree: Path) -> dict:
         return {}
     from .hook import _attached_to, _pid_alive, _session_in_root
     root = config.norm(worktree)
-    attached = _attached_to(sid, root)
-    for account in config.account_names("claude"):
+    account = owner.get("account")
+    for account in [account] if isinstance(account, str) and account else config.account_names("claude"):
+        attached = _attached_to(sid, root, vendor="claude", account=account)
         try:
             files = list((config.account_dir("claude", account) / "sessions").glob("*.json"))
         except OSError:

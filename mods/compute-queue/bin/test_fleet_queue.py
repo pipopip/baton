@@ -75,6 +75,9 @@ class FleetTests(unittest.TestCase):
             if args and args[0] == 'rev-parse':
                 return 'a' * 40
             raise AssertionError(args)
+        # no test reaches the real heavy lock of this machine's queue: the laptop's lock is one in the test's own state
+        self.heavy = patch.object(cq, 'HEAVY_LOCK', str(self.state / 'heavy.lock'))
+        self.heavy.start(); self.addCleanup(self.heavy.stop)
         self.git = patch.object(cq, 'git', side_effect=fake_git)
         self.git.start(); self.addCleanup(self.git.stop)
         self.snapshot = patch.object(cq, 'snapshot', return_value=('a' * 40, False))

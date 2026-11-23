@@ -46,6 +46,7 @@ MEMORY_NEVER = 'RAM cap and floor exceed host memory'
 LOAD_NEVER = 'slot load exceeds host load cap'
 NO_LAPTOP = 'the laptop is not an executor on this machine'  # _reserve: the laptop is no candidate on a machine that is neither the Windows laptop nor the Mac (or is switched off there)
 NEVER_FITS = (SLOTS_NEVER, MEMORY_NEVER, LOAD_NEVER, NO_LAPTOP)
+LOW_MEMORY_SHARE = 0.10   # _fit: a Mac's laptop takes no new work while less than this share of its memory is available
 LAPTOP_LONG = 'job runs longer than laptop_max_minutes'  # _fit: the laptop's reason for leaving a long job to the hosts; _reserve overrides it when no host can ever take the job
 OVERCOMMIT_WAIT = 'fleet memory caps exceed the overcommit bound'  # _fit: a temporary reason, never a never-fits one
 CPU_OVERCOMMIT_WAIT = queue_policy.CPU_QUOTA_WAIT  # _fit: temporary too (the host's fleet_reason says the same)
@@ -355,7 +356,7 @@ def _submit(ctx, req):
     identity = e.worktree_identity(top)
     owner = e.read_json(os.path.join(top, '.baton', 'owner.json'))
     session = req.get('session') or ''
-    if identity is None or not isinstance(owner, dict) or not session or owner.get('session_id') != session:
+    if identity is None or not e.owner_matches(owner, session, claude_home=ctx.claude_home):
         _error('fleet submission requires the current worktree owner session')
     now = ctx.now()
     jid = e.new_id(now, 'fleet')
@@ -407,7 +408,7 @@ def _submit(ctx, req):
             if e.load_job(ctx, jid) or identity != e.worktree_identity(top):
                 _error('job collision or worktree changed before acceptance')
             current_owner = e.read_json(os.path.join(top, '.baton', 'owner.json'))
-            if not isinstance(current_owner, dict) or current_owner.get('session_id') != session:
+            if not e.owner_matches(current_owner, session, claude_home=ctx.claude_home):
                 _error('worktree owner changed before acceptance')
             legacy_ctx = _legacy_context(ctx)
             if legacy_ctx is ctx:
@@ -642,12 +643,12 @@ def _laptop_config(ctx, probe):
                 max_minutes=max_minutes, needs_ac=needs_ac, pressure_gated=mac)
 
 
-def laptop_figures(ctx):
+def laptop_figures(ctx, raw=None):
     """The laptop's slots used and total, RAM floor (0 on a Mac, which gates on memory pressure instead) and battery
     rule as admission reads them (the fleet config and the fleet jobs on the laptop), for the ordinary capacity sample
-    and the lead's text; {} when they cannot be told."""
+    and the lead's text; {} when they cannot be told. `raw` is a probe the caller already took (one sample, one probe)."""
     try:
-        raw = _local('pool').probe()
+        raw = raw if isinstance(raw, dict) else _local('pool').probe()
         config = _laptop_config(ctx, raw) if isinstance(raw, dict) else None
         if not config or raw.get('supported') is not True:
             return {}
@@ -937,6 +938,13 @@ def _fit(ctx, job, probe, jobs, now, explain=False, queue=False, ignore_limit=Fa
             return no(verdict)
         if gated and data.get('pressure') in (2, 4):
             return no(f"memory pressure is {'warn' if data['pressure'] == 2 else 'critical'}: no new laptop work until it is normal")
+        # Pressure lags: a burst of starts can fill the memory before warn shows, and a level that cannot be read says
+        # nothing. So also hold while what is available is under a tenth of the memory: an observation of the machine,
+        # not a floor or a reservation.
+        if gated and _num(data.get('total_gb'), 0.001) and _num(data.get('available_gb'), 0) \
+                and data['available_gb'] < LOW_MEMORY_SHARE * data['total_gb']:
+            return no(f"available memory is low ({data['available_gb']:.1f} of {data['total_gb']:.0f} GB): "
+                      "no new laptop work until it recovers")
         if cfg.get('needs_ac') and data.get('on_battery') is True:
             return no('on battery power (laptop_needs_ac): no new fleet work until AC')
         limit = cfg.get('max_minutes')
@@ -1035,8 +1043,10 @@ def _fits_idle(job, probe):
         return False
     if probe['host'] == 'laptop':
         cfg = probe['config']
+        # a Mac reserves no memory: no size is too big for it once it is idle
         return (cfg['enabled'] and not job.get('requested_defer') and job['slots'] <= cfg['slots'] and
-                job['memory_max_gb'] + max(cfg['ram_floor_gb'], cfg['commit_floor_gb']) <= data['total_gb'])
+                (cfg.get('pressure_gated') is True or
+                 job['memory_max_gb'] + max(cfg['ram_floor_gb'], cfg['commit_floor_gb']) <= data['total_gb']))
     policy = data['policy']
     return (job['slots'] <= policy['pool_slots'] - policy.get('foreground_slots', 2) and
             job['memory_max_gb'] + policy['ram_floor_gb'] <= data['total_bytes'] / GIB and
@@ -3006,7 +3016,7 @@ def _cancel(ctx, req):
         if identity is None or identity != job.get('worktree_identity'):
             _error('fleet cancellation worktree identity changed')
         owner = e.read_json(os.path.join(top, '.baton', 'owner.json'))
-        if not isinstance(owner, dict) or owner.get('session_id') != session:
+        if not e.owner_matches(owner, session, claude_home=ctx.claude_home):
             _error('fleet cancellation requires the current worktree owner')
         if job['status'] in TERMINAL:
             return {'ok': True, 'job': jid, 'status': job['status'], 'note': 'already finished'}
@@ -3040,6 +3050,7 @@ def execute(ctx, command, req):
         return _cancel(ctx, req)
     if command in ('status', 'get'):
         job = _get(ctx, req.get('job'))
+        e.authorize_job_read(req, job)
         refresh = None
         if command == 'status' and req.get('refresh'):
             if job['status'] in TERMINAL and (job.get('artifact_missing') or job.get('artifact_pending')):
@@ -3048,17 +3059,20 @@ def execute(ctx, command, req):
                 elif job.get('host_id') and job.get('host_id') != 'laptop':
                     refresh = e.refresh_deferred(ctx, job)
                     latest = _get(ctx, job['id'])
+                    e.authorize_job_read(req, latest)
                     if refresh.get('ok') and not latest.get('artifact_missing'):
                         e.drop_ref(latest.get('top'), latest['id'])
             elif job['status'] in ('launching', 'running'):
                 if job.get('host_id') == 'laptop':
                     _local_reconcile(ctx, job)
                     latest = _get(ctx, job['id'])
+                    e.authorize_job_read(req, latest)
                     refresh = {'ok': latest.get('status') in TERMINAL or not latest.get('launch_uncertain'),
                                'cached': bool(latest.get('launch_uncertain'))}
                 elif job.get('host_id') and job.get('host_id') != 'laptop':
                     refresh = _remote_reconcile(ctx, job, explicit=True)
             job = _get(ctx, job['id'])
+            e.authorize_job_read(req, job)
         delivered = {}
         if job['status'] in TERMINAL:   # the caller has the result: no notice repeats it
             marked = e.mark_delivered(ctx, job['id'], req.get('seen_by'), 'status')
@@ -3069,6 +3083,7 @@ def execute(ctx, command, req):
         deadline = time.monotonic() + max(1, min(540, int(req.get('timeout_s') or 540)))
         while True:
             job = _get(ctx, req.get('job'))
+            e.authorize_job_read(req, job)
             if job['status'] in TERMINAL:
                 marked = e.mark_delivered(ctx, job['id'], req.get('seen_by'), 'wait')
                 return {'ok': True, 'ended': True, 'delivered': bool(marked or job.get('notified')),
@@ -3123,14 +3138,15 @@ def augment(ctx, command, req, result):
     elif command in ('watch', 'tick'):
         watch = dict(result.get('watch') or {})
         root, session = req.get('root') or '', req.get('watch_session') or req.get('session') or ''
-        top = e._top_of(root) if root and os.path.isdir(root) else root
+        top = e.watch_top(ctx, root, session)
         identity = e.worktree_identity(top) if top else None
-        mine = [j for j in jobs if identity is not None and e.notice_matches_worktree(j, top, identity, session)]
+        mine = [j for j in jobs if identity is not None
+                and e.notice_matches_worktree(j, top, identity, session, strict=ctx.claude_home is not None)]
         watch['mine_running'] = watch.get('mine_running', 0) + sum(j.get('status') in ('launching', 'running') for j in mine)
         watch['mine_queued'] = watch.get('mine_queued', 0) + sum(j.get('status') == 'queued' for j in mine)
         watch['queued'] = watch.get('queued', 0) + sum(j.get('status') == 'queued' for j in jobs)
         owner = e.read_json(os.path.join(top, '.baton', 'owner.json')) if top else None
-        if isinstance(owner, dict) and owner.get('session_id') == session:
+        if e.owner_matches(owner, session, claude_home=ctx.claude_home):
             pending = [j for j in mine if j.get('status') in TERMINAL and j.get('notify', True) and not j.get('notified')]
             watch['to_notify'] = list(watch.get('to_notify') or []) + [e.notice_data(j) for j in pending]
             extra = e.attention_counts(pending)

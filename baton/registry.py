@@ -9,9 +9,10 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 from pathlib import Path
 
-from . import config, harvest, paths
+from . import config, harvest, locking, paths
 
 REGISTRY_NAME = "registry.json"
 ATTACHED_NAME = "attached.json"
@@ -92,7 +93,8 @@ def update(worktree: str | Path, vendor: str, ws: str | None = None, **fields) -
         item["ws"] = ws
     item["last_vendor"] = vendor
     rec = item.setdefault(vendor, {})
-    if fields.get("session_id") and rec.get("session_id") != fields["session_id"]:
+    if fields.get("session_id") and (rec.get("session_id") != fields["session_id"]
+                                    or fields.get("account") and rec.get("account") != fields["account"]):
         rec.clear()
     rec.update({k: v for k, v in fields.items() if v is not None})
     rec.setdefault("last_seen", time.time())
@@ -108,38 +110,32 @@ def remove(worktree: str | Path) -> bool:
     return True
 
 
-def detach_session(session_id: str, keep: str | Path, *, vendor: str | None = None,
-                   account: str | None = None) -> list[str]:
-    """Drop ``session_id`` from the vendor records of every worktree except ``keep`` (``bt attach`` moved it).
+def _names_session(item: object, session_id: str, vendor: str, account: str) -> bool:
+    rec = item.get(vendor) if isinstance(item, dict) else None
+    return isinstance(rec, dict) and rec.get("session_id") == session_id and rec.get("account") == account
 
-    A worktree left without any vendor record loses its entry; otherwise ``last_vendor`` falls back to a
-    remaining vendor when it named the dropped one. Returns the paths of the worktrees touched.
-    """
+
+def session_worktrees(session_id: str, *, vendor: str, account: str) -> dict[str, str]:
+    """Worktrees whose registry entry names this identity."""
+    return {key: str(item.get("path") or key) for key, item in _load_quiet()["worktrees"].items()
+            if _names_session(item, session_id, vendor, account)}
+
+
+def detach_session(worktree: str | Path, session_id: str, *, vendor: str, account: str) -> bool:
+    """Drop the record of an exact identity from one worktree on attach."""
     data = load()
-    keep_key = config.norm(keep)
-    touched = []
-    for key, item in list(data["worktrees"].items()):
-        if key == keep_key or not isinstance(item, dict):
-            continue
-        dropped = False
-        for record_vendor in config.VENDORS:
-            rec = item.get(record_vendor)
-            if (isinstance(rec, dict) and rec.get("session_id") == session_id
-                    and (vendor is None or record_vendor == vendor)
-                    and (account is None or rec.get("account") == account)):
-                del item[record_vendor]
-                dropped = True
-        if not dropped:
-            continue
-        touched.append(str(item.get("path") or key))
-        remaining = [v for v in config.VENDORS if isinstance(item.get(v), dict)]
-        if not remaining:
-            del data["worktrees"][key]
-        elif item.get("last_vendor") not in remaining:
-            item["last_vendor"] = remaining[0]
-    if touched:
-        _save(data)
-    return touched
+    key = config.norm(worktree)
+    item = data["worktrees"].get(key)
+    if not _names_session(item, session_id, vendor, account):
+        return False
+    del item[vendor]
+    remaining = [v for v in config.VENDORS if isinstance(item.get(v), dict)]
+    if not remaining:
+        del data["worktrees"][key]
+    elif item.get("last_vendor") == vendor:
+        item["last_vendor"] = remaining[0]
+    _save(data)
+    return True
 
 
 # ------------------------------------------------------------------- startup list
@@ -183,11 +179,15 @@ def startup_add(worktree: str | Path, vendor: str, account: str, session_id: str
     wkey = config.norm(worktree)
     entries = startup_entries()
     mine = next((e for e in entries if config.norm(e["path"]) == wkey), None)
-    if (min_age and mine is not None and mine.get("session_id") == session_id and mine.get("vendor") == vendor and mine.get("account") == account
+    def matches_session(entry: dict) -> bool:
+        return (entry.get("session_id") == session_id and entry.get("vendor") == vendor
+                and entry.get("account") == account)
+
+    if (min_age and mine is not None and matches_session(mine)
             and isinstance(mine.get("updated_at"), (int, float)) and 0 <= now - mine["updated_at"] < min_age):
         return False
-    kept = [e for e in entries if config.norm(e["path"]) != wkey and not (session_id and e.get("session_id") == session_id and e.get("vendor") == vendor and e.get("account") == account)
-            and _startup_live(e, now)]
+    kept = [e for e in entries
+            if config.norm(e["path"]) != wkey and not (session_id and matches_session(e)) and _startup_live(e, now)]
     kept.append({"path": str(worktree), "key": paths.key_for(Path(worktree)), "vendor": vendor, "account": account,
                  "session_id": session_id, "updated_at": now})
     startup_save(kept, now)
@@ -242,34 +242,63 @@ def startup_drop_session(session_id: str, keep: str | Path | None = None, *,
 
 # ------------------------------------------------------------------- attached sessions
 #
-# ``bt attach`` maps a session that started outside a worktree (for example in C:/Work) to the
-# worktree it works in, so hooks can resolve that worktree from the session id instead of the cwd.
-# attached.json: {session_id: {worktree, vendor, account, transcript, attached_at}}.
+# Keys encode (vendor, account, session_id). Older books used the session ID
+# alone as the key and carried the vendor and account in the record.
 
 
 def attached_path() -> Path:
     return config.STATE_DIR / ATTACHED_NAME
 
 
-def attached_load() -> dict:
-    """attached.json contents; ``{}`` when missing or unreadable. Hooks call this, so it never raises."""
+def attached_lock():
+    """Serialize writes and moves between worktrees. Acquire this before any owner lock."""
+    return locking.exclusive(attached_path().with_suffix(".lock"), timeout=10)
+
+
+def attached_load(*, strict: bool = False) -> dict:
+    """Read the attachment book. Hooks tolerate unreadable books, while writers preserve them."""
     try:
         with open(attached_path(), encoding="utf-8") as fh:
             data = json.load(fh)
-    except (OSError, ValueError):
+        if isinstance(data, dict):
+            return data
+        raise ValueError("expected an object")
+    except FileNotFoundError:
         return {}
-    return data if isinstance(data, dict) else {}
+    except (OSError, ValueError) as exc:
+        if strict:
+            raise OSError(f"cannot read {attached_path()}") from exc
+        return {}
 
 
-def attached_worktree(session_id: str | None, data: dict | None = None) -> Path | None:
-    """Worktree ``session_id`` was attached to, when that directory still exists."""
+def _attachment_key(vendor: str, account: str, session_id: str) -> str:
+    return json.dumps([vendor, account, session_id], separators=(",", ":"))
+
+
+def attached_record(session_id: str | None, *, vendor: str, account: str, data: dict | None = None) -> dict | None:
+    """Look up one identity, including a legacy record that explicitly matches it."""
     if not isinstance(session_id, str) or not session_id:
         return None
-    rec = (attached_load() if data is None else data).get(session_id)
-    target = rec.get("worktree") if isinstance(rec, dict) else None
-    if isinstance(target, str) and target and os.path.isdir(target):
-        return Path(target)
+    data = attached_load() if data is None else data
+    key = _attachment_key(vendor, account, session_id)
+    for row_key, row_sid in ((key, session_id), (session_id, None)):
+        rec = data.get(row_key)
+        if (isinstance(rec, dict) and rec.get("session_id") == row_sid
+                and rec.get("vendor") == vendor and rec.get("account") == account
+                and isinstance(rec.get("worktree"), str) and rec["worktree"]):
+            return rec
     return None
+
+
+def attachment_target(record: dict | None) -> Path | None:
+    """Return the mapped directory if it still exists."""
+    target = record["worktree"] if record else None
+    return Path(target) if target and os.path.isdir(target) else None
+
+
+def attached_worktree(session_id: str | None, *, vendor: str, account: str) -> Path | None:
+    """Worktree attached to this identity, when that directory still exists."""
+    return attachment_target(attached_record(session_id, vendor=vendor, account=account))
 
 
 def attached_worktrees() -> set[str]:
@@ -280,14 +309,32 @@ def attached_worktrees() -> set[str]:
 
 def attach_record(session_id: str, worktree: str | Path, vendor: str, account: str,
                   transcript: str | None, now: float | None = None) -> None:
-    """Add or replace one attached session and drop entries older than 14 days (atomic write with retries)."""
+    """Add or replace one attachment and drop entries older than 14 days."""
+    with attached_lock():
+        _attach_record_locked(attached_load(strict=True), session_id, worktree, vendor, account, transcript, now)
+
+
+def _attach_record_locked(data: dict, session_id: str, worktree: str | Path, vendor: str, account: str,
+                          transcript: str | None, now: float | None = None) -> None:
     now = time.time() if now is None else now
-    data = attached_load()
     kept = {}
-    for sid, rec in data.items():
+    legacy = {}
+    for row_key, rec in data.items():
         stamp = harvest.parse_iso(rec.get("attached_at")) if isinstance(rec, dict) else None
-        if stamp is not None and now - stamp <= ATTACHED_RETENTION:
-            kept[sid] = rec
-    kept[session_id] = {"worktree": str(worktree), "vendor": vendor, "account": account,
-                        "transcript": transcript, "attached_at": harvest.iso_now(now)}
-    harvest.atomic_write(attached_path(), json.dumps(kept, indent=1, sort_keys=True))
+        if stamp is None or now - stamp > ATTACHED_RETENTION:
+            continue
+        row_vendor, row_account = rec.get("vendor"), rec.get("account")
+        sid = rec.get("session_id", row_key)
+        if (row_vendor not in config.VENDORS or not isinstance(row_account, str) or not row_account
+                or not isinstance(sid, str) or not sid
+                or not isinstance(rec.get("worktree"), str) or not rec["worktree"]):
+            continue
+        key = _attachment_key(row_vendor, row_account, sid)
+        if "session_id" not in rec:
+            legacy[key] = {**rec, "session_id": sid}
+        elif row_key == key:
+            kept[key] = rec
+    key = _attachment_key(vendor, account, session_id)
+    kept[key] = {"worktree": str(worktree), "vendor": vendor, "account": account, "session_id": session_id,
+                 "transcript": transcript, "attached_at": harvest.iso_now(now), "binding_id": uuid.uuid4().hex}
+    harvest.atomic_write(attached_path(), json.dumps({**legacy, **kept}, indent=1, sort_keys=True))

@@ -150,7 +150,8 @@ def _owner_last_active(root: Path, owner: dict) -> float | None:
     or the registry's ``last_seen`` for that very session. None when nothing is known."""
     stamps = [config.mtime(owner.get("transcript")), harvest.parse_iso(owner.get("claimed_at"))]
     rec = registry.session(root, str(owner.get("vendor") or ""))
-    if isinstance(rec, dict) and rec.get("session_id") == owner.get("session_id"):
+    if (isinstance(rec, dict) and rec.get("session_id") == owner.get("session_id")
+            and rec.get("account") == owner.get("account")):
         last_seen = rec.get("last_seen")
         if isinstance(last_seen, (int, float)) and not isinstance(last_seen, bool):
             stamps.append(float(last_seen))
@@ -177,11 +178,10 @@ def _pid_alive(pid: int) -> bool:
         kernel32.CloseHandle(handle)
 
 
-def _attached_to(session_id: str, root: str) -> bool:
-    """Whether ``bt attach`` bound ``session_id`` to the worktree whose ``config.norm`` key is ``root``."""
-    rec = registry.attached_load().get(session_id)
-    target = rec.get("worktree") if isinstance(rec, dict) else None
-    return isinstance(target, str) and bool(target) and config.norm(target) == root
+def _attached_to(session_id: str, root: str, *, vendor: str, account: str) -> bool:
+    """Whether the given identity is attached to the normalized worktree path."""
+    rec = registry.attached_record(session_id, vendor=vendor, account=account)
+    return rec is not None and config.norm(rec["worktree"]) == root
 
 
 def _session_in_root(rec: dict, root: str) -> bool:
@@ -193,11 +193,57 @@ def _session_in_root(rec: dict, root: str) -> bool:
     return found is not None and config.norm(found) == root
 
 
+def _codex_rollout_home(transcript: object, sid: str) -> Path | None:
+    """Recover an older claim's home from its native rollout path."""
+    if not isinstance(transcript, str) or not transcript:
+        return None
+    path = Path(transcript)
+    if not (path.is_absolute() and path.name.startswith("rollout-") and path.name.endswith(f"-{sid}.jsonl")):
+        return None
+    if len(path.parts) < 6 or path.parts[-5] != "sessions":
+        return None
+    if not all(len(part) == digits and part.isascii() and part.isdecimal()
+               for part, digits in zip(path.parts[-4:-1], (4, 2, 2))):
+        return None
+    return path.parents[4]
+
+
+def _codex_owner_homes(owner: dict, sid: str) -> list[Path]:
+    recorded = owner.get("config_home")
+    if isinstance(recorded, str) and Path(recorded).is_absolute():
+        return [Path(recorded)]
+    account = owner.get("account")
+    rollout_home = _codex_rollout_home(owner.get("transcript"), sid)
+    if rollout_home is not None and (not account or account == config.account_from_env(
+            "codex", {config.ACCOUNT_ENV["codex"]: str(rollout_home)})):
+        return [rollout_home]
+    configured = config.account_names("codex")
+    if account in configured:
+        return [config.account_dir("codex", account)]
+    if account:
+        return []
+    return [config.account_dir("codex", name) for name in configured]
+
+
+def _codex_owner_alive(owner: dict, sid: str) -> bool | None:
+    if sid in {".", ".."} or any(char in sid for char in "/\\:\0"):
+        return None
+    uncertain = False
+    unlocked = False
+    for home in _codex_owner_homes(owner, sid):
+        state = locking.codex_writer_lock(home / "thread-writer-locks" / f"{sid}.lock")
+        if state is locking.WriterLockState.HELD:
+            return True
+        uncertain |= state is locking.WriterLockState.UNKNOWN
+        unlocked |= state is locking.WriterLockState.UNLOCKED
+    return False if unlocked and not uncertain else None
+
+
 def owner_process_alive(owner: dict, root: Path | None = None) -> bool | None:
     """Whether the session named in ``owner.json`` is still running: True, False, or None (cannot tell).
 
     Claude Code lists running sessions as ``<config_dir>/sessions/<pid>.json`` with a
-    ``sessionId``; Codex holds ``<home>/thread-writer-locks/<thread>.lock`` open while a
+    ``sessionId``; Codex locks ``<home>/thread-writer-locks/<thread>.lock`` while a
     thread runs. SessionEnd hooks do not run when a terminal is closed, so the process
     is the reliable signal.
 
@@ -212,10 +258,19 @@ def owner_process_alive(owner: dict, root: Path | None = None) -> bool | None:
     vendor = owner.get("vendor")
     if vendor == "claude":
         root_key = config.norm(root) if root is not None else None
-        attached_here = root_key is not None and _attached_to(sid, root_key)
         seen_dir = False
-        for account in config.account_names("claude"):
-            sessions = config.account_dir("claude", account) / "sessions"
+        claimed_account = owner.get("account")
+        configured = config.account_names("claude")
+        accounts = [claimed_account] if claimed_account else configured
+        for account in accounts:
+            attached_here = root_key is not None and _attached_to(sid, root_key, vendor=vendor, account=account)
+            home = owner.get("config_home")
+            if isinstance(home, str) and os.path.isabs(home):
+                sessions = Path(home) / "sessions"
+            elif account in configured:
+                sessions = config.account_dir("claude", account) / "sessions"
+            else:
+                continue
             if not sessions.is_dir():
                 continue
             seen_dir = True
@@ -236,21 +291,7 @@ def owner_process_alive(owner: dict, root: Path | None = None) -> bool | None:
                     return alive
         return False if seen_dir else None
     if vendor == "codex":
-        found_dir = False
-        for account in config.account_names("codex"):
-            locks = config.account_dir("codex", account) / "thread-writer-locks"
-            if not locks.is_dir():
-                continue
-            found_dir = True
-            lock = locks / f"{sid}.lock"
-            if lock.exists():
-                try:
-                    with open(lock, "rb") as fh:
-                        fh.read(1)  # a running Codex holds a byte-range lock: the read fails
-                    return False
-                except OSError:
-                    return True
-        return None  # no lock file (ephemeral/exec threads): fall back to timing
+        return _codex_owner_alive(owner, sid)
     return None
 
 
@@ -315,6 +356,9 @@ def _claim_owner_locked(root: Path, vendor: str, account: str, session_id: str |
         "claimed_at": harvest.iso_now(now),  # every claim (start, resume, compact) refreshes liveness
         "process_pid": _claude_process_id(session_id) if vendor == "claude" else None,
     }
+    override = os.environ.get(config.ACCOUNT_ENV[vendor])
+    if override and config.account_from_env(vendor) == account:
+        claim["config_home"] = os.path.abspath(config.expand(override))
     # the iTerm2 session this agent runs in (`bt <ws>` records it); `bt <ws>` from another tab selects that tab. Taken from
     # this process's environment only: an earlier owner's value names another tab.
     iterm_session = os.environ.get("BATON_ITERM_SESSION")
@@ -463,7 +507,7 @@ def _native_registration_name(session_id: str, launched: str, home: Path) -> str
         return None
 
 
-def on_session_start(vendor: str, data: dict, root: Path) -> dict | None:
+def on_session_start(vendor: str, data: dict, root: Path, attachment: dict | None = None) -> dict | None:
     _guard(vendor, "SessionStart", lambda: paths.ensure_excluded(root))
     _guard(vendor, "SessionStart", lambda: paths.baton_dir(root, create=True))
     try:
@@ -474,6 +518,8 @@ def on_session_start(vendor: str, data: dict, root: Path) -> dict | None:
         warning = "WARNING: cannot lock worktree ownership. Do not edit files here; tell the user."
         return _output("SessionStart", warning, warning)
     try:
+        if not _attachment_current(vendor, data.get("session_id"), attachment):
+            return None
         return _on_session_start_locked(vendor, data, root)
     finally:
         lock.__exit__(None, None, None)
@@ -552,9 +598,10 @@ def _count_compaction_locked(vendor: str, root: Path, session_id: str | None, tr
                     account=config.account_from_env(vendor, os.environ), last_seen=now, compactions=count + 1)
 
 
-def on_post_compact(vendor: str, data: dict, root: Path) -> None:
+def on_post_compact(vendor: str, data: dict, root: Path, attachment: dict | None = None) -> None:
     with locking.exclusive(paths.baton_dir(root) / "owner.lock"):
-        _on_post_compact_locked(vendor, data, root)
+        if _attachment_current(vendor, data.get("session_id"), attachment):
+            _on_post_compact_locked(vendor, data, root)
 
 
 def _on_post_compact_locked(vendor: str, data: dict, root: Path) -> None:
@@ -582,8 +629,9 @@ def _tab_state(state: str, root: Path, data: dict, vendor: str = "", detail: str
         if not _is_lead(root, data):
             return
         from . import iterm
-        iterm.tab_state(state, iterm.label_for(None, root), vendor=vendor, repo=iterm.group_of(root)[0], detail=detail)
-        if state == "start":
+        group = iterm.group_of(root)[0] if state == "start" else ""    # only a start colours the tab: no config reads otherwise
+        wrote = iterm.tab_state(state, iterm.label_for(None, root), vendor=vendor, repo=group, detail=detail)
+        if state == "start" and wrote:      # a real iTerm2 tab took the sequences: arrange the tabs in the background
             iterm.arrange_soon()
     except Exception:
         pass
@@ -679,9 +727,7 @@ def on_notification(data: dict, root: Path) -> None:
         _tab_state("input", root, data, "claude")
 
 
-def on_session_end(vendor: str, data: dict, root: Path) -> None:
-    if data.get("reason") != "clear":      # /clear keeps the tab and the workstream: SessionStart starts it again
-        _tab_state("end", root, data, vendor)
+def on_session_end(vendor: str, data: dict, root: Path, attachment: dict | None = None) -> None:
     if vendor == "codex":
         _clear_blocked(data)
     now = time.time()
@@ -697,7 +743,10 @@ def on_session_end(vendor: str, data: dict, root: Path) -> None:
     account = fields["account"]
     def finish() -> None:
         with locking.exclusive(paths.baton_dir(root) / "owner.lock"):
-            if _may_record(root, session_id, transcript, vendor, account):
+            if (_attachment_current(vendor, session_id, attachment)
+                    and _may_record(root, session_id, transcript, vendor, account)):
+                if data.get("reason") != "clear":  # /clear keeps the tab until SessionStart
+                    _tab_state("end", root, data, vendor)
                 registry.update(root, vendor, ws=paths.ws_name(root), **fields)
                 _release_owner_locked(root, session_id, transcript, vendor, account)
                 registry.startup_remove(root, session_id, vendor=vendor, account=account)
@@ -756,8 +805,11 @@ def _context_nudge_locked(vendor: str, data: dict, root: Path, now: float) -> st
     return text
 
 
-def on_user_prompt(vendor: str, data: dict, root: Path) -> dict | None:
+def on_user_prompt(vendor: str, data: dict, root: Path, attachment: dict | None = None) -> dict | None:
     with locking.exclusive(paths.baton_dir(root) / "owner.lock"):
+        if not _attachment_current(vendor, data.get("session_id"), attachment):
+            return None
+        _tab_state("working", root, data, vendor)
         return _on_user_prompt_locked(vendor, data, root)
 
 
@@ -844,19 +896,33 @@ def launch_dir(vendor: str, session_id: str | None, transcript: str | None, envi
         return None
 
 
-def resolve_root(vendor: str, cwd: str, session_id: str | None, transcript: str | None = None) -> tuple[Path | None, bool]:
-    """(worktree, attached) for an event: the worktree ``bt attach`` mapped this session to, else the
-    worktree of the session's launch directory, else the worktree of the hook's cwd.
-
-    A tool that later ``cd``s elsewhere does not move the session: the launch directory decides, and a
-    launch directory outside any worktree means no worktree. attached.json is one small JSON read (a
-    missing file costs a failed open); it is skipped when the payload carries no session id.
-    """
-    attached = registry.attached_worktree(session_id)
+def _resolve_root(vendor: str, cwd: str, session_id: str | None, transcript: str | None,
+                  environ=None) -> tuple[Path | None, dict | None]:
+    account = config.account_from_env(vendor, environ)
+    record = registry.attached_record(session_id, vendor=vendor, account=account)
+    attached = registry.attachment_target(record)
     if attached is not None:
-        return attached, True
-    launched = launch_dir(vendor, session_id, transcript)
-    return paths.find_worktree_root(cwd if launched is None else launched), False
+        return attached, record
+    launched = launch_dir(vendor, session_id, transcript, environ) if environ is not None else launch_dir(
+        vendor, session_id, transcript)
+    return paths.find_worktree_root(cwd if launched is None else launched), None
+
+
+def resolve_root(vendor: str, cwd: str, session_id: str | None, transcript: str | None = None,
+                 *, environ=None) -> tuple[Path | None, bool]:
+    """Resolve the scoped attachment, then the session launch directory, then the hook's cwd."""
+    root, attached = _resolve_root(vendor, cwd, session_id, transcript, environ)
+    return root, attached is not None
+
+
+def _attachment_current(vendor: str, session_id: str | None, expected: dict | None) -> bool:
+    """Check the binding again under owner.lock before a hook mutates that worktree."""
+    account = config.account_from_env(vendor)
+    current = registry.attached_record(session_id, vendor=vendor, account=account)
+    if expected is None:
+        return registry.attachment_target(current) is None
+    return current is not None and all(current.get(k) == expected.get(k)
+                                       for k in ("worktree", "attached_at", "binding_id"))
 
 
 def handle(vendor: str, data: dict) -> dict | None:
@@ -873,23 +939,22 @@ def handle(vendor: str, data: dict) -> dict | None:
     if vendor == "codex" and _codex_child(data.get("transcript_path")):
         return None
     cwd = data.get("cwd") if isinstance(data.get("cwd"), str) and data.get("cwd") else os.getcwd()
-    root, _ = resolve_root(vendor, cwd, data.get("session_id") or None, data.get("transcript_path") or None)
+    root, attachment = _resolve_root(vendor, cwd, data.get("session_id") or None, data.get("transcript_path") or None)
     if root is None:
         return None
     if event == "Notification":
         on_notification(data, root)
         return None
     if event == "SessionStart":
-        return on_session_start(vendor, data, root)
+        return on_session_start(vendor, data, root, attachment)
     if event == "PostCompact":
-        on_post_compact(vendor, data, root)
+        on_post_compact(vendor, data, root, attachment)
     elif event == "SessionEnd":
-        on_session_end(vendor, data, root)
+        on_session_end(vendor, data, root, attachment)
     elif event == "UserPromptSubmit":
         if vendor == "codex":
             _clear_blocked(data)
-        _tab_state("working", root, data, vendor)
-        return on_user_prompt(vendor, data, root)
+        return on_user_prompt(vendor, data, root, attachment)
     return None
 
 

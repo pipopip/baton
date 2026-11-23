@@ -443,13 +443,13 @@ def session_root(data: dict, environ=None) -> tuple[Path | None, str]:
     if not session_id:
         return None, "no session id"
     cwd = data.get("cwd") if isinstance(data.get("cwd"), str) and data.get("cwd") else os.getcwd()
-    root, _ = hook.resolve_root("claude", cwd, session_id, transcript)
+    root, _ = hook.resolve_root("claude", cwd, session_id, transcript, environ=environ)
     if root is None:
         return None, "not in a worktree"
     owner = config.read_json(paths.baton_dir(root) / "owner.json")
     if not owner or not owner.get("session_id"):
         return None, "no baton owner"
-    if owner.get("session_id") != session_id:
+    if not hook._owner_is_me(owner, session_id, transcript, "claude", config.account_from_env("claude", environ)):
         return None, "owned by another session"
     return root, ""
 
@@ -576,7 +576,7 @@ def on_pre_tool_use(data: dict, environ=None) -> dict | None:
     if not session_id:
         return None
     cwd = data.get("cwd") if isinstance(data.get("cwd"), str) and data.get("cwd") else os.getcwd()
-    root, _ = hook.resolve_root("claude", cwd, session_id, data.get("transcript_path") or None)
+    root, _ = hook.resolve_root("claude", cwd, session_id, data.get("transcript_path") or None, environ=environ)
     if root is None:
         return None
     state = read_flag(root, str(session_id))
@@ -652,8 +652,12 @@ def pid_for_session(session_id: str, root: Path | None = None) -> int | None:
     """Pid of the running Claude process whose ``sessions/<pid>.json`` names ``session_id`` (and, with ``root``,
     was launched in that worktree or attached to it). None when there is none."""
     root_key = config.norm(root) if root is not None else None
-    attached = root_key is not None and hook._attached_to(session_id, root_key)
-    for account in config.account_names("claude"):
+    owner = config.read_json(paths.baton_dir(root) / "owner.json") if root is not None else {}
+    account = owner.get("account") if owner.get("session_id") == session_id else None
+    if account and owner.get("vendor") != "claude":
+        return None
+    for account in [account] if isinstance(account, str) and account else config.account_names("claude"):
+        attached = root_key is not None and hook._attached_to(session_id, root_key, vendor="claude", account=account)
         sessions = config.account_dir("claude", account) / "sessions"
         try:
             files = list(sessions.glob("*.json"))

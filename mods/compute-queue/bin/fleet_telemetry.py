@@ -126,6 +126,8 @@ def _reason_word(reason):
         return 'battery'
     if 'pressure' in r:
         return 'pressure'
+    if 'available memory is low' in r:
+        return 'low memory'
     if 'legacy' in r or 'draining' in r:
         return 'legacy busy'
     if 'ram' in r or 'memory' in r or 'commit' in r:

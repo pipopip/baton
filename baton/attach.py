@@ -2,7 +2,7 @@
 
 SessionStart sees the session's cwd, so a session started outside any worktree never loads the capsule;
 the owner then types ``/pickup <ws>``. This command resolves the worktree, records the mapping
-``session id -> worktree`` in ``STATE_DIR/attached.json`` (hooks consult it for SessionStart, PostCompact,
+``(vendor, account, session id) -> worktree`` in ``STATE_DIR/attached.json`` (hooks consult it for SessionStart, PostCompact,
 SessionEnd and UserPromptSubmit), claims ``owner.json``, registers the session, releases the claim and registry record it held on any
 other worktree, and prints the startup capsule. Run from inside the agent's shell, where the vendor exports its session id.
 """
@@ -13,7 +13,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import capsule, config, harvest, hook, launch, paths, registry, worktrees
+from . import capsule, config, harvest, hook, launch, locking, paths, registry, worktrees
 
 SESSION_ENV = {"claude": ("CLAUDE_CODE_SESSION_ID",), "codex": ("CODEX_THREAD_ID", "CODEX_SESSION_ID")}
 NO_SESSION_NOTE = ("note: no session id (run this from the agent's shell, or pass --session and --vendor): "
@@ -37,50 +37,78 @@ def detect(vendor: str | None, session: str | None, environ=None) -> tuple[str |
     return vendor, session or env_session(vendor, environ)
 
 
-def find_transcript(vendor: str, session_id: str) -> Path | None:
-    """The session's transcript under any account of ``vendor`` (newest when several match), else None."""
-    hits: list[Path] = []
-    for account in config.account_names(vendor):
-        home = config.account_dir(vendor, account)
-        if vendor == "claude":
-            try:
-                hits += [p for p in (home / "projects").glob(f"*/{session_id}.jsonl") if p.is_file()]
-            except OSError:
-                pass
-        else:
-            found = worktrees.find_rollout(session_id, [home], time.monotonic() + worktrees.LIVE_LOOKUP_S)
-            if found is not None:
-                hits.append(found)
+def find_transcript(vendor: str, session_id: str, account: str) -> Path | None:
+    """The newest transcript with this session ID in the selected account."""
+    selected_home = os.environ.get(config.ACCOUNT_ENV[vendor])
+    home = (config.expand(selected_home) if selected_home and config.account_from_env(vendor) == account
+            else config.account_dir(vendor, account))
+    if vendor == "codex":
+        return worktrees.find_rollout(session_id, [home], time.monotonic() + worktrees.LIVE_LOOKUP_S)
+    try:
+        hits = [p for p in (home / "projects").glob(f"*/{session_id}.jsonl") if p.is_file()]
+    except OSError:
+        return None
     return max(hits, key=lambda p: config.mtime(p) or 0.0, default=None)
 
 
-def release_elsewhere(root: Path, session_id: str, previous: str | None = None, *,
-                      vendor: str | None = None, account: str | None = None) -> list[str]:
-    """Let go of this session's hold on every worktree but ``root``; returns the paths released.
-
-    The old holds are the worktrees whose registry vendor record names this session and the worktree attached.json
-    bound it to before (``previous``). In each, ``owner.json`` is removed when it is this session's, the session is
-    dropped from the registry record and from the startup list. Each step is independent and never raises.
-    """
+def release_elsewhere(root: Path, session_id: str, previous: str | None, *,
+                      vendor: str, account: str) -> list[str]:
+    """Release this identity's old owner and registry records under each worktree's owner lock."""
     keep = config.norm(root)
-    others: dict[str, str] = {}
-    try:
-        for path in registry.detach_session(session_id, root, vendor=vendor, account=account):
-            others[config.norm(path)] = path
-    except Exception:  # noqa: BLE001 - an unreadable registry must not undo the attach
-        pass
-    if previous and config.norm(previous) != keep:
+    others = registry.session_worktrees(session_id, vendor=vendor, account=account)
+    if previous:
         others.setdefault(config.norm(previous), previous)
+    others.pop(keep, None)
+    released = []
     for path in others.values():
-        try:
-            hook.release_owner(Path(path), session_id, None, vendor=vendor, account=account)
-        except Exception:  # noqa: BLE001
-            pass
+        old_root = Path(path)
+        if old_root.is_dir():
+            try:
+                with locking.exclusive(paths.baton_dir(old_root) / "owner.lock"):
+                    hook._release_owner_locked(old_root, session_id, None, vendor, account)
+                    registry.detach_session(old_root, session_id, vendor=vendor, account=account)
+            except (OSError, registry.RegistryUnavailable) as exc:
+                hook._log(vendor, "attach", exc)
+                continue
+        else:
+            hook._guard(vendor, "attach", lambda: registry.detach_session(
+                old_root, session_id, vendor=vendor, account=account))
+        released.append(path)
+    return released
+
+
+def _move(root: Path, vendor: str, account: str, session_id: str, transcript: str | None) -> tuple[str, list[str]]:
+    """Claim, publish, and release in that order under the attachment lock."""
     try:
-        registry.startup_drop_session(session_id, root, vendor=vendor, account=account)
-    except Exception:  # noqa: BLE001
-        pass
-    return list(others.values())
+        with registry.attached_lock():
+            data = registry.attached_load(strict=True)
+            bound = registry.attached_record(session_id, vendor=vendor, account=account, data=data)
+            now = time.time()
+            owner_path = paths.baton_dir(root) / "owner.json"
+            with locking.exclusive(owner_path.with_suffix(".lock")):
+                previous_owner = config.read_json(owner_path)
+                warning = hook._claim_owner_locked(root, vendor, account, session_id, transcript, "attach", now)
+                if warning:
+                    return warning, []
+                try:
+                    registry._attach_record_locked(data, session_id, root, vendor, account, transcript, now)
+                except OSError:
+                    if previous_owner:
+                        hook._write_json(owner_path, previous_owner)
+                    else:
+                        hook._remove(owner_path)
+                    raise
+                hook._guard(vendor, "attach", lambda: registry.update(
+                    root, vendor, ws=paths.ws_name(root), session_id=session_id, transcript=transcript, account=account,
+                    source="attach", started_at=harvest.iso_now(now), last_seen=now))
+                released = release_elsewhere(root, session_id, bound["worktree"] if bound else None,
+                                             vendor=vendor, account=account)
+                hook._guard(vendor, "attach", lambda: registry.startup_add(root, vendor, account, session_id, now))
+                hook.register_session_workflow(root, vendor, session_id, transcript, launch_cwd=os.getcwd())
+                return "", released
+    except OSError as exc:
+        hook._log(vendor, "attach", exc)
+        return "WARNING: cannot update worktree attachment. Do not edit files here; tell the user.", []
 
 
 def run(args) -> int:
@@ -91,30 +119,19 @@ def run(args) -> int:
         return 2
     vendor, session_id = detect(args.vendor, args.session)
     if session_id and vendor is None:  # --session without --vendor and no env: whichever vendor has the transcript
-        vendor = next((v for v in config.VENDORS if find_transcript(v, session_id)), "claude")
+        vendor = next((v for v in config.VENDORS if find_transcript(v, session_id, config.account_from_env(v))), "claude")
     vendor = vendor or registry.entry(root).get("last_vendor") or "claude"
     account = config.account_from_env(vendor)
-    transcript = find_transcript(vendor, session_id) if session_id else None
-    now = time.time()
+    found = find_transcript(vendor, session_id, account) if session_id else None
+    transcript = str(found) if found else None
 
     paths.ensure_excluded(root)
     paths.baton_dir(root, create=True)
-    warning = ""
     if session_id:
-        warning = hook.claim_owner(root, vendor, account, session_id, str(transcript) if transcript else None, "attach", now)
+        warning, released = _move(root, vendor, account, session_id, transcript)
         if warning:
             print(warning)
             return 2
-        bound = registry.attached_load().get(session_id)
-        previous = bound.get("worktree") if isinstance(bound, dict) and isinstance(bound.get("worktree"), str) else None
-        registry.attach_record(session_id, root, vendor, account, str(transcript) if transcript else None, now)
-        registry.update(root, vendor, ws=paths.ws_name(root), session_id=session_id,
-                        transcript=str(transcript) if transcript else None, account=account,
-                        source="attach", started_at=harvest.iso_now(now), last_seen=now)
-        hook.register_session_workflow(root, vendor, session_id, str(transcript) if transcript else None,
-                                       launch_cwd=os.getcwd())
-        registry.startup_add(root, vendor, account, session_id, now)
-        released = release_elsewhere(root, session_id, previous, vendor=vendor, account=account)
         print(f"Attached {vendor} session {harvest.id8(session_id)} to {root} — work in that directory.")
         if released:
             print("moved this session off: " + ", ".join(released))

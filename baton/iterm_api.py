@@ -12,15 +12,16 @@ without tabs is closed by iTerm2) and a group's first window comes from ``Tab.as
 from __future__ import annotations
 
 import argparse
+import asyncio
 import fcntl
 import json
 import subprocess
 import sys
 import time
 
-import iterm2
+from . import config, iterm, paths
 
-from . import config, iterm
+iterm2 = None      # imported by main() once this process holds the lock: a start that loses the race pays nothing more
 
 LOCK = "iterm-arrange.lock"
 DIRTY = "iterm-arrange.dirty"
@@ -47,26 +48,26 @@ def _cwd(pid) -> str | None:
     return None
 
 
+SESSION_VARS = ("jobName", "path", "jobPid", "profileName", "user.baton_ws", "user.baton_group")
+
+
+async def _row(window, window_title, tab, tab_title, session) -> dict:
+    job, path, pid, profile, ws, group = await asyncio.gather(*(_var(session, name) for name in SESSION_VARS))
+    if (job or "").lower() in iterm.AGENTS and not (ws and path and paths.find_worktree_root(path)):
+        path = await asyncio.to_thread(_cwd, pid) or path  # the agent's own folder: the shell's may be elsewhere
+    return {"session": session.session_id, "tab": tab.tab_id, "window": window.window_id, "profile": profile,
+            "job": job, "path": path, "ws": ws, "group": group, "tab_title": tab_title, "window_title": window_title}
+
+
 async def snapshot(app) -> list[dict]:
-    """Every session of every window, with what plan_arrangement reads."""
-    rows = []
+    """Every session of every window, with what plan_arrangement reads; the variables are read concurrently."""
+    pending = []
     for window in app.terminal_windows:
         window_title = await _var(window, "titleOverrideFormat")
         for tab in window.tabs:
             tab_title = await _var(tab, "titleOverrideFormat")
-            for session in tab.sessions:
-                job = await _var(session, "jobName")
-                path = await _var(session, "path")
-                if (job or "").lower() in iterm.AGENTS:
-                    path = _cwd(await _var(session, "jobPid")) or path
-                rows.append({
-                    "session": session.session_id, "tab": tab.tab_id, "window": window.window_id,
-                    "profile": await _var(session, "profileName"), "job": job,
-                    "path": path, "ws": await _var(session, "user.baton_ws"),
-                    "group": await _var(session, "user.baton_group"), "tab_title": tab_title,
-                    "window_title": window_title,
-                })
-    return rows
+            pending.extend(_row(window, window_title, tab, tab_title, session) for session in tab.sessions)
+    return list(await asyncio.gather(*pending))
 
 
 async def _profiles(connection) -> dict:
@@ -84,7 +85,7 @@ async def arrange(connection, dry_run: bool, quiet: bool) -> int:
         print(json.dumps(plan, indent=2, ensure_ascii=False))
     if dry_run:
         return 0
-    profiles = await _profiles(connection)
+    profiles = await _profiles(connection) if any(i.get("profile") for i in plan["sessions"]) else {}
     for item in plan["sessions"]:
         session = app.get_session_by_id(item["session"])
         if session is None:
@@ -143,7 +144,12 @@ def _locked(path):
     return handle
 
 
+def _pass(args) -> None:
+    iterm2.run_until_complete(lambda c: arrange(c, args.dry_run, args.quiet), retry=False)
+
+
 def main(argv=None) -> int:
+    global iterm2
     ap = argparse.ArgumentParser(prog="baton.iterm_api")
     ap.add_argument("action", choices=["arrange", "prefs"])
     ap.add_argument("--dry-run", action="store_true")
@@ -151,28 +157,39 @@ def main(argv=None) -> int:
     ap.add_argument("--settle", type=float, default=0.0, help="seconds to wait first (a starting session sets its variables)")
     args = ap.parse_args(argv)
     if args.action == "prefs":
+        import iterm2 as module
+        iterm2 = module
         return iterm2.run_until_complete(prefs, retry=False) or 0
-    config.STATE_DIR.mkdir(parents=True, exist_ok=True)
-    dirty = config.STATE_DIR / DIRTY
-    lock = None if args.dry_run else _locked(config.STATE_DIR / LOCK)
-    if lock is None and not args.dry_run:
-        dirty.touch()                                   # an arranger is running: it makes one more pass
+    if args.dry_run:
+        import iterm2 as module
+        iterm2 = module
+        _pass(args)
         return 0
-    try:
-        time.sleep(max(0.0, args.settle))
-        for _ in range(3):
-            started = time.time()
-            iterm2.run_until_complete(lambda c: arrange(c, args.dry_run, args.quiet), retry=False)
-            try:
+    config.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    dirty, lock_path = config.STATE_DIR / DIRTY, config.STATE_DIR / LOCK
+    dirty.touch()                                       # this start asks for a pass, whoever makes it
+    time.sleep(max(0.0, args.settle))
+    while True:
+        lock = _locked(lock_path)
+        if lock is None:                                # an arranger is running: its dirty check sees this start
+            return 0
+        try:
+            if iterm2 is None:
+                import iterm2 as module
+                iterm2 = module
+            for _ in range(3):
+                started = time.time()
+                _pass(args)
                 if dirty.stat().st_mtime < started:
                     break
-            except FileNotFoundError:
-                break
-            time.sleep(1.0)
-    finally:
-        if lock is not None:
+                time.sleep(1.0)
+        finally:
             lock.close()
-    return 0
+        try:                                            # a start that lost the race after the last check: go again
+            if dirty.stat().st_mtime < started:
+                return 0
+        except FileNotFoundError:
+            return 0
 
 
 if __name__ == "__main__":

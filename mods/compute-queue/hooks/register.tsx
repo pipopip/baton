@@ -3,7 +3,7 @@ import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import { computeAllowed, suggestRule } from './allow'
 import { classifyBash } from './classify'
-import { alertText, fleetStatusLine, noticeText, statusLine, statusText } from './notice'
+import { alertText, fleetStatusLine, isNoticeJob, noticeText, statusLine, statusText } from './notice'
 import type { Alert, NoticeJob } from './notice'
 import { buildRequest, gate, parseReply, snapshotKey } from './plan'
 import type { Capacity, LeaderMemory, Median, Plan, QueuedJob, RunningJob } from './plan'
@@ -33,6 +33,7 @@ type Tick = Reply & {
 // scheduling leadership do not); a job's own session id is read fresh at submit.
 const S = {
   py: 'python',
+  claudeHome: '',
   script: '',
   leaderId: '',
   root: '',
@@ -63,7 +64,7 @@ async function cq($: EngineInterface, cmd: string, payload: unknown = {}, timeou
     const r = await $.process.run([S.py, '-X', 'utf8', S.script, cmd], {
       stdin: JSON.stringify(payload),
       timeoutMs,
-      env: { PYTHONIOENCODING: 'utf-8' },
+      env: { PYTHONIOENCODING: 'utf-8', CQ_CLAUDE_HOOK_HOME: S.claudeHome || '~/.claude' },
     })
     const line = r.stdout.trim().split('\n').pop() ?? ''
     try {
@@ -94,6 +95,10 @@ function seenBy(agentId: unknown, session: string) {
   return agentId === undefined ? { seen_by: { root: S.readyTop || S.root, session } } : {}
 }
 
+function readAuthority(session: string) {
+  return { vendor: 'claude', root: S.root, session }
+}
+
 // Retry marking accepted notices without sending the same prompt a second time.
 async function markNotices($: EngineInterface, session: string, top: string) {
   const ids = [...S.pendingNoticeMarks]
@@ -103,7 +108,7 @@ async function markNotices($: EngineInterface, session: string, top: string) {
     for (const id of r.acknowledged_ids) S.pendingNoticeMarks.delete(id as string)
 }
 
-// A job's result reaches its session once, by whichever way gets there first, and every way records it in the same
+// A job's completion reaches its session once, by whichever way gets there first, and every way records it in the same
 // two places (S.delivered here, `notified` in the queue):
 //   inside a turn   with the results of the next tool batch (classic.PostToolBatch): no wait for the turn to end,
 //                   no polling, nothing queued behind the turn;
@@ -119,7 +124,7 @@ const turnActive = (now: number) => S.inTurn && now - S.turnAt < STALE_TURN_MS
 
 // Up to five of the waiting jobs, taking turns so that five undeliverable ones cannot hide the rest.
 function pick(jobs: NoticeJob[]): NoticeJob[] {
-  const waiting = jobs.filter(j => !S.delivered.has(j.id))
+  const waiting = jobs.filter(j => isNoticeJob(j) && !S.delivered.has(j.id))
   if (waiting.length === 0) return []
   const offset = S.noticeCursor % waiting.length
   const picked = [...waiting.slice(offset), ...waiting.slice(0, offset)].slice(0, 5)
@@ -130,21 +135,33 @@ function pick(jobs: NoticeJob[]): NoticeJob[] {
 const batchText = (fresh: NoticeJob[]) =>
   fresh.length === 1 ? noticeText(fresh[0]!) :
     `[compute-queue] ${fresh.length} completed jobs:\n` +
-    fresh.map(j => noticeText({ ...j, tail: (j.tail ?? []).slice(-8), artifact_text: (j.artifact_text ?? []).slice(0, 1) })).join('\n')
+    fresh.map(noticeText).join('\n')
 
-// The delivery inside a turn: the text to hand over with a tool batch, or null. No queue call here (the hook must
-// answer at once): the jobs are those the last tick found for this session and owner, under a minute ago, and a
-// session in the middle of a turn has not been handed over since. The mark follows; a failed mark is retried by the
-// tick and S.delivered keeps this process from sending the result again meanwhile.
-function midTurnNotice($: EngineInterface, session: string, now: number): string | null {
+async function authorizedNotices($: EngineInterface, session: string, top: string, ids: string[], timeoutMs?: number) {
+  const checked = await cq($, 'notice_authorize', { root: top, session, ids, notice_protocol: 2 }, timeoutMs)
+  if (!checked.ok || !Array.isArray(checked.jobs) || S.deliverySession !== session || (await $.session.id()) !== session) return []
+  return (checked.jobs as unknown[]).filter((j): j is NoticeJob =>
+    isNoticeJob(j) && ids.includes(j.id) && !S.delivered.has(j.id))
+}
+
+// An attach can move the session after the tick that filled the cache. Only contact the queue when a result is ready.
+async function midTurnNotice($: EngineInterface, session: string, now: number, remainingMs: number): Promise<string | null> {
   if (S.deliverySession !== session || S.noticeBusySession === session || now - S.readyAt > READY_MAX_AGE_MS) return null
-  const fresh = pick(S.ready)
-  if (fresh.length === 0) return null
-  // the text first: a job that cannot be rendered is not recorded as delivered, and the prompt path still has it
-  const text = batchText(fresh) + '\n[compute-queue] This is the completion notice for the job(s) above; it is not sent again.'
-  for (const j of fresh) { S.delivered.add(j.id); S.pendingNoticeMarks.add(j.id) }
-  void markNotices($, session, S.readyTop).catch(() => undefined)
-  return text
+  const ids = pick(S.ready).map(job => job.id)
+  const timeout = Math.min(1500, remainingMs - 200)
+  if (!ids.length || timeout < 200) return null
+  const top = S.readyTop
+  S.noticeBusySession = session
+  try {
+    const fresh = await authorizedNotices($, session, top, ids, timeout)
+    if (!fresh.length || S.readyTop !== top) return null
+    const text = batchText(fresh)
+    for (const j of fresh) { S.delivered.add(j.id); S.pendingNoticeMarks.add(j.id) }
+    void markNotices($, session, top).catch(() => undefined)
+    return text
+  } finally {
+    if (S.noticeBusySession === session) S.noticeBusySession = ''
+  }
 }
 
 // One bounded prompt per batch; recheck the worktree's current owner just
@@ -155,10 +172,7 @@ function notify($: EngineInterface, jobs: NoticeJob[], session: string, top: str
   if (ids.length === 0) return
   S.noticeBusySession = session
   void (async () => {
-    const checked = await cq($, 'notice_authorize', { root: top, session, ids, notice_protocol: 2 })
-    if (!checked.ok || !Array.isArray(checked.jobs) || S.deliverySession !== session || (await $.session.id()) !== session) return
-    // what a tool batch or a wait answered while the queue was asked is not sent again
-    const fresh = (checked.jobs as NoticeJob[]).filter(j => !S.delivered.has(j.id))
+    const fresh = await authorizedNotices($, session, top, ids)
     if (fresh.length === 0 || turnActive(await $.clock.now())) return
     const text = batchText(fresh)
     const r = await $.prompt.submit({ text })
@@ -170,7 +184,7 @@ function notify($: EngineInterface, jobs: NoticeJob[], session: string, top: str
   })
 }
 
-function notifyAlert($: EngineInterface, alert: Alert) {
+function notifyAlert($: EngineInterface, alert: Alert, session: string, top: string) {
   const key = `${alert.host_id ?? 'ember'}:${alert.at}`
   if (S.alertSubmitting || S.alertsDelivered.has(key)) return
   S.alertSubmitting = true
@@ -179,7 +193,8 @@ function notifyAlert($: EngineInterface, alert: Alert) {
     .then(r => {
       if (r.drop !== undefined) return undefined
       S.alertsDelivered.add(key)
-      return cq($, 'notified', { ids: [], ack_alert: true, notice_protocol: 2, ...(alert.host_id ? { host_id: alert.host_id } : {}) })
+      return cq($, 'notified', { ids: [], ack_alert: true, owner_session: session, owner_root: top,
+        notice_protocol: 2, ...(alert.host_id ? { host_id: alert.host_id } : {}) })
     })
     .catch(() => undefined)
     .finally(() => {
@@ -246,10 +261,10 @@ async function tick($: EngineInterface) {
     if (S.ready.length > 0 && !turnActive(tickedAt)) notify($, S.ready, currentSession, top)
     if (t.leader) await plan($, t)
     const w = t.watch
-    if (t.alert && w?.top !== undefined && w.top.split('/').pop() === LEAD_WORKSTREAM) notifyAlert($, t.alert)
     if (w?.top !== undefined && w.top.split('/').pop() === LEAD_WORKSTREAM) {
+      if (t.alert) notifyAlert($, t.alert, currentSession, w.top)
       for (const [host_id, remote] of Object.entries(t.per_host ?? {})) {
-        if (remote.alert) notifyAlert($, { ...remote.alert, host_id })
+        if (remote.alert) notifyAlert($, { ...remote.alert, host_id }, currentSession, w.top)
       }
     }
     // an unacknowledged disk alert pauses dispatch on its host: the one fleet-wide condition the snapshot cannot show
@@ -263,6 +278,7 @@ async function tick($: EngineInterface) {
 
 async function start($: EngineInterface) {
   S.py = (await $.env.get('CQ_PYTHON')) || 'python'
+  S.claudeHome = (await $.env.get('CLAUDE_CONFIG_DIR')) || ''
   S.script = `${$.plugin.root.replace(/\\/g, '/')}/bin/cq.py`
   S.leaderId = S.leaderId || (await $.session.id())
   S.root = await $.session.root()
@@ -273,16 +289,15 @@ async function start($: EngineInterface) {
       'generators, the integ verify, anything Linux-specific or over a few minutes. Short targeted checks (one package or test file, a lint ' +
       'or type check, roughly under 3 minutes and a few GB) run directly in the session, not here. ' +
       'A scheduler places the run on the build hosts (ember, hestia) or the laptop (macOS or Windows; a Mac\'s laptop takes short work only, 20 minutes by default); it splits when slots idle. ' +
-      'When it ends you get one notice ' +
-      'with the result (exit, the last log lines, small text artifacts in full): with your next tool results if you are working, ' +
-      'as a prompt if you are idle. Keep working meanwhile; do not poll status or read the output files to learn the result. ' +
+      'When it ends you get one notice with its ID and outcome, either with your next tool results or as a prompt when idle. ' +
+      'Keep working meanwhile. Use compute-queue status with the job ID to read the result, including log lines and small text artifacts. ' +
       'Returns { job, position, note } at once; do not run such commands any other way (remoterun.py, ssh builds and heavyrun.py are blocked).',
     inputSchema: RUN_SCHEMA,
     isDeferred: false,
   })
   await $.tool.register({
     name: 'status',
-    description: 'Read cached queue or one job (where it stands, or its result once ended; a result read here is not sent again as a notice; full: true gives the whole stored record). view: fleet gives a compact cached slot/RAM/alert overview without host calls. refresh: true queries one bound deferred/fleet job and retries missing artifacts; captured outputs remain fixed.',
+    description: 'Read the queue or one job in your current owned worktree (a result read here is not sent again as a notice; full: true gives the whole stored record). view: fleet gives a compact cached slot/RAM/alert overview without host calls. refresh: true queries one bound deferred/fleet job and retries missing artifacts; captured outputs remain fixed.',
     inputSchema: { type: 'object', properties: { job: { type: 'string' }, refresh: { type: 'boolean' }, full: { type: 'boolean' }, view: { type: 'string', enum: ['fleet'] } } },
     isDeferred: false,
   })
@@ -404,7 +419,7 @@ export const register: Register = on => {
     const now = await $.clock.now()
     S.inTurn = true
     S.turnAt = now
-    const text = midTurnNotice($, e.session_id, now)
+    const text = await midTurnNotice($, e.session_id, now, next.budget.remainingMs)
     return text === null ? r : { ...r, additionalContext: [...(r.additionalContext ?? []), text] }
   }).catch(($, e, next) => next(e))
 
@@ -413,9 +428,10 @@ export const register: Register = on => {
   on('tool.call', { tool: 'mcp__compute-queue__status' }, async ($, e) => {
     const { job, refresh, view, full, agentId } = e as Record<string, unknown>
     const one = typeof job === 'string'
-    const seen = seenBy(agentId, await $.session.id())
+    const session = await $.session.id()
     return answered(await cq($, 'status', {
-      ...(one ? { job, ...seen, ...(full === true ? {} : { compact: true }) } : {}),
+      read_authority: readAuthority(session),
+      ...(one ? { job, ...seenBy(agentId, session), ...(full === true ? {} : { compact: true }) } : {}),
       ...(refresh === true ? { refresh: true } : {}),
       ...(view === 'fleet' ? { view } : {}),
     }))
@@ -424,8 +440,10 @@ export const register: Register = on => {
   on('tool.call', { tool: 'mcp__compute-queue__wait' }, async ($, e) => {
     const a = e as Record<string, unknown>
     const timeoutS = Math.min(540, Math.max(1, Number(a.timeout_s ?? 540)))
-    const seen = seenBy(a.agentId, await $.session.id())
-    return answered(await cq($, 'wait', { job: a.job, timeout_s: timeoutS, ...seen }, (timeoutS + 30) * 1000))
+    const session = await $.session.id()
+    return answered(await cq($, 'wait', {
+      job: a.job, timeout_s: timeoutS, read_authority: readAuthority(session), ...seenBy(a.agentId, session),
+    }, (timeoutS + 30) * 1000))
   })
 
   on('tool.call', { tool: 'mcp__compute-queue__cancel' }, async ($, e) => {
@@ -438,7 +456,8 @@ export const register: Register = on => {
       const r = await cq($, 'cancel', { job: m[1], root: S.root, session: await $.session.id() })
       return { text: r.ok ? `${m[1]}: ${String(r.note)}` : `cancel failed: ${String(r.error)}` }
     }
-    return { text: statusText(await cq($, 'status', {}) as Parameters<typeof statusText>[0]) }
+    const r = await cq($, 'status', { read_authority: readAuthority(await $.session.id()) })
+    return { text: statusText(r as Parameters<typeof statusText>[0]) }
   })
 
   // The same guard on every tool that runs a shell command: Bash, PowerShell (the primary shell on this machine) and

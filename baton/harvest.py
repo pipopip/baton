@@ -17,6 +17,7 @@ SECTION_CAP = 1200          # chars per kept Claude summary section
 CODEX_TEXT_CAP = 400        # chars per kept Codex user request
 CODEX_KEEP = 8              # number of Codex user requests kept
 REPLACE_TRIES = 5            # os.replace attempts (PermissionError backoff)
+_sleep = time.sleep          # the backoff's own reference: tests patch it without catching other threads' sleeps
 CTX_TAIL_BYTES = 512 * 1024  # SessionEnd / resume token lookup window
 COMPACT_TAIL_WINDOWS = (1 << 20, 8 << 20)  # compaction lookup: 1 MiB, then 8 MiB
 
@@ -81,7 +82,7 @@ def atomic_write(path: str | os.PathLike, text: str) -> None:
             except PermissionError:
                 if attempt == REPLACE_TRIES - 1:
                     raise
-                time.sleep(0.05 * (attempt + 1))
+                _sleep(0.05 * (attempt + 1))
     except BaseException:
         try:
             os.remove(tmp)

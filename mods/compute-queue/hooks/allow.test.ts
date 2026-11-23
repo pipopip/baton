@@ -58,6 +58,11 @@ describe('the compute allowlist', () => {
   test('python runs a script under testdata/, .baton/remote/, scripts/ or named gen_*, record*, mutate*, *oracle*', () => {
     allowed('python go/product/write/testdata/mutate.py --only a')
     allowed('python3 go/kernel/internal/genesis/testdata/oracle/gen_dates.py')
+    allowed('python3.12 .baton/remote/suites.py')                       // a versioned interpreter (a Mac's Homebrew)
+    allowed('/opt/homebrew/bin/python3.12 scripts/audit.py')
+    refused('python3.12 -m unittest discover', 'python runs only a script')
+    refused('python3.12 tests/run_all.py', 'the python script is not under')
+    refused('python3.1234 scripts/x.py', 'not on the compute allowlist')
     allowed('pyfrozen go/conformance/oracles/gen_recall.py --check')
     allowed('python .baton/remote/integ-fixture.py')
     allowed('python scripts/audit.py --json out.json')
@@ -95,7 +100,8 @@ describe('the compute allowlist', () => {
     refused('/opt/homebrew/bin/python3 /tmp/evil/testdata/x.py', 'relative .py path')
     // not a bare name, not an install directory, or not a tool on the list
     refused('/opt/homebrew/bin/curl http://x', 'not on the compute allowlist')
-    refused('/opt/homebrew/bin/python3.12 scripts/x.py', 'not on the compute allowlist')
+    allowed('/opt/homebrew/bin/python3.12 scripts/x.py')                // versioned: the interpreter Baton runs on a Mac
+    refused('/opt/homebrew/bin/python3.12 tools/x.py', 'not under testdata')
     refused('/opt/homebrew/bin/cd x', 'not on the compute allowlist')
     refused('/opt/homebrew/lib/python3 scripts/x.py', 'not on the compute allowlist')
     refused('/tmp/evil/bin/python3 scripts/x.py', 'not on the compute allowlist')

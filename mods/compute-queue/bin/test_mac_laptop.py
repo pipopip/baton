@@ -34,9 +34,6 @@ class Fixture(unittest.TestCase):
         patcher = patch.dict(os.environ, MAC)
         patcher.start()
         self.addCleanup(patcher.stop)
-        lock = patch.object(fq._engine(), 'HEAVY_LOCK', str(self.state / 'heavy' / 'heavy.lock'))   # never the real one
-        lock.start()
-        self.addCleanup(lock.stop)
 
     def probe(self, available=30, cpus=18, pressure=1, battery=False, total=48):
         return dict(host='laptop', at=self.clock[0], data=dict(
@@ -222,7 +219,7 @@ class AdmissionTests(Fixture):
 
     def test_no_memory_is_reserved_or_floored(self):
         # a cap larger than the machine, and next to nothing available: still admitted at normal pressure
-        probe = self.probe(available=0.5, total=48)
+        probe = self.probe(available=6, total=48)      # 12.5% available: above the low-memory line
         self.assertIsNone(self.fit(probe, memory_max_gb=50)[1])
         # the caps of the jobs already on the laptop are not counted against the new one
         live = [dict(id='x', host_id='laptop', status='running', slots=1, memory_max_gb=45)]
@@ -230,6 +227,37 @@ class AdmissionTests(Fixture):
                               probe, live, self.clock[0], explain=True)
         self.assertIsNone(reason)
         self.assertEqual(fit['reserved'], 0)
+
+    def test_new_work_is_held_while_under_a_tenth_of_the_memory_is_available_at_normal_pressure(self):
+        # pressure lags a burst of starts: the observation of what is available holds the next one
+        fit, reason = self.fit(self.probe(available=4.7, total=48, pressure=1))
+        self.assertIsNone(fit)
+        self.assertEqual(reason, 'available memory is low (4.7 of 48 GB): no new laptop work until it recovers')
+        self.assertEqual(fleet_telemetry._reason_word(reason), 'low memory')
+        self.assertIsNotNone(self.fit(self.probe(available=4.9, total=48, pressure=1))[0])      # 10.2%: open
+
+    def test_an_unreadable_pressure_level_with_low_memory_holds_and_with_enough_does_not(self):
+        self.assertIsNone(self.fit(self.probe(available=2, pressure=None))[0])
+        self.assertIsNotNone(self.fit(self.probe(available=30, pressure=None))[0])
+
+    def test_the_low_memory_hold_is_the_macs_alone_and_adds_no_floor_to_windows(self):
+        with patch.dict(os.environ, {'CQ_LAPTOP_PLATFORM': 'windows'}):
+            cfg = fq._laptop_config(self.ctx, dict(logical_cpus=16))
+            probe = dict(host='laptop', at=self.clock[0], config=cfg, data=dict(
+                available_gb=8, commit_free_gb=8, total_gb=32, logical_cpus=16, capabilities=['python']))
+            self.assertIsNotNone(self.fit(probe, memory_max_gb=1)[0])      # 25% available, floor 6: fits as before
+            probe['data'].update(available_gb=3, commit_free_gb=3)
+            self.assertEqual(self.fit(probe, memory_max_gb=1)[1], 'physical or commit RAM floor')
+
+    def test_the_idle_check_has_no_memory_term_on_a_mac(self):
+        probe = self.probe()
+        job = dict(slots=1, memory_max_gb=50, requires=[], requested_defer=None)
+        self.assertTrue(fq._fits_idle(job, probe))              # 50 GB beside a 48 GB machine: no reservation, so it fits
+        self.assertFalse(fq._fits_idle(dict(job, slots=19), probe))
+        with patch.dict(os.environ, {'CQ_LAPTOP_PLATFORM': 'windows'}):
+            win = dict(host='laptop', at=self.clock[0], config=fq._laptop_config(self.ctx, dict(logical_cpus=16)),
+                       data=dict(total_gb=32, capabilities=['python']))
+            self.assertFalse(fq._fits_idle(job, win))           # Windows keeps the cap-plus-floor test
 
     def test_slots_still_bound_admission_and_a_job_larger_than_the_pool_never_fits(self):
         self.write_config(laptop_slots=2)
@@ -413,6 +441,52 @@ class FiguresTests(Fixture):
             self.assertEqual(fq.laptop_figures(self.ctx), dict(slots_total=5, slots_used=2, ram_floor_gb=0, needs_ac=True))
         with patch('mac_pool.probe', return_value=dict(raw, supported=False)):
             self.assertEqual(fq.laptop_figures(self.ctx), {})
+
+
+class FiguresFromOneProbeTests(Fixture):
+    def test_laptop_figures_uses_the_probe_it_is_given(self):
+        self.mac()
+        self.confirm_default_lock()
+        raw = dict(supported=True, logical_cpus=18, available_gb=30, commit_free_gb=30, total_gb=48, boot_identity='b', pressure=1)
+        with patch('mac_pool.probe', side_effect=AssertionError('probed again')):
+            self.assertEqual(fq.laptop_figures(self.ctx, raw), dict(slots_total=18, slots_used=0, ram_floor_gb=0, needs_ac=False))
+
+
+class HeavyLockFolderTests(Fixture):
+    """cq.Laptop.heavy_lock_held creates a missing lock folder only at the queue's own default place."""
+
+    def setUp(self):
+        super().setUp()
+        if os.name == 'nt':
+            self.skipTest('flock')
+
+    def held(self, lock, **env):
+        with patch.object(cq, 'HEAVY_LOCK', str(lock)), patch.dict(os.environ, dict(CQ_STATE=str(self.state), **env)):
+            return cq.Laptop().heavy_lock_held()
+
+    def test_a_missing_default_folder_is_created_and_not_held(self):
+        for name in ('CQ_HEAVY_LOCK', 'CQ_HEAVYRUN', 'CQ_BATON_DIR'):
+            os.environ.pop(name, None)
+        state = self.state / 'fresh'
+        with patch.object(cq, 'HEAVY_LOCK', str(state / 'heavy.lock')), patch.dict(os.environ, {'CQ_STATE': str(state)}):
+            self.assertFalse(cq.Laptop().heavy_lock_held())
+        self.assertTrue((state / 'heavy.lock').exists())
+
+    def test_a_missing_folder_of_an_explicit_path_is_held_and_not_created(self):
+        for env in ({'CQ_HEAVY_LOCK': str(self.state / 'elsewhere' / 'heavy.lock')},
+                    {'CQ_BATON_DIR': str(self.state / 'baton')}):
+            with self.subTest(env=env):
+                lock = Path(env.get('CQ_HEAVY_LOCK') or Path(env['CQ_BATON_DIR']) / 'heavy.lock')
+                with patch.object(cq, 'HEAVY_LOCK', str(lock)), patch.dict(os.environ, dict(CQ_STATE=str(self.state), **env)):
+                    self.assertTrue(cq.Laptop().heavy_lock_held())
+                self.assertFalse(lock.parent.exists())
+
+    def test_a_default_path_that_is_not_the_state_folder_is_not_created_either(self):
+        lock = self.state / 'sub' / 'heavy.lock'
+        for name in ('CQ_HEAVY_LOCK', 'CQ_HEAVYRUN', 'CQ_BATON_DIR'):
+            os.environ.pop(name, None)
+        self.assertTrue(self.held(lock))
+        self.assertFalse(lock.parent.exists())
 
 
 class CapacityTests(Fixture):

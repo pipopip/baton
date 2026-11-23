@@ -49,7 +49,7 @@ def context(engine, ctx, generation):
                         run_remoterun=ctx.run_remoterun, spawn=ctx.spawn,
                         laptop=ctx.laptop, sync=ctx.sync)
     # Preserve injected lock bounds and config-refresh behavior in tests and bridge.
-    for attr in ('qlock_timeout', 'refresh_config', 'artifact_stream'):
+    for attr in ('qlock_timeout', 'refresh_config', 'artifact_stream', 'claude_home'):
         if hasattr(ctx, attr):
             setattr(result, attr, getattr(ctx, attr))
     result.host_id = ctx.host_id

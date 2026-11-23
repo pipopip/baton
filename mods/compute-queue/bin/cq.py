@@ -495,11 +495,17 @@ def worktree_identity(path):
     return {"device": st.st_dev, "inode": st.st_ino, "birth_ns": birth_ns}
 
 
-def require_worktree_owner(top, session):
+def owner_matches(owner, session, *, vendor=None, claude_home=None):
+    if (not isinstance(owner, dict) or not isinstance(session, str) or not session
+            or owner.get("session_id") != session or (vendor is not None and owner.get("vendor") != vendor)):
+        return False
+    return claude_home is None or (owner.get("vendor") == "claude" and _claude_owner_home_matches(owner, claude_home))
+
+
+def require_worktree_owner(top, session, *, claude_home=None):
     """Check local coordination for requests carrying an agent session."""
     owner = read_json(os.path.join(top, ".baton", "owner.json"))
-    if (not isinstance(session, str) or not session or not isinstance(owner, dict)
-            or owner.get("session_id") != session or owner.get("vendor") not in ("claude", "codex")):
+    if (not owner_matches(owner, session, claude_home=claude_home) or owner.get("vendor") not in ("claude", "codex")):
         raise CqError("operation requires the current worktree owner session")
 
 
@@ -515,13 +521,20 @@ def owner_lock(top):
     return FileLock(os.path.join(top, ".baton", "owner.lock"), 2.0)
 
 
-def notice_matches_worktree(job, top, identity=None, owner_session=None):
+def notice_matches_worktree(job, top, identity=None, owner_session=None, *, strict=False):
     """Do not adopt a result from an earlier directory that used the same path."""
     if not top or not same_path(job.get("top", ""), top):
         return False
     current = identity if identity is not None else worktree_identity(top)
     if current is None:
         return False
+    if strict:
+        stored_top = job.get("top")
+        try:
+            if not isinstance(stored_top, str) or not os.path.isabs(stored_top) or worktree_identity(stored_top) != current:
+                return False
+        except (OSError, ValueError):
+            return False
     original = job.get("worktree_identity")
     if original is not None:
         return original == current
@@ -676,9 +689,19 @@ def spawn_detached(argv, env=None, stdout=None, cwd=None):
 class Laptop:
     """The laptop's side: heavy lock, free RAM, process liveness, tree kill."""
 
+    @staticmethod
+    def _lock_folder_is_ours():
+        """Whether the heavy lock is at its default place, the queue's own state folder: only then is a missing folder
+        a new queue nobody holds. An explicit path (CQ_HEAVY_LOCK, CQ_BATON_DIR, heavy_lock or heavyrun in the runtime
+        config) names a lock another party owns: if its folder is missing, that is not ours to create and reads as held."""
+        state = queue_paths.config_state(norm_path(os.environ.get("CQ_STATE") or DEFAULT_STATE))
+        return (not queue_paths.explicit_legacy_lock(state)
+                and norm_path(os.path.dirname(HEAVY_LOCK) or ".") == norm_path(state))
+
     def heavy_lock_held(self):
         try:
-            os.makedirs(os.path.dirname(HEAVY_LOCK) or ".", exist_ok=True)   # a new state folder: nobody holds it yet
+            if self._lock_folder_is_ours():
+                os.makedirs(os.path.dirname(HEAVY_LOCK), exist_ok=True)   # a new state folder: nobody holds it yet
             fd = os.open(HEAVY_LOCK, os.O_RDWR | os.O_CREAT)
         except OSError:
             return True
@@ -716,6 +739,13 @@ class Laptop:
         st.dwLength = ctypes.sizeof(MEMSTATUS)
         ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
         return round(st.ullAvailPhys / 2**30, 1)
+
+    def mac_probe(self):
+        """The Mac pool's resource probe, once, for a capacity sample (None off a Mac)."""
+        if sys.platform != "darwin":
+            return None
+        import mac_pool
+        return mac_pool.probe()
 
     def memory_pressure(self):
         """The kernel's memory pressure level (1 normal, 2 warn, 4 critical) on a Mac, else None."""
@@ -883,7 +913,7 @@ class Ctx:
     """Everything with side effects outside the state dir, so tests can inject it."""
 
     def __init__(self, state=None, now=None, ssh=None, run_remoterun=None, spawn=None, laptop=None, sync=False,
-                 artifact_stream=None):
+                 artifact_stream=None, claude_home=None):
         self.state = norm_path(state or os.environ.get("CQ_STATE") or DEFAULT_STATE)
         self.legacy_state = norm_path(queue_paths.config_state(self.state))
         self.generation = 2 if queue_paths.is_generation2(self.state) else 1
@@ -897,6 +927,7 @@ class Ctx:
         self.laptop = laptop or Laptop()
         self.sync = sync
         self.artifact_stream = artifact_stream
+        self.claude_home = claude_home
 
     def p(self, *parts):
         if parts and (parts[0] in ("hosts.json", "host.conf.json", "runtime.local.json", "laptop.conf.json")
@@ -1502,7 +1533,7 @@ def cmd_submit(ctx, req):
     if where == "laptop" and not legacy_laptop_executes():
         if laptop_executes():  # a Mac: its laptop takes fleet jobs only
             raise CqError("where 'laptop' is refused here: this Mac runs laptop work as fleet jobs (CPU slots, a memory "
-                          "cap, low priority); use where 'fleet' with candidates ['laptop'] and platform 'macos' (or "
+                          "cap, admitted on memory pressure); use where 'fleet' with candidates ['laptop'] and platform 'macos' (or "
                           "'portable'), with slots of at least 1, no split and no self_heavy")
         raise CqError(f"where 'laptop' is refused: the laptop is {LAPTOP_NOT_EXECUTOR} (only a Windows controller runs "
                       "laptop jobs); use where 'host' or 'fleet' to run it on a remote Linux device")
@@ -1591,7 +1622,7 @@ def cmd_submit(ctx, req):
     identity = worktree_identity(top)
     if identity is None:
         raise CqError("cannot identify the submitting worktree")
-    require_worktree_owner(top, req["session"])
+    require_worktree_owner(top, req["session"], claude_home=ctx.claude_home)
     now = ctx.now()
     job_id = new_id(now, ctx.host_id) if ctx.host_id else new_id(now)
     if load_job(ctx, job_id):
@@ -1621,7 +1652,7 @@ def cmd_submit(ctx, req):
         with owner_lock(top), ctx.qlock():
             if identity != worktree_identity(top):
                 raise CqError("submitting worktree changed before acceptance")
-            require_worktree_owner(top, req["session"])
+            require_worktree_owner(top, req["session"], claude_home=ctx.claude_home)
             # Clock ties are common in concurrent sessions and deterministic tests.
             sequence_path = ctx.p("queue-sequence.json")
             if load_job(ctx, job_id):
@@ -1763,7 +1794,22 @@ def _repository_top(root):
         return None
 
 
-def attached_request(ctx, request):
+def _claude_owner_home_matches(owner, home):
+    from pathlib import Path
+    selected = Path(os.path.expanduser(home or "~/.claude")).resolve()
+    recorded = owner.get("config_home")
+    if isinstance(recorded, str) and os.path.isabs(recorded):
+        return Path(recorded).resolve() == selected
+    transcript = owner.get("transcript")
+    if isinstance(transcript, str) and os.path.isabs(transcript):
+        projects = Path(transcript).parent.parent
+        if projects.name == "projects":
+            return projects.parent.resolve() == selected
+    # Older main-account claims may have neither a transcript nor a config_home.
+    return owner.get("account") in (None, "main") and selected == (Path.home() / ".claude").resolve()
+
+
+def attached_request(ctx, request, *, claude_home=None):
     """The request with `root` replaced by the worktree its session attached to, when the session's own directory is
     outside any repository.
 
@@ -1776,25 +1822,119 @@ def attached_request(ctx, request):
     if not isinstance(root, str) or not root or not isinstance(session, str) or not session:
         return request
     try:
-        if _repository_top(root) is not None:
+        if claude_home is None and _repository_top(root) is not None:
             return request
         book = read_json(os.path.join(os.path.dirname(queue_paths.config_state(ctx.state)), "attached.json"))
-        entry = book.get(session) if isinstance(book, dict) else None
-        target = entry.get("worktree") if isinstance(entry, dict) else None
-        if not isinstance(target, str) or _repository_top(target) is None:
+        if not isinstance(book, dict):
             return request
-        owner = read_json(os.path.join(target, ".baton", "owner.json"))
-        if not isinstance(owner, dict) or owner.get("session_id") != session:
+        # Older clients send only a session ID. A collision must not pick a different account's worktree.
+        candidates = []
+        for key, entry in book.items():
+            if not isinstance(entry, dict) or entry.get("session_id", key) != session:
+                continue
+            vendor, account = entry.get("vendor"), entry.get("account")
+            if vendor not in ("claude", "codex") or not isinstance(account, str) or not account:
+                continue
+            if "session_id" in entry and key != json.dumps([vendor, account, session], separators=(",", ":")):
+                continue
+            if claude_home is not None and vendor != "claude":
+                continue
+            candidates.append(entry)
+        if claude_home is None and len(candidates) != 1:
             return request
-        return {**request, "root": norm_path(target)}
+        matches = []
+        for entry in candidates:
+            target = entry.get("worktree")
+            if not isinstance(target, str) or _repository_top(target) is None:
+                continue
+            owner = read_json(os.path.join(target, ".baton", "owner.json"))
+            if (owner_matches(owner, session, vendor=entry["vendor"], claude_home=claude_home)
+                    and owner.get("account") == entry["account"]):
+                matches.append(target)
+        if len(matches) == 1:
+            return {**request, "root": norm_path(matches[0])}
+        return request
     except (OSError, ValueError, TypeError, AttributeError):
         return request
+
+
+def authorize_job_read(req, job):
+    # An in-process adapter can bind reads to its caller. Apply that check to
+    # the record actually loaded by the leaf, including each wait poll.
+    authorize = req.get('_authorize_job_read')
+    if authorize is not None:
+        authorize(job)
+
+
+JOB_UNAVAILABLE = "job is unavailable to the current worktree owner"
+
+
+class JobScope:
+    """An authenticated worktree owner and the directory incarnation it owns."""
+
+    OWNER_KEYS = ("vendor", "account", "config_home", "session_id", "transcript")
+
+    def __init__(self, owner, refusal=CqError):
+        self.root = owner["root"]
+        self.session = owner["session"]
+        self.owner_identity = tuple(owner["record"].get(key) for key in self.OWNER_KEYS)
+        self.refusal = refusal
+        self.owner_path = os.path.join(self.root, ".baton", "owner.json")
+        self.identity = worktree_identity(self.root)
+        self.require_current()
+
+    def require_current(self):
+        try:
+            owner = read_json(self.owner_path)
+            current = (self.identity is not None and worktree_identity(self.root) == self.identity
+                       and isinstance(owner, dict) and tuple(owner.get(key) for key in self.OWNER_KEYS) == self.owner_identity)
+        except (OSError, ValueError):
+            current = False
+        if not current:
+            raise self.refusal(JOB_UNAVAILABLE)
+
+    def contains(self, job):
+        return isinstance(job, dict) and notice_matches_worktree(job, self.root, self.identity, self.session, strict=True)
+
+    def require_job(self, job):
+        self.require_current()
+        if not self.contains(job):
+            raise self.refusal(JOB_UNAVAILABLE)
+
+
+def scoped_queue_status(ctx, result, scope=None):
+    """Return fleet aggregates and, for a current owner, rows from its worktree."""
+    if not result.get("ok"):
+        return result
+    fleet = result.get("fleet")
+    response = {"ok": True}
+    if isinstance(fleet, dict):
+        import fleet_telemetry
+        devices = {host: dict(device, reason=fleet_telemetry._reason_word(device["reason"]) if device.get("reason") else "")
+                   for host, device in fleet.get("devices", {}).items()}
+        response["fleet"] = {**fleet, "devices": devices}
+    if result.get("generation2_unavailable"):
+        response["generation2_unavailable"] = "generation-two queue is unavailable"
+    if scope is None:
+        return response
+    import queue_generations
+    jobs = [job for job in queue_generations.all_jobs(sys.modules[__name__], ctx)
+            if not job.get("parent") and scope.contains(job)]
+    now = ctx.now()
+    active = sorted((job for job in jobs if job.get("status") in ("queued", "launching", "running")),
+                    key=lambda job: start_key(job, now))
+    recent = sorted((job for job in jobs if job.get("status") in TERMINAL),
+                    key=lambda job: job.get("t_finished") or 0)[-5:]
+    response.update(queue=[status_row(job, now) for job in active], recent=[status_row(job, now) for job in recent])
+    scope.require_current()
+    return response
 
 
 def cmd_get(ctx, req):
     job = load_job(ctx, req.get("job", ""))
     if not job:
         raise CqError(f"no such job {req.get('job')!r}")
+    authorize_job_read(req, job)
     delivered = {}
     if job.get("status") in TERMINAL:
         marked = mark_delivered(ctx, job["id"], req.get("seen_by"), "status")
@@ -1803,7 +1943,11 @@ def cmd_get(ctx, req):
         return {"ok": True, **delivered, "job": job_brief(job, ctx.now())}
     out = dict(job)
     if job.get("children"):
-        out["child_jobs"] = [load_job(ctx, c) for c in job["children"]]
+        children = [load_job(ctx, child_id) for child_id in job["children"]]
+        for child in children:
+            if child is not None:
+                authorize_job_read(req, child)
+        out["child_jobs"] = children
     return {"ok": True, "job": out}
 
 
@@ -1859,7 +2003,7 @@ def cmd_cancel(ctx, req):
         identity = worktree_identity(top)
         if identity is None or job.get("worktree_identity") is None or identity != job["worktree_identity"]:
             raise CqError("cancellation worktree identity changed or is unavailable")
-        require_worktree_owner(top, session)
+        require_worktree_owner(top, session, claude_home=ctx.claude_home)
         if job["status"] in TERMINAL:
             return {"ok": True, "job": job_id, "status": job["status"], "note": "already finished"}
         targets = [job]
@@ -2329,19 +2473,22 @@ def probe(ctx, snap=None, err="", attempted=True):
     save_host_state(ctx, hs)
     if laptop_executes() and laptop_platform() == "macos":
         # a Mac's laptop takes fleet jobs: real numbers, but the ordinary queue's laptop path is off (`legacy: False`)
-        ram = ctx.laptop.free_ram_gb()
+        # one probe for the whole sample; a laptop object without `mac_probe` (a test's) is read figure by figure
+        snap = _laptop_call(ctx.laptop, "mac_probe")
+        snap = snap if isinstance(snap, dict) and snap.get("supported") is True else None
+        ram = round(snap["available_gb"], 1) if snap else ctx.laptop.free_ram_gb()
         laptop = {"legacy": False, "platform": "macos", "heavy_busy": bool(ctx.laptop.heavy_lock_held()), "free_ram_gb": ram,
                   "ram_ok": ram >= LAPTOP_RAM_MIN_GB}
-        battery = _laptop_call(ctx.laptop, "on_battery")
+        battery = snap.get("on_battery") if snap else _laptop_call(ctx.laptop, "on_battery")
         if battery is not None:
             laptop["on_battery"] = bool(battery)
-        level = _laptop_call(ctx.laptop, "memory_pressure")
+        level = snap.get("pressure") if snap else _laptop_call(ctx.laptop, "memory_pressure")
         if level in (1, 2, 4):
             laptop["memory_pressure"] = {1: "normal", 2: "warn", 4: "critical"}[level]
         try:  # slots used of total, the RAM floor and the battery rule, as the fleet admission has them
             import fleet_queue
             fleet_queue.bind(sys.modules[__name__])
-            laptop.update(fleet_queue.laptop_figures(ctx))
+            laptop.update(fleet_queue.laptop_figures(ctx, snap))
         except Exception:
             pass
     elif laptop_executes():
@@ -4757,12 +4904,17 @@ def _mark_delivered(ctx, job_id, seen_by, via):
         return False
     top = _top_of(root) if os.path.isdir(root) else root
     vendor = seen_by.get("vendor") or "claude"
-    if not notice_owner_matches(top, session, vendor):
+    if not notice_owner_matches(top, session, vendor, claude_home=ctx.claude_home):
         return False
-    with ctx.qlock():
+    lease = owner_lock(top) if ctx.claude_home is not None else contextlib.nullcontext()
+    with lease, ctx.qlock():
+        if not notice_owner_matches(top, session, vendor, claude_home=ctx.claude_home):
+            return False
         job = load_job(ctx, job_id)
+        authorize_job_read(seen_by, job)
         if (not job or job.get("parent") or job.get("status") not in TERMINAL or job.get("notified")
-                or not job.get("notify", True) or not notice_matches_worktree(job, top, worktree_identity(top), session)):
+                or not job.get("notify", True)
+                or not notice_matches_worktree(job, top, worktree_identity(top), session, strict=ctx.claude_home is not None)):
             return False
         job["notified"] = True
         job["notified_via"] = via
@@ -4889,12 +5041,12 @@ def cmd_tick(ctx, req):
     return out
 
 
-def notice_owner_matches(top, session, vendor="claude"):
+def notice_owner_matches(top, session, vendor="claude", *, claude_home=None):
     """A notice belongs to the currently claimed session, not merely its worktree."""
     if not top or not session:
         return False
     owner = read_json(os.path.join(top, ".baton", "owner.json"))
-    return isinstance(owner, dict) and owner.get("vendor") == vendor and owner.get("session_id") == session
+    return owner_matches(owner, session, vendor=vendor, claude_home=claude_home)
 
 
 def attention_counts(jobs):
@@ -4905,28 +5057,40 @@ def attention_counts(jobs):
     return {"failed": failed, "missing": missing}
 
 
+def watch_top(ctx, root, session):
+    if ctx.claude_home is None:
+        return _top_of(root) if root and os.path.isdir(root) else root
+    top = _repository_top(root)
+    return top if notice_owner_matches(top, session, claude_home=ctx.claude_home) else None
+
+
 def watch(ctx, root, now, session=""):
     """What one session sees: its own jobs' counts and the unnotified finished ones; the queue totals."""
-    top = _top_of(root) if root and os.path.isdir(root) else root
+    top = watch_top(ctx, root, session)
     jobs = all_jobs(ctx)
     identity = worktree_identity(top) if top else None
-    mine = [j for j in jobs if not j.get("parent") and identity is not None and notice_matches_worktree(j, top, identity, session)]
+    strict = ctx.claude_home is not None
+    mine = [j for j in jobs if not j.get("parent") and identity is not None
+            and notice_matches_worktree(j, top, identity, session, strict=strict)]
     # Legacy active jobs still use resources after a handoff. Include them in
     # activity counts, but never treat their completion as safe to deliver.
-    uncertain = [j for j in jobs if not j.get("parent") and identity is not None and
+    uncertain = [j for j in jobs if not strict and not j.get("parent") and identity is not None and
                  j.get("worktree_identity") is None and j.get("session") != session and
                  same_path(j.get("top", ""), top) and j.get("status") in ("running", "launching", "queued")]
     pending = [j for j in mine if j.get("status") in TERMINAL and j.get("notify", True) and not j.get("notified")]
     done = [notice_data(j) for j in pending]
     # A predecessor's timer can finish a tick during any handoff, including
     # Claude-to-Claude. Never offer its result to a non-owner or unknown owner.
-    if not notice_owner_matches(top, session):
+    if not notice_owner_matches(top, session, claude_home=ctx.claude_home):
         done, pending = [], []
+        if strict:
+            top, mine, uncertain = None, [], []
     queued = [j for j in jobs if j.get("status") == "queued" and not j.get("parent")]
     return {"mine_running": sum(1 for j in mine + uncertain if j["status"] in ("running", "launching")),
             "mine_queued": sum(1 for j in mine + uncertain if j["status"] == "queued"),
             "mine_unverified": len(uncertain),
-            "queued": len(queued), "to_notify": done, "top": top, "mine_attention": attention_counts(pending)}
+            "queued": len(queued), "to_notify": done, **({"top": top} if top is not None else {}),
+            "mine_attention": attention_counts(pending)}
 
 
 def cmd_watch(ctx, req):
@@ -4936,22 +5100,24 @@ def cmd_watch(ctx, req):
 def cmd_notice_authorize(ctx, req):
     """Recheck ownership and pending jobs immediately before a Claude prompt."""
     top, session = req.get("root") or "", req.get("session") or ""
-    if not notice_owner_matches(top, session):
+    if not notice_owner_matches(top, session, claude_home=ctx.claude_home):
         return {"ok": False, "error": "notice owner changed"}
     wanted = req.get("ids") or []
     if not isinstance(wanted, list) or len(wanted) > 5 or any(
             not isinstance(jid, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,100}", jid)
             for jid in wanted):
         return {"ok": False, "error": "invalid notice ids"}
-    with ctx.qlock():
-        if not notice_owner_matches(top, session):
+    lease = owner_lock(top) if ctx.claude_home is not None else contextlib.nullcontext()
+    with lease, ctx.qlock():
+        if not notice_owner_matches(top, session, claude_home=ctx.claude_home):
             return {"ok": False, "error": "notice owner changed"}
         identity = worktree_identity(top)
         jobs = []
         for jid in wanted:
             j = load_job(ctx, jid)
             if (j and not j.get("parent") and j.get("status") in TERMINAL and j.get("notify", True)
-                    and not j.get("notified") and identity is not None and notice_matches_worktree(j, top, identity, session)):
+                    and not j.get("notified") and identity is not None
+                    and notice_matches_worktree(j, top, identity, session, strict=ctx.claude_home is not None)):
                 jobs.append(notice_data(j))
         return {"ok": True, "jobs": jobs}
 
@@ -5213,6 +5379,7 @@ def cmd_status(ctx, req):
         job = load_job(ctx, req["job"])
         if not job:
             raise CqError(f"no such job {req['job']!r}")
+        authorize_job_read(req, job)
         if job.get('defer'):
             refresh = refresh_deferred(ctx, job)
         elif (job.get('placed_where') == 'laptop' and job.get('status') in TERMINAL
@@ -5226,6 +5393,7 @@ def cmd_status(ctx, req):
                     _, _, missing = capture_local_job(ctx, job, os.path.join(run, 'src'))
                     with ctx.qlock():
                         current = load_job(ctx, job['id'])
+                        authorize_job_read(req, current)
                         current['artifact_missing'] = missing
                         save_job(ctx, current)
                     if not missing:
@@ -5272,6 +5440,7 @@ def cmd_wait(ctx, req):
         job = load_job(ctx, job_id)
         if not job:
             raise CqError(f"no such job {job_id!r}")
+        authorize_job_read(req, job)
         if job["status"] in TERMINAL:
             # the caller now has the result: when it is the session the notice would go to, the notice is not sent
             marked = mark_delivered(ctx, job_id, req.get("seen_by"), "wait")
@@ -5284,27 +5453,28 @@ def cmd_wait(ctx, req):
 
 def cmd_notified(ctx, req):
     ids = req.get("ids") or ([req["job"]] if req.get("job") else [])
-    with ctx.qlock():
-        if req.get("owner_session") and not notice_owner_matches(req.get("owner_root") or "", req["owner_session"],
-                                                                   req.get("owner_vendor") or "claude"):
+    top, session = req.get("owner_root") or "", req.get("owner_session")
+    vendor, scoped = req.get("owner_vendor") or "claude", ctx.claude_home is not None
+    if scoped and (ids or req.get("ack_alert")) and not notice_owner_matches(top, session, vendor, claude_home=ctx.claude_home):
+        return {"ok": False, "error": "notice owner changed"}
+    lease = owner_lock(top) if scoped and session and top else contextlib.nullcontext()
+    with lease, ctx.qlock():
+        if session and not notice_owner_matches(top, session, vendor, claude_home=ctx.claude_home):
             return {"ok": False, "error": "notice owner changed"}
-        if req.get("owner_session"):
-            identity = worktree_identity(req.get("owner_root") or "")
-            jobs = [load_job(ctx, i) for i in ids]
-            if identity is None or any(not j or not notice_matches_worktree(j, req.get("owner_root") or "", identity, req.get("owner_session")) for j in jobs):
+        jobs = [load_job(ctx, i) for i in ids]
+        if session:
+            identity = worktree_identity(top)
+            if identity is None or any(not j or not notice_matches_worktree(j, top, identity, session, strict=scoped) for j in jobs):
                 return {"ok": False, "error": "notice worktree changed"}
-        else:
-            jobs = [load_job(ctx, i) for i in ids]
         for j in jobs:
-            if (j and not j.get("notified") and
-                    (not req.get("owner_session") or notice_matches_worktree(j, req.get("owner_root") or "", identity, req.get("owner_session")))):
+            if j and not j.get("notified"):
                 j["notified"] = True
                 save_job(ctx, j)
-    if req.get("ack_alert"):
-        hs = host_state(ctx)
-        if hs.get("disk_alert"):
-            hs["disk_alert"]["acked"] = True
-            save_host_state(ctx, hs)
+        if req.get("ack_alert"):
+            hs = host_state(ctx)
+            if hs.get("disk_alert"):
+                hs["disk_alert"]["acked"] = True
+                save_host_state(ctx, hs)
     return {"ok": True, **({"acknowledged_ids": ids} if req.get("notice_protocol") == 2 else {})}
 
 
@@ -5382,7 +5552,64 @@ def _execute_single(ctx, command, request):
 
 def execute(ctx, command, request):
     import queue_generations
-    return queue_generations.execute(sys.modules[__name__], ctx, command, attached_request(ctx, request), _execute_current)
+    engine = sys.modules[__name__]
+    if command not in ("get", "status", "wait") or (ctx.claude_home is None and "read_authority" not in request):
+        req = attached_request(ctx, request, claude_home=ctx.claude_home)
+        if ctx.claude_home is not None and command == "notified" and req.get("owner_root"):
+            owner_req = {"root": req["owner_root"], "session": req.get("owner_session")}
+            req = {**req, "owner_root": attached_request(ctx, owner_req, claude_home=ctx.claude_home)["root"]}
+        if ctx.claude_home is not None and command in ("tick", "leader"):
+            session = req.get("session")
+            if isinstance(session, str) and session:
+                home = os.path.normcase(os.path.realpath(os.path.expanduser(ctx.claude_home)))
+                if home != os.path.normcase(os.path.realpath(os.path.expanduser("~/.claude"))):
+                    lease_session = "claude-" + hashlib.sha256(os.fsencode(home) + b"\0" + session.encode()).hexdigest()
+                    req = {**req, "watch_session": req.get("watch_session") or session, "session": lease_session}
+        return queue_generations.execute(engine, ctx, command, req, _execute_current)
+
+    authority = request.get("read_authority")
+    if not isinstance(authority, dict) or authority.get("vendor") != "claude":
+        raise CqError(JOB_UNAVAILABLE)
+    if command == "status" and request.get("view") is not None:
+        if request["view"] != "fleet" or request.get("job") or request.get("refresh"):
+            raise CqError("view=fleet is a cached overview; omit job and refresh")
+        result = queue_generations.execute(engine, ctx, command, {"view": "fleet"}, _execute_current)
+        return scoped_queue_status(ctx, result)
+
+    root, session = authority.get("root"), authority.get("session")
+    if not isinstance(root, str) or not os.path.isabs(root) or not isinstance(session, str) or not session:
+        raise CqError(JOB_UNAVAILABLE)
+    home = ctx.claude_home or authority.get("home") or os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"
+    if not isinstance(home, str):
+        raise CqError(JOB_UNAVAILABLE)
+    root = attached_request(ctx, {"root": root, "session": session}, claude_home=home)["root"]
+    top = _repository_top(root)
+    owner = read_json(os.path.join(top, ".baton", "owner.json")) if top else None
+    if not owner_matches(owner, session, vendor="claude", claude_home=home):
+        raise CqError(JOB_UNAVAILABLE)
+    scope = JobScope({"root": top, "session": session, "record": owner})
+
+    if command == "status" and not request.get("job"):
+        if request.get("refresh"):
+            raise CqError("refresh requires a job ID")
+        result = queue_generations.execute(engine, ctx, "status", {"view": "fleet"}, _execute_current)
+        return scoped_queue_status(ctx, result, scope)
+
+    job_id = request.get("job")
+    try:
+        job = queue_generations.load_job(engine, ctx, job_id)
+    except (CqError, OSError, ValueError):
+        raise CqError(JOB_UNAVAILABLE) from None
+    scope.require_job(job)
+    if job.get("id") != job_id:
+        raise CqError(JOB_UNAVAILABLE)
+    req = dict(request, _authorize_job_read=scope.require_job)
+    if req.get("seen_by"):
+        req["seen_by"] = {"root": top, "session": session, "_authorize_job_read": scope.require_job}
+    try:
+        return queue_generations.execute(engine, ctx, command, req, _execute_current)
+    finally:
+        scope.require_current()
 
 
 def _execute_current(ctx, command, request):
@@ -5420,7 +5647,7 @@ def main(argv=None):
     ap.add_argument("--state")
     ap.add_argument("--sync", action="store_true", help="run launches inline instead of in a detached worker")
     args = ap.parse_args(argv)
-    ctx = Ctx(state=args.state, sync=args.sync)
+    ctx = Ctx(state=args.state, sync=args.sync, claude_home=os.environ.pop("CQ_CLAUDE_HOOK_HOME", None))
     refresh_host_config(ctx.state, ctx.host_id)
     ctx.refresh_config = True
     if args.cmd == "_launch":
