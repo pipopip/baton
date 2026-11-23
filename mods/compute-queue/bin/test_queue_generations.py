@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+os.environ.setdefault('CQ_LAPTOP_PLATFORM', 'windows')   # the laptop these tests stand in for is the Windows one, whatever OS runs them
 import cq
 import fleet_telemetry
 import multi_host
@@ -305,6 +306,202 @@ class Generations(unittest.TestCase):
                 self.assertEqual(calls[-1][0], name == 'usable', name)
                 if name != 'usable':
                     self.assertEqual(calls[-1][1]['host_id'], 'hearth', name)
+
+    def _default_jobs_setup(self):
+        generations.context(cq, self.ctx, 2)
+        shard = self.root / 'hosts' / 'hearth'
+        shard.mkdir(parents=True)
+        calls = []
+        def leaf(ctx, cmd, req):
+            calls.append((ctx.state.endswith('queue-v2'), dict(req)))
+            return {'ok': True, 'job': self.fleet, 'note': 'fleet job accepted'}
+        base = {'root': str(self.root), 'session': 'sess-A', 'command': 'bash build.sh', 'slots': 2, 'requires': ['go']}
+        submit = lambda **fields: generations.execute(cq, self.ctx, 'submit', dict(base, **fields), leaf)
+        good = {'default_jobs': ['go', 'bash', 'python'], 'host_id': 'hearth', 'address': 'u@hearth', 'slots': 12, 'foreground_slots': 4}
+        def conf(**change):
+            (shard / 'host.conf.json').write_text(json.dumps(dict(good, **change)))
+        return shard, calls, submit, conf
+
+    def test_a_default_job_that_declares_its_tools_may_also_run_on_a_host_qualified_for_them(self):
+        shard, calls, submit, conf = self._default_jobs_setup()
+        both = lambda: self.assertEqual(calls[-1][1]['candidates'], ['ember', 'hearth'])
+        alone = lambda note=None: self.assertEqual((calls[-1][0], calls[-1][1]['candidates'], 'requires' in calls[-1][1]),
+                                                   (True, ['ember'], False), note)
+        stored = {'memory_max_gb': 8.0}
+        with mock.patch.object(cq, 'load_job', side_effect=lambda ctx, jid: dict(stored)):
+            # a host that lists no tools takes none: no file, no key, a list that lacks a required name
+            for text in (None, json.dumps({'host_id': 'hearth', 'address': 'u@hearth'}),
+                         json.dumps({'host_id': 'hearth', 'address': 'u@hearth', 'default_jobs': ['node']})):
+                if text is not None:
+                    (shard / 'host.conf.json').write_text(text)
+                result = submit()
+                alone(text)
+            self.assertIn('fleet job on ember: CPU', result['note'])
+            # qualified for the declared tools: both hosts, `requires` kept for the fleet backend to place by
+            conf()
+            result = submit()
+            v2, sent = calls[-1]
+            self.assertEqual((v2, sent['where'], sent['candidates'], sent['requires'], 'host_id' in sent),
+                             (True, 'fleet', ['ember', 'hearth'], ['go'], False))
+            self.assertEqual(sent['_default_memory_max_gb'], 8)
+            self.assertIn('fleet job on ember or hearth: CPU held to 2 slots', result['note'])
+            submit(requires=['go', 'bash'])                            # bash and python may be named beside another tool
+            self.assertEqual((calls[-1][1]['candidates'], calls[-1][1]['requires']), (['ember', 'hearth'], ['go', 'bash']))
+            # the list must hold every name declared
+            conf(default_jobs=['go'])
+            submit(requires=['go', 'bash'])
+            alone()
+            submit(requires=['go', 'node'])
+            alone()
+            conf(default_jobs=['go', 'node'])
+            submit(requires=['node', 'go'])
+            both()
+            # bash and python say nothing about what a job needs: a job naming only them stays on ember, listed or not
+            conf()
+            for requires in (['bash'], ['python'], ['python', 'bash'], ['bash', 'bash']):
+                submit(requires=requires)
+                alone(requires)
+            # what is not a non-empty list of tool names means none (the boolean of an earlier draft among them)
+            for value in (True, 'go', 'go,bash', [], {}, {'go': True}, None, 1, [7], ['go', 7], ['go', ''], ['has space'], [['go']]):
+                conf(default_jobs=value)
+                submit()
+                alone(value)
+            # the file is read only for a request that qualifies: one that names a host or declares no useful tool never opens it
+            conf()
+            with mock.patch('builtins.open', side_effect=AssertionError('settings read')):
+                for fields in ({'slots': 2}, {'slots': 2, 'requires': ['go'], 'host_id': 'ember'}, {'slots': 2, 'requires': ['bash']},
+                               {'slots': 2, 'requires': []}, {'slots': 0, 'requires': ['go']}):
+                    self.assertEqual(generations.default_job_hosts(cq, self.ctx, fields, 'ember', 8), [], fields)
+                self.assertEqual(generations.default_job_hosts(cq, self.ctx, {'slots': 2, 'requires': ['go']}, 'hearth', 8), [])
+            # no usable tool list on the job: ember only (empty, null, not a list, bad names, too many)
+            for fields in ({'requires': []}, {'requires': None}, {'requires': 'go'}, {'requires': ['']}, {'requires': [7]},
+                           {'requires': ['has space']}, {'requires': ['go'] * 33}):
+                submit(**fields)
+                alone(fields)
+            generations.execute(cq, self.ctx, 'submit', dict(root=str(self.root), session='sess-A', command='bash build.sh', slots=2),
+                                lambda c, m, r: calls.append((True, dict(r))) or {'ok': True})   # no requires at all
+            self.assertEqual((calls[-1][1]['candidates'], 'requires' in calls[-1][1]), (['ember'], False))
+            # naming a host is a pin, by its id or an alias of it; an empty host_id names none
+            (self.root / 'hosts.json').write_text(json.dumps({'version': 1, 'hosts': {
+                'hearth': {'state': 'hosts/hearth', 'enabled': True}}, 'aliases': {'build': 'ember', 'hestia': 'hearth'}}))
+            for name in ('ember', 'build'):
+                submit(host_id=name)
+                alone(name)
+            for name in (None, ''):
+                submit(host_id=name)
+                both()
+            submit(host_id='hestia')                                   # naming hearth itself is the existing rule: ordinary here
+            self.assertEqual((calls[-1][0], calls[-1][1]['host_id']), (False, 'hestia'))
+            # slots above hearth's fleet pool (12 less 4 kept for foreground work): ember only (ember's own pool is 14)
+            (self.root / 'host.conf.json').write_text(json.dumps({'name': 'ember', 'slots': 16}))
+            submit(slots=8)
+            both()
+            submit(slots=9)
+            alone()
+            (self.root / 'host.conf.json').unlink()
+            # a host the fleet backend could not use: ember only
+            for name, change in (('paused', {'paused': True}), ('no address', {'address': None}), ('empty address', {'address': ''}),
+                                 ('option as address', {'address': '-oProxyCommand=x'}), ('address with a space', {'address': 'u@h x'}),
+                                 ('host_id mismatch', {'host_id': 'hestia'}), ('no host_id', {'host_id': None})):
+                conf(**change)
+                submit()
+                alone(name)
+            for text in ('not json', '[]', '"default_jobs"', '[' * 5000, ''):
+                (shard / 'host.conf.json').write_text(text)
+                submit()
+                alone(text[:20])
+            (shard / 'host.conf.json').unlink()
+            submit()                                                   # no file at all
+            alone()
+            conf()
+            (self.root / 'hosts.json').write_text(json.dumps({'version': 1, 'hosts': {
+                'hearth': {'state': 'hosts/hearth', 'enabled': False}}}))
+            submit()                                                   # disabled in the registry
+            alone()
+            # a registry that cannot be read leaves the submission as it was: a file the generation context already
+            # refuses keeps the ordinary path (as in the tests above)
+            for text in ('not json', json.dumps({'version': 2, 'hosts': {}})):
+                (self.root / 'hosts.json').write_text(text)
+                submit()
+                self.assertEqual((calls[-1][0], 'candidates' in calls[-1][1], calls[-1][1]['requires']), (False, False, ['go']), text)
+            (self.root / 'hosts.json').write_text(json.dumps({'version': 1, 'hosts': {
+                'hearth': {'state': 'hosts/hearth', 'enabled': True}}}))
+            real = multi_host._registry
+            def fails_for_candidates(engine, ctx, aliases=None):
+                if aliases is not None:
+                    raise RuntimeError('boom')    # the generation context's own read (no aliases) works
+                return real(engine, ctx)
+            with mock.patch.object(multi_host, '_registry', side_effect=fails_for_candidates):
+                submit()
+                alone('a registry read that fails only for the candidates')
+            submit()                                                   # and the same request works once it can be read
+            both()
+            # the note names the hosts the fleet backend kept for the job (a sandbox job loses a host without one)
+            stored['candidates'] = ['ember']
+            self.assertIn('fleet job on ember: CPU held to 2 slots', submit()['note'])
+            stored['candidates'] = ['ember', 'hearth']
+            self.assertIn('fleet job on ember or hearth: CPU held', submit()['note'])
+            # a refusal of the fleet backend cannot name hosts it never stored
+            def refuse(ctx, cmd, req):
+                raise cq.CqError('no candidate can ever run this job')
+            with self.assertRaisesRegex(cq.CqError, r'\(a heavy where: host job now runs as a contained fleet job on ember, '
+                                                    r'or another host that takes default jobs, so a host can share its capacity\)$'):
+                generations.execute(cq, self.ctx, 'submit', dict(root=str(self.root), session='sess-A', command='x', slots=2,
+                                                                 requires=['go']), refuse)
+
+    def test_a_job_no_host_took_by_default_is_converted_exactly_as_before_the_setting(self):
+        shard, calls, submit, conf = self._default_jobs_setup()
+        states = (('no hearth file', ['go']), ('hearth without default_jobs', ['go']), ('hearth lists other tools', ['go']),
+                  ('hearth lists them, job names only bash', ['bash']))
+        for state, requires in states:
+            if state == 'hearth without default_jobs':
+                (shard / 'host.conf.json').write_text(json.dumps({'host_id': 'hearth', 'address': 'u@hearth'}))
+            elif state == 'hearth lists other tools':
+                conf(default_jobs=['node'])
+            elif state != 'no hearth file':
+                conf()
+            with mock.patch.object(cq, 'load_job', return_value={'memory_max_gb': 8.0}):
+                result = submit(requires=requires, priority='verify', est_minutes=20, host_id='', _default_memory_max_gb=50)
+            # what the conversion sent before the setting existed: fleet, ember alone, linux, the slots, ember's default
+            # cap (4 GB a slot, never under 8), a label from the command; no requires, no host_id
+            self.assertEqual(calls[-1], (True, {
+                'root': str(self.root), 'session': 'sess-A', 'command': 'bash build.sh', 'slots': 2, 'priority': 'verify',
+                'est_minutes': 20, 'where': 'fleet', 'candidates': ['ember'], 'platform': 'linux',
+                '_default_memory_max_gb': 8.0, 'label': 'bash build.sh'}), state)
+            self.assertEqual(result, {'ok': True, 'job': self.fleet, 'note': 'fleet job accepted; this where: host job runs as a '
+                'contained fleet job on ember: CPU held to 2 slots, memory capped at 8 GB (state memory_max_gb to change it)'}, state)
+
+    def test_a_host_with_a_memory_budget_below_the_default_cap_is_left_out_and_the_cap_never_changes(self):
+        shard, calls, submit, conf = self._default_jobs_setup()
+        other = self.root / 'hosts' / 'zeta'
+        other.mkdir(parents=True)
+        (self.root / 'hosts.json').write_text(json.dumps({'version': 1, 'hosts': {
+            'zeta': {'state': 'hosts/zeta', 'enabled': True}, 'hearth': {'state': 'hosts/hearth', 'enabled': True}}}))
+        zeta = lambda **change: (other / 'host.conf.json').write_text(json.dumps(dict(
+            {'default_jobs': ['go'], 'host_id': 'zeta', 'address': 'u@zeta', 'slots': 12, 'foreground_slots': 4}, **change)))
+        sent = lambda: (calls[-1][1]['candidates'], calls[-1][1]['_default_memory_max_gb'])
+        with mock.patch.object(cq, 'load_job', return_value={'memory_max_gb': 8.0}):
+            # ember's cap is 4 GB a slot: 20 GB for 5 slots. A budget below it leaves the host out; the cap is 20 whoever joins.
+            for budget, hosts in ((None, ['ember', 'hearth']), (20, ['ember', 'hearth']), (50, ['ember', 'hearth']),
+                                  (19.5, ['ember']), (15, ['ember']), (1, ['ember']),
+                                  (0.5, ['ember', 'hearth']), (64, ['ember', 'hearth']), (True, ['ember', 'hearth']),
+                                  ('9', ['ember', 'hearth']), ([9], ['ember', 'hearth'])):   # a budget the host cannot hold is none
+                conf(memory_budget_gb=budget) if budget is not None else conf()
+                submit(slots=5)
+                self.assertEqual(sent(), (hosts, 20), budget)
+            # two hosts: the one with room joins, the small one stays out; sorted order; the cap is still ember's
+            conf(memory_budget_gb=19)
+            zeta(memory_budget_gb=30)
+            submit(slots=5)
+            self.assertEqual(sent(), (['ember', 'zeta'], 20))
+            conf()
+            submit(slots=5)
+            self.assertEqual(sent(), (['ember', 'hearth', 'zeta'], 20))
+            zeta(slots=4, foreground_slots=0)                           # zeta's pool is 4: a 5-slot job leaves it out
+            submit(slots=5)
+            self.assertEqual(sent(), (['ember', 'hearth'], 20))
+            submit(slots=4)
+            self.assertEqual(sent(), (['ember', 'hearth', 'zeta'], 16))
 
     def test_the_ordinary_path_refuses_an_unknown_or_disabled_host_as_before(self):
         (self.root / 'hosts.json').write_text(json.dumps({'version': 1, 'hosts': {

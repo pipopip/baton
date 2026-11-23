@@ -42,6 +42,10 @@ class _BorrowedGate:
 
 
 class LocalPool:
+    # The platform's pool module and heavy-lock class: mac_broker.LocalPool names the macOS ones.
+    _pool = pool
+    _exclusive_lock = _ExclusiveLock
+
     def __init__(self, legacy_lock_path, max_cpu_slots=4, cohort_seconds=60, quiet_seconds=1):
         for name, value in (("max_cpu_slots", max_cpu_slots), ("cohort_seconds", cohort_seconds),
                             ("quiet_seconds", quiet_seconds)):
@@ -102,7 +106,7 @@ class LocalPool:
                 self._release_if_drained()
 
     def submit(self, descriptor_path):
-        d = pool._load_descriptor(descriptor_path)
+        d = self._pool._load_descriptor(descriptor_path)
         if os.path.normcase(os.path.realpath(d["legacy_lock_path"])) != self.path:
             raise ValueError("descriptor has a different legacy lock")
         # A declared reserve is mandatory for the pooled admission contract.
@@ -110,19 +114,19 @@ class LocalPool:
             raise ValueError("pooled jobs require RAM floor and pending reservation")
         if d["cpu_slots"] > self.max_cpu_slots:
             raise ValueError("job CPU slots exceed pool limit")
-        if os.path.lexists(pool.claim_path(descriptor_path)):
+        if os.path.lexists(self._pool.claim_path(descriptor_path)):
             raise FileExistsError("descriptor already claimed")
         outcome = {}
         ready = threading.Event()
         key = object()
         def claimed(pid, creation):
-            outcome["claim_fingerprint"] = pool.claim_fingerprint(descriptor_path)
+            outcome["claim_fingerprint"] = self._pool.claim_fingerprint(descriptor_path)
             outcome["receipt"] = {"pid": pid, "process_start_identity": creation}
             ready.set()
         def worker():
             try:
-                pool.run(descriptor_path, gate=_BorrowedGate(self), on_claim=claimed,
-                         expected_hash=pool._descriptor_hash(d))
+                self._pool.run(descriptor_path, gate=_BorrowedGate(self), on_claim=claimed,
+                         expected_hash=self._pool._descriptor_hash(d))
             except BaseException as exc:
                 outcome["error"] = exc
                 ready.set()
@@ -130,7 +134,7 @@ class LocalPool:
                 with self._lock:
                     if "receipt" in outcome:
                         self._completed[os.path.normcase(os.path.abspath(descriptor_path))] = (
-                            pool._descriptor_hash(d), outcome["receipt"], outcome["claim_fingerprint"])
+                            self._pool._descriptor_hash(d), outcome["receipt"], outcome["claim_fingerprint"])
                     self._jobs.pop(key, None)
                     self._release_if_drained()
                     self._condition.notify_all()
@@ -142,8 +146,8 @@ class LocalPool:
             if self.used_cpu_slots + d["cpu_slots"] > self.max_cpu_slots:
                 raise BusyError("pool CPU capacity busy")
             if self._gate is None:
-                pool._setup()
-                gate = _ExclusiveLock(self.path)
+                self._pool._setup()
+                gate = self._exclusive_lock(self.path)
                 try:
                     if not gate.try_acquire():
                         raise BusyError("legacy lock busy")
@@ -176,18 +180,18 @@ class LocalPool:
         pool can establish that no future launch remains possible.
         """
         with self._lock:
-            out = pool.observe(descriptor_path, pid, process_start_identity)
+            out = self._pool.observe(descriptor_path, pid, process_start_identity)
             completed = self._completed.get(os.path.normcase(os.path.abspath(descriptor_path)))
             if not completed:
                 return out
             try:
-                d = pool._load_descriptor(descriptor_path)
-                claim = pool.read_claim(descriptor_path)
+                d = self._pool._load_descriptor(descriptor_path)
+                claim = self._pool.read_claim(descriptor_path)
                 digest, receipt, fingerprint = completed
                 identity = (receipt["pid"], receipt["process_start_identity"])
                 supplied = (pid, process_start_identity)
-                if (fingerprint is not None and pool.claim_fingerprint(descriptor_path) == fingerprint and
-                        pool._descriptor_hash(d) == digest and claim is not None and
+                if (fingerprint is not None and self._pool.claim_fingerprint(descriptor_path) == fingerprint and
+                        self._pool._descriptor_hash(d) == digest and claim is not None and
                         (claim["worker_pid"], claim["worker_start_filetime"]) == identity and
                         supplied in ((None, None), identity) and
                         (out["job_exists"] is False or

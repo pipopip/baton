@@ -63,6 +63,34 @@ describe('the prompt builder', () => {
     expect(p).toContain('below the 6 GB floor')
   })
 
+  test('a Mac laptop says fleet jobs only, with slots, free RAM, memory pressure and the battery, not a heavy lock or a floor', () => {
+    const mac = capacity()
+    mac.laptop = { heavy_busy: true, free_ram_gb: 31.5, ram_ok: true, legacy: false, slots_used: 3, slots_total: 18, memory_pressure: 'warn', on_battery: true }
+    const p = buildRequest(input({ capacity: mac })).prompt
+    expect(p).toContain('laptop: runs fleet jobs only (start no job there; where any means the host)')
+    expect(p).toContain('3/18 fleet slots in use')
+    expect(p).toContain('31.5 GB RAM free; memory pressure warn (no new laptop work); on battery')
+    expect(p).not.toContain('(no new fleet work)')   // the battery does not hold work unless laptop_needs_ac is set
+    expect(p).not.toContain('heavy lock')
+    expect(p).not.toContain('floor')
+    mac.laptop = { heavy_busy: false, free_ram_gb: 20, legacy: false, memory_pressure: 'normal', needs_ac: true, on_battery: true }
+    const q = buildRequest(input({ capacity: mac })).prompt
+    expect(q).toContain('memory pressure normal; on battery (no new fleet work)')
+    mac.laptop = { heavy_busy: false, free_ram_gb: 20, legacy: false }
+    expect(buildRequest(input({ capacity: mac })).prompt).toContain('laptop: runs fleet jobs only (start no job there; where any means the host); 20 GB RAM free')
+  })
+
+  test('the pool holding the heavy lock does not change a Mac\'s snapshot', () => {
+    const a = capacity()
+    const b = capacity()
+    a.laptop = { heavy_busy: false, free_ram_gb: 20, legacy: false }
+    b.laptop = { heavy_busy: true, free_ram_gb: 20, legacy: false }
+    expect(snapshotKey(input({ capacity: a }))).toBe(snapshotKey(input({ capacity: b })))
+    a.laptop = { heavy_busy: false, free_ram_gb: 20 }
+    b.laptop = { heavy_busy: true, free_ram_gb: 20 }
+    expect(snapshotKey(input({ capacity: a }))).not.toBe(snapshotKey(input({ capacity: b })))
+  })
+
   test('empty queue and history render as (none)', () => {
     const p = buildRequest(input({ queued: [], running: [], medians: [] })).prompt
     expect(p).toContain('(none)')

@@ -466,6 +466,9 @@ def _k(tokens: int | None) -> str:
     return "?" if tokens is None else str(round(tokens / 1000))
 
 
+CYCLER_FAILED = "this session remains active"   # the end of on_stop's message when no cycle could be started
+
+
 def on_stop(data: dict, environ=None) -> dict | None:
     """The Stop hook: None (allow), a block decision, or a systemMessage when the cycler was started."""
     environ = os.environ if environ is None else environ
@@ -559,7 +562,7 @@ def on_stop(data: dict, environ=None) -> dict | None:
     if not ok:
         write_flag(root, None)
         log(f"fail {ws} session {harvest.id8(session_id)}: cycler {started}")
-        return {"systemMessage": f"baton cycle: could not start the cycler ({started}); this session remains active."}
+        return {"systemMessage": f"baton cycle: could not start the cycler ({started}); {CYCLER_FAILED}."}
     log(f"start {ws} session {harvest.id8(session_id)} pid={pid} tokens={tokens}: cycler {started}")
     return {"systemMessage": f"baton cycle: context ~{k}k tokens (limit {lim}k); a fresh `bt {ws}` session is starting in a "
                              "new tab; this one will be closed after a replacement claims the worktree."}
@@ -597,10 +600,30 @@ def _record_payload(data: dict, environ) -> None:
         pass
 
 
+def _tab_ready(data: dict, out: dict | None, environ=None) -> None:
+    """The turn ended for the user: tab colour and notification of this session's iTerm2 tab. Not when the hook blocked
+    the stop or answered with a message (a cycle was started: this session is about to be replaced), nor for a
+    follower, a subagent or a session that does not own its worktree (a nested headless ``claude -p`` inherits the
+    tab's tty). Never raises."""
+    try:
+        environ = os.environ if environ is None else environ
+        if out and ("decision" in out or ("systemMessage" in out and CYCLER_FAILED not in str(out["systemMessage"]))):
+            return                      # blocked, or a cycle started; a cycler that could not start leaves the turn ended
+        root, _why = session_root(data, environ)
+        if root is None:
+            return
+        from . import iterm
+        iterm.tab_state("ready", iterm.label_for(environ, root), environ, vendor="claude", repo=paths.repo_name(root))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def handle(kind: str, data: dict) -> dict | None:
     event = str(data.get("hook_event_name") or "")
     if kind == "stop" and event == "Stop":
-        return on_stop(data)
+        out = on_stop(data)
+        _tab_ready(data, out)
+        return out
     if kind == "pretool" and event == "PreToolUse":
         return on_pre_tool_use(data)
     return None

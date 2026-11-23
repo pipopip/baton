@@ -19,16 +19,17 @@ export default {
         "any",
         "fleet"
       ],
-      "description": "fleet selects a compatible configured device using independent CPU and RAM requirements. host (the default) with slots >= 1 and no host_id, or host_id ember, runs as a contained fleet job on ember: CPU held to the slots, memory capped (memory_max_gb, else the larger of 8 GB and 4 GB per slot). Another host's id (or an alias) does the same only when that host's host.conf.json sets host_jobs_to_fleet true. Otherwise, and for slots 0, split, self_heavy and RAM jobs, the ordinary queue keeps the job."
+      "description": "fleet selects a compatible configured device using independent CPU and RAM requirements. host (the default) with slots >= 1 and no host_id, or host_id ember, runs as a contained fleet job on ember (with no host_id and a non-empty requires it may also run on another host whose host.conf.json lists those tools in default_jobs): CPU held to the slots, memory capped (memory_max_gb, else the larger of 8 GB and 4 GB per slot). Another host's id (or an alias) does the same only when that host's host.conf.json sets host_jobs_to_fleet true. Otherwise, and for slots 0, split, self_heavy and RAM jobs, the ordinary queue keeps the job. On a Mac, laptop runs the job as a fleet job pinned to the Mac (slots >= 1; no split, self_heavy or RAM scratch)."
     },
     "platform": {
       "type": "string",
       "enum": [
         "linux",
         "windows",
+        "macos",
         "portable"
       ],
-      "description": "Fleet compatibility declaration; default linux. portable explicitly allows the same command on Windows and Linux."
+      "description": "Fleet compatibility declaration; default linux. windows and macos run only on that laptop (the Mac accepts macos and portable, a Windows laptop windows and portable); remote hosts are linux. portable explicitly allows the same command on the laptop and Linux hosts. The Mac takes short work (laptop_max_minutes, default 20) and, with every core and no RAM reservation, new work only while the kernel's memory pressure is normal."
     },
     "candidates": {
       "type": "array",
@@ -90,7 +91,7 @@ export default {
       "type": "number",
       "minimum": 0.25,
       "maximum": 50,
-      "description": "Enforced job memory cap in GiB: Linux cgroup memory, Windows aggregate committed memory. Required for pinned RAM/deferred jobs; fleet can derive a conservative cap from its estimate."
+      "description": "Enforced job memory cap in GiB: Linux cgroup memory, Windows aggregate committed memory, on the Mac a watchdog over the job's physical footprint that kills the tree above a cap you stated (exit 137) only while memory pressure is warn or critical. Required for pinned RAM/deferred jobs; fleet can derive a conservative cap from its estimate."
     },
     "sandbox": {
       "type": "boolean",

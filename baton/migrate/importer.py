@@ -777,7 +777,9 @@ def checklist(lay: Layout, src: Path, result: dict) -> list[str]:
     ssh = m["user"]["ssh"]
     items.append("ssh: copy these key files yourself (they are never carried): " + (", ".join(ssh["key_names"]) or "none")
                  + "; authorise this Mac's key on hosts: " + (", ".join(h["alias"] for h in ssh["hosts"]) or "none")
-                 + f"; staged config: {lay.new_root / STAGE / 'user' / 'ssh' / 'config'}")
+                 + f"; staged config: {lay.new_root / STAGE / 'user' / 'ssh' / 'config'}"
+                 + (f"; staged known_hosts (host keys only): {lay.new_root / STAGE / 'user' / 'ssh' / 'known_hosts'}; append it to ~/.ssh/known_hosts, because the compute queue connects with StrictHostKeyChecking=yes"
+                    if ssh.get("known_hosts") else ""))
     by_hand = m.get("secrets_by_hand", [])
     items.append("Secret-looking files that were not carried (copy by hand): "
                  + ("".join(f"\n   - {s['where']}" + (f" ({s['why']})" if s.get("why") else "") for s in by_hand) or "none"))

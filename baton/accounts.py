@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 import time
 import tomllib
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 
@@ -292,8 +293,49 @@ def utilisation(vendor: str, account: str, data: dict | None = None) -> int | No
 
 
 def logged_in(vendor: str, account: str) -> bool:
-    """True when the account's credential file exists (contents are never read)."""
+    """True when the account's credential file exists (contents are never read), or, for Claude on macOS, where
+    Claude Code keeps the login in the Keychain instead of ``.credentials.json``, when its Keychain item exists."""
+    if has_credential_file(vendor, account):
+        return True
+    if vendor != "claude" or not config.MACOS:
+        return False
+    found = _in_keychain(keychain_service(account))
+    return found is not False       # a keychain that cannot be read (locked, no GUI session) is no evidence of no login
+
+
+def has_credential_file(vendor: str, account: str) -> bool:
+    """The account's credential file exists: the only login whose expiry baton can read (``login_expiry``)."""
     return (config.account_dir(vendor, account) / CREDENTIAL_FILE[vendor]).is_file()
+
+
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+KEYCHAIN_ITEM_NOT_FOUND = 44        # errSecItemNotFound, as `security` exits
+
+
+def keychain_service(account: str) -> str:
+    """The Keychain service Claude Code files an account's login under on macOS: the bare name for ``main`` (run
+    without CLAUDE_CONFIG_DIR, see ``account_env``), else the name and the first 8 hex digits of the SHA-256 of
+    the NFC form of the config dir the account runs with (as Claude Code 2.1 derives it). Not handled: Claude
+    Code's CLAUDE_SECURESTORAGE_CONFIG_DIR override and the suffix of its non-production builds; with either, an
+    account shows as not logged in."""
+    if account == "main":
+        return KEYCHAIN_SERVICE
+    path = unicodedata.normalize("NFC", str(config.account_dir("claude", account)))
+    return f"{KEYCHAIN_SERVICE}-{hashlib.sha256(path.encode('utf-8')).hexdigest()[:8]}"
+
+
+def _in_keychain(service: str) -> bool | None:
+    """Whether the login keychain holds a generic password for ``service``: True, False (``security`` reports no
+    such item) or None (it could not tell: locked keychain, no ``security``, timeout). Only the item's attributes
+    are looked up (no ``-w``): the secret is never read and macOS shows no access prompt."""
+    try:
+        done = subprocess.run(["/usr/bin/security", "find-generic-password", "-s", service],
+                              capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode == 0:
+        return True
+    return False if done.returncode == KEYCHAIN_ITEM_NOT_FOUND else None
 
 
 def login_expiry(vendor: str, account: str) -> tuple[float | None, float | None]:
@@ -334,7 +376,9 @@ def login_remedy(vendor: str, account: str) -> str:
         return "run `codex login`" if account == "main" else f"run `codex login` with CODEX_HOME set to {config.account_dir(vendor, account)}"
     if account == "main":
         return "run `claude auth login`"
-    return f'run `$env:CLAUDE_CONFIG_DIR="{config.account_dir(vendor, account)}"; claude auth login; Remove-Item Env:CLAUDE_CONFIG_DIR`'
+    if config.WINDOWS:
+        return f'run `$env:CLAUDE_CONFIG_DIR="{config.account_dir(vendor, account)}"; claude auth login; Remove-Item Env:CLAUDE_CONFIG_DIR`'
+    return f'run `CLAUDE_CONFIG_DIR="{config.account_dir(vendor, account)}" claude auth login`'
 
 
 def fmt_date(epoch: float | None) -> str:

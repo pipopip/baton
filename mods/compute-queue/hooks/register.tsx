@@ -269,8 +269,11 @@ async function start($: EngineInterface) {
   await $.tool.register({
     name: 'run',
     description:
-      'Queue a compute run (go test/build/vet beyond one package, mutation runs, lake, generators, the integ verify, anything heavy). ' +
-      'A scheduler places it on the build host (default) or this laptop, splits it when slots idle. When it ends you get one notice ' +
+      'Queue a compute run: full suites (go test/build/vet beyond one package), mutation, fuzz and soak runs, a full lake build, emulator runs, ' +
+      'generators, the integ verify, anything Linux-specific or over a few minutes. Short targeted checks (one package or test file, a lint ' +
+      'or type check, roughly under 3 minutes and a few GB) run directly in the session, not here. ' +
+      'A scheduler places the run on the build hosts (ember, hestia) or the laptop (macOS or Windows; a Mac\'s laptop takes short work only, 20 minutes by default); it splits when slots idle. ' +
+      'When it ends you get one notice ' +
       'with the result (exit, the last log lines, small text artifacts in full): with your next tool results if you are working, ' +
       'as a prompt if you are idle. Keep working meanwhile; do not poll status or read the output files to learn the result. ' +
       'Returns { job, position, note } at once; do not run such commands any other way (remoterun.py, ssh builds and heavyrun.py are blocked).',

@@ -25,7 +25,20 @@ export type Capacity = {
     ram_floor_gb?: number
     load_cap?: number
   }
-  laptop: { heavy_busy: boolean; free_ram_gb: number | null; ram_ok?: boolean; executor?: boolean }
+  laptop: {
+    heavy_busy: boolean
+    free_ram_gb: number | null
+    ram_ok?: boolean
+    executor?: boolean
+    // a Mac's laptop takes fleet jobs only: legacy false, with the figures admission reads
+    legacy?: boolean
+    on_battery?: boolean
+    needs_ac?: boolean
+    slots_used?: number
+    slots_total?: number
+    ram_floor_gb?: number
+    memory_pressure?: 'normal' | 'warn' | 'critical'
+  }
   hosts?: Record<string, Capacity['host'] & { sample_at?: number }>
 }
 
@@ -114,6 +127,16 @@ export const SYSTEM_TEXT = systemText()
 
 const round1 = (n: number | null | undefined): number | null => (typeof n === 'number' ? Math.round(n * 10) / 10 : null)
 
+// A Mac's laptop runs fleet jobs, not the ordinary queue's: the planner starts nothing there. What it can say is the
+// fleet's own figures: slots used of total, free RAM, the kernel's memory pressure (the fleet admits new laptop work only
+// at normal) and the battery, which is information only unless laptop_needs_ac is set.
+export function macLaptopText(l: Capacity['laptop']): string {
+  const slots = l.slots_total !== undefined ? `${l.slots_used ?? 0}/${l.slots_total} fleet slots in use; ` : ''
+  const pressure = l.memory_pressure ? `; memory pressure ${l.memory_pressure}${l.memory_pressure === 'normal' ? '' : ' (no new laptop work)'}` : ''
+  const battery = l.on_battery ? `; on battery${l.needs_ac ? ' (no new fleet work)' : ''}` : ''
+  return `laptop: runs fleet jobs only (start no job there; where any means the host); ${slots}${l.free_ram_gb} GB RAM free${pressure}${battery}`
+}
+
 export function formatCapacity(c: Capacity): string {
   const h = c.host
   const host = !h.up
@@ -126,7 +149,9 @@ export function formatCapacity(c: Capacity): string {
   const l = c.laptop
   const laptop = l.executor === false
     ? 'laptop: not an executor on this machine (start no job there; where any means the host)'
-    : `laptop: heavy lock ${l.heavy_busy ? 'BUSY' : 'free'}; ${l.free_ram_gb} GB RAM free${l.ram_ok === false ? ' (below the 6 GB floor: no heavy job)' : ''}`
+    : l.legacy === false
+      ? macLaptopText(l)
+      : `laptop: heavy lock ${l.heavy_busy ? 'BUSY' : 'free'}; ${l.free_ram_gb} GB RAM free${l.ram_ok === false ? ' (below the 6 GB floor: no heavy job)' : ''}`
   return `${host}\n${laptop}`
 }
 
@@ -253,7 +278,7 @@ export function snapshotKey(input: PlanInput): string {
     input.queued.map(j => j.id),
     input.running.map(j => j.id),
     h.up && h.usable ? h.free : -1,
-    input.capacity.laptop.heavy_busy,
+    input.capacity.laptop.legacy === false ? false : input.capacity.laptop.heavy_busy,   // a Mac's pool holds the lock for fleet jobs
   ])
 }
 

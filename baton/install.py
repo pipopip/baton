@@ -17,7 +17,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import config, hook, wtguard
+from . import config, hook, iterm, wtguard
 
 
 INSTALL_HOME = config.INSTALL_HOME
@@ -64,11 +64,11 @@ def _claude_handlers() -> dict[str, dict | list[dict]]:
     """Event -> matcher group (or list of groups) for Claude Code (exec form: command + args, no shell).
 
     The UserPromptSubmit and PreToolUse entries go through cmd.exe and the generated .cmd wrappers on Windows and
-    run Python directly elsewhere."""
+    run Python directly elsewhere. The Notification entry exists on macOS only."""
     py = {"type": "command", "command": _python(), "args": ["-S", HOOK_SCRIPT, "claude"], "timeout": 10}
     cycle = {"type": "command", "command": _python(), "args": ["-S", CYCLE_SCRIPT, "stop"], "timeout": 60,
              "statusMessage": "baton cycle check"}
-    return {
+    handlers = {
         "SessionStart": {"matcher": "startup|resume|clear|compact|fork", "hooks": [dict(py, statusMessage="baton capsule")]},
         "PostCompact": {"hooks": [dict(py)]},
         "SessionEnd": {"hooks": [dict(py)]},
@@ -87,13 +87,31 @@ def _claude_handlers() -> dict[str, dict | list[dict]]:
         ],
         "Stop": {"hooks": [cycle]},
     }
+    if config.MACOS:
+        # the iTerm2 tab asks for the user (colour, notification): runs hook.py, which ignores any other notification.
+        # Not idle_prompt: Claude sends it a minute after every finished turn.
+        handlers["Notification"] = {"matcher": "permission_prompt|elicitation_dialog", "hooks": [dict(py, timeout=5)]}
+    return handlers
 
 
 def _codex_handlers() -> dict[str, dict]:
-    """Event -> matcher group for Codex hooks.json (string commands)."""
+    """Event -> matcher group for Codex hooks.json (string commands).
+
+    The Stop, PermissionRequest, PostToolUse and Interrupt entries exist on macOS only: they give a Codex session's
+    iTerm2 tab its state (done, waiting for approval, working again, idle) and print nothing, so Codex behaves as if
+    they were absent."""
     py = f"{_python()} -S {HOOK_SCRIPT} codex"
     base = {"type": "command", "command": py, "timeout": 10}
+    tab = {}
+    if config.MACOS:
+        tab = {
+            "Stop": {"hooks": [dict(base, timeout=5)]},
+            "PermissionRequest": {"hooks": [dict(base, timeout=5)]},
+            "PostToolUse": {"hooks": [dict(base, timeout=5)]},
+            "Interrupt": {"hooks": [dict(base, timeout=3)]},   # Codex allows this event one second unless told otherwise
+        }
     return {
+        **tab,
         "SessionStart": {"matcher": "^(startup|resume|clear|compact)$", "hooks": [dict(base, additionalContextLimit=2400)]},
         "PostCompact": {"hooks": [dict(base)]},
         "SessionEnd": {"hooks": [dict(base, timeout=3)]},  # Codex clamps SessionEnd to 3 s
@@ -200,10 +218,12 @@ def merge_hooks(hooks: dict, wanted: dict[str, dict], replace_session_workflow: 
     return {k: v for k, v in out.items() if v}
 
 
-def _backup(path: Path, stamp: str) -> None:
+def _backup(path: Path, stamp: str, source: Path | None = None) -> None:
+    """Copy ``source`` (default: ``path``) to ``<path>.bak-baton-<stamp>`` unless that backup exists."""
+    source = path if source is None else source
     backup = path.with_name(f"{path.name}.bak-baton-{stamp}")
-    if path.exists() and not backup.exists():
-        shutil.copy2(path, backup)
+    if source.exists() and not backup.exists():
+        shutil.copy2(source, backup)
 
 
 def _write_json(path: Path, data: dict) -> None:
@@ -239,7 +259,7 @@ def _norm_dir(text: str) -> str:
 
 
 def plugin_dir_entries(value: str) -> list[str]:
-    """The entries of a CLAUDE_CODE_PLUGIN_DIRS value: split at ``;`` and at the platform's ``os.pathsep``, except
+    r"""The entries of a CLAUDE_CODE_PLUGIN_DIRS value: split at ``;`` and at the platform's ``os.pathsep``, except
     that a Windows drive letter (``C:/dir``, ``C:\dir``) is not split at its colon."""
     out: list[str] = []
     for chunk in value.split(";"):
@@ -463,6 +483,63 @@ def install_profile(stamp: str, dry_run: bool, text: str | None = None) -> str:
     return f"added bt to {target}"
 
 
+def install_iterm_profile(stamp: str, dry_run: bool, home: str | os.PathLike | None = None) -> str | None:
+    """macOS: write Baton's iTerm2 dynamic profile (``baton.iterm.profile_text``) to ``DynamicProfiles/baton.json``
+    under ``home`` (default: the user's home). None off macOS; a one-line note when iTerm2 is not installed or
+    ``[policy] iterm_profile`` is empty (Baton's tabs then use the default profile). Idempotent; a changed file is backed
+    up once per run, beside the folder rather than in it (iTerm2 reads every file in the folder, and one that is not a
+    valid property list stops it from reading any)."""
+    if not config.MACOS:
+        return None
+    from . import terminal
+    if not terminal.iterm_present():
+        return "skipped the iTerm2 profile: iTerm2 is not installed"
+    name = iterm.profile_name()
+    if not name:
+        return "skipped the iTerm2 profile: [policy] iterm_profile is empty, so tabs use the default profile"
+    target = iterm.profile_path(home)
+    text = iterm.profile_text(name)
+    try:
+        if target.read_bytes() == text.encode("utf-8"):
+            return f"unchanged {target}"
+    except OSError:
+        pass
+    if dry_run:
+        return f"would write {target}"
+    if target.exists():
+        _backup(target.parent.parent / target.name, stamp, source=target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name("." + target.name + ".baton-tmp")      # a leading dot: iTerm2 does not see a half-written file
+    tmp.write_text(text, encoding="utf-8", newline="\n")
+    os.replace(tmp, target)
+    return f"wrote {target}"
+
+
+def install_iterm_api(dry_run: bool, runner=None) -> str:
+    """macOS with iTerm2: the virtualenv `bt iterm arrange` and `bt iterm prefs --live` run in, holding the pinned
+    ``iterm2`` package (``iterm.API_PACKAGE``); left as it is when it already imports that version. A failure is a note,
+    never a failed install: tabs then keep the look the hooks give them, without the arranger."""
+    import subprocess
+    runner = runner or subprocess.run
+    python = iterm.api_python()
+    version = iterm.API_PACKAGE.split("==", 1)[1]
+    if python.exists():
+        probe = runner([str(python), "-c", "import importlib.metadata as m; print(m.version('iterm2'))"],
+                       capture_output=True, text=True)
+        if probe.returncode == 0 and probe.stdout.strip() == version:
+            return f"unchanged {python.parent.parent} ({iterm.API_PACKAGE})"
+    if dry_run:
+        return f"would install {iterm.API_PACKAGE} in {python.parent.parent}"
+    venv = python.parent.parent
+    for argv in ([sys.executable, "-m", "venv", str(venv)],
+                 [str(python), "-m", "pip", "install", "--quiet", "--disable-pip-version-check", iterm.API_PACKAGE]):
+        done = runner(argv, capture_output=True, text=True)
+        if done.returncode != 0:
+            return (f"skipped the iTerm2 arranger: {' '.join(argv[:4])} failed ({(done.stderr or done.stdout).strip()[-200:]}); "
+                    "tabs keep the hooks' look")
+    return f"installed {iterm.API_PACKAGE} in {venv} (bt iterm arrange, bt iterm prefs --live)"
+
+
 def run(args) -> int:
     targets = {t for t in ("claude", "codex", "profile", "routing", "lane") if getattr(args, t, False)}
     targets = targets or {"claude", "codex", "profile", "routing"}
@@ -521,6 +598,17 @@ def run(args) -> int:
             actions.append(install_profile(stamp, args.dry_run, rc_text))
         except OSError as exc:
             actions.append(f"error: could not update {profile_target()}: {exc}")
+            failed = True
+        try:
+            note = install_iterm_profile(stamp, args.dry_run)
+            if note:
+                actions.append(note)
+                if not note.startswith("skipped"):
+                    actions.append(install_iterm_api(args.dry_run))
+                    actions.append("iTerm2's application settings (theme, tab bar) are not touched: `bt iterm prefs --live` "
+                                   "applies the ones that suit many tabs to the running iTerm2")
+        except OSError as exc:
+            actions.append(f"error: could not write the iTerm2 profile: {exc}")
             failed = True
     others = [f"{v}:{a}" for v in config.VENDORS for a in config.account_names(v) if a != "main"]
     if others:

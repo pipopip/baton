@@ -184,6 +184,11 @@ export function statusLine(cap: Capacity | null | undefined, w: WatchCounts | nu
       !h.up ? `${name} DOWN` : h.paused ? `${name} PAUSED${h.pause === 'host.conf.json' ? ' (host.conf.json)' : ''}` : `${name} ${h.held}/${h.total}`
   const host = device(cap.host.name || 'ember', cap.host, cap.at)
   const extra = Object.entries(cap.hosts ?? {}).map(([id, remote]) => device(remote.name || id, remote, remote.sample_at))
-  const laptop = cap.laptop.executor === false ? 'off' : cap.laptop.heavy_busy ? 'busy' : 'free'
+  const lp = cap.laptop
+  // a Mac's laptop runs fleet jobs: its slots, and memory pressure when it is not normal, say more than the heavy lock its pool holds
+  const laptop = lp.executor === false ? 'off'
+    : lp.legacy === false
+      ? `${lp.slots_total !== undefined ? `${lp.slots_used ?? 0}/${lp.slots_total}` : 'fleet'}${lp.memory_pressure && lp.memory_pressure !== 'normal' ? ` ${lp.memory_pressure} pressure` : ''}`
+      : lp.heavy_busy ? 'busy' : 'free'
   return [host, ...extra, `laptop ${laptop}`, `${w?.queued ?? 0} queued`, mineText(w, alerts)].join(' · ')
 }

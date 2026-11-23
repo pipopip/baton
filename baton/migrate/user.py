@@ -358,8 +358,11 @@ def collect_user(ctx: c.Ctx) -> dict:
     ssh = ctx.home / ".ssh"
     if (ssh / "config").is_file():
         _add_file(ctx, out, ssh / "config", "ssh/config", (ssh / "config").stat().st_size)
+    if (ssh / "known_hosts").is_file():
+        _add_file(ctx, out, ssh / "known_hosts", "ssh/known_hosts", (ssh / "known_hosts").stat().st_size)
     info = ssh_info(ctx.home)
-    out["ssh"] = {"key_names": info["key_names"], "hosts": info["hosts"]}
+    out["ssh"] = {"key_names": info["key_names"], "hosts": info["hosts"],
+                  "known_hosts": any(f["rel"] == "ssh/known_hosts" for f in out["files"])}
     out["generated"]["ssh/key-names.txt"] = ("\n".join(info["key_names"]) + "\n").encode("utf-8")
     if (ctx.home / ".gitconfig").is_file():
         _add_file(ctx, out, ctx.home / ".gitconfig", "gitconfig", (ctx.home / ".gitconfig").stat().st_size)

@@ -77,16 +77,36 @@ SSH = default_ssh()
 LAPTOP_NOT_EXECUTOR = "not an executor on this machine"
 
 
-def laptop_executes(name=None, environ=None):
-    """Whether this machine runs `where: "laptop"` work. The laptop executor is Windows' (Job Objects, the heavy lock,
-    GlobalMemoryStatusEx); elsewhere it would run the job's script directly with no limit, so it is off unless
-    CQ_LAPTOP_EXECUTOR=1 (the Linux test suite exercises the laptop paths that way). CQ_LAPTOP_EXECUTOR=0 turns it off
-    anywhere. A controller on another machine (a Mac) places jobs on the remote hosts only."""
+def laptop_platform(platform=None, environ=None):
+    """The kind of machine the laptop is: "macos" on a Mac (sys.platform darwin), "windows" otherwise. The Windows
+    laptop is what the older queue code means by the laptop; a test suite that stands in for it on Linux or a Mac
+    gets that meaning, and a test of the Mac's executor sets CQ_LAPTOP_PLATFORM=macos."""
+    environ = os.environ if environ is None else environ
+    forced = environ.get("CQ_LAPTOP_PLATFORM")
+    if forced in ("macos", "windows"):
+        return forced
+    return "macos" if (sys.platform if platform is None else platform) == "darwin" else "windows"
+
+
+def laptop_executes(name=None, environ=None, platform=None):
+    """Whether this machine runs fleet work on the laptop. Windows (Job Objects, the heavy lock, GlobalMemoryStatusEx)
+    and macOS (mac_pool: process-tree containment, taskpolicy, a memory watchdog, flock) are executors. Elsewhere it
+    would run the job's script directly with no limit, so it is off unless CQ_LAPTOP_EXECUTOR=1 (the Linux test suite
+    exercises the laptop paths that way). CQ_LAPTOP_EXECUTOR=0 turns it off anywhere: a Mac then only controls and
+    places jobs on the remote hosts, as before it was an executor. `name` is os.name, `platform` sys.platform."""
     environ = os.environ if environ is None else environ
     forced = environ.get("CQ_LAPTOP_EXECUTOR")
     if forced in ("0", "1"):
         return forced == "1"
-    return (os.name if name is None else name) == "nt"
+    return (os.name if name is None else name) == "nt" or (sys.platform if platform is None else platform) == "darwin"
+
+
+def legacy_laptop_executes(name=None, environ=None, platform=None):
+    """Whether the ordinary queue's `where: "laptop"` / `where: "any"` path runs jobs here. That path (Laptop,
+    launch_laptop, laprun) is Windows'; a Mac's laptop takes fleet jobs only (fleet_queue, mac_pool), so a Mac keeps
+    the old refusals and `where: "any"` goes to a host."""
+    environ = os.environ if environ is None else environ
+    return laptop_executes(name, environ, platform) and laptop_platform(platform, environ) != "macos"
 
 
 def norm_path(p):
@@ -137,6 +157,10 @@ HOST_CONF_VALID = {
     "paused": lambda v: isinstance(v, bool),
     "ram_jobs": lambda v: isinstance(v, bool),
     "memory_budget_gb": _in(1, 50),
+    # the tools this host is qualified to take default-placed (where: host, no host_id) jobs for: a non-empty list of
+    # tool names; anything else means none (queue_generations.default_job_hosts)
+    "default_jobs": lambda v: isinstance(v, list) and bool(v) and all(
+        isinstance(x, str) and re.fullmatch(r"[a-zA-Z0-9_.+-]{1,64}", x) is not None for x in v),
     # an absolute path of at most 20 characters, no dots: CQ_RAM_TMP (this plus /XXXXXXXX) stays within the 29 bytes
     # lane_plan's socket tests leave under the 108-byte unix socket path limit
     "tmp_root": lambda v: isinstance(v, str) and re.fullmatch(r"/[A-Za-z0-9_/-]{1,19}", v) is not None,
@@ -663,6 +687,9 @@ class Laptop:
                 msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
                 os.lseek(fd, 0, os.SEEK_SET)
                 msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            elif fcntl:  # mac_pool's jobs hold it shared, the cohort owner exclusively: any holder fails the exclusive try
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
             return False
         except OSError:
             return True
@@ -670,6 +697,10 @@ class Laptop:
             os.close(fd)
 
     def free_ram_gb(self):
+        if sys.platform == "darwin":
+            import mac_pool
+            free = mac_pool.available_gb()
+            return 0.0 if free is None else round(free, 1)  # unreadable: no room is promised
         if os.name != "nt":  # pragma: no cover
             return 99.0
         import ctypes
@@ -684,6 +715,20 @@ class Laptop:
         st.dwLength = ctypes.sizeof(MEMSTATUS)
         ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
         return round(st.ullAvailPhys / 2**30, 1)
+
+    def memory_pressure(self):
+        """The kernel's memory pressure level (1 normal, 2 warn, 4 critical) on a Mac, else None."""
+        if sys.platform != "darwin":
+            return None
+        import mac_pool
+        return mac_pool.memory_pressure()
+
+    def on_battery(self):
+        """True on battery power, False on AC, None when it is not told (not a Mac, or pmset says nothing)."""
+        if sys.platform != "darwin":
+            return None
+        import mac_pool
+        return mac_pool.on_battery()
 
     def mem_stats(self):
         """GetPerformanceInfo in GB: commit and its limit, kernel nonpaged and paged pools, system cache; None on failure."""
@@ -827,9 +872,10 @@ class Laptop:
     def kill_tree(self, pid):
         if os.name == "nt":
             _run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
-        else:  # pragma: no cover
-            with contextlib.suppress(OSError):
-                os.kill(pid, 15)
+        else:  # the process, its descendants and its group: SIGTERM, a grace, SIGKILL
+            import mac_pool
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                mac_pool.kill_tree(pid)
 
 
 class Ctx:
@@ -1452,7 +1498,11 @@ def cmd_submit(ctx, req):
         raise CqError("where must be host, laptop or any")
     if ctx.host_id and where != "host":
         raise CqError("a remote queue shard requires where host")
-    if where == "laptop" and not laptop_executes():
+    if where == "laptop" and not legacy_laptop_executes():
+        if laptop_executes():  # a Mac: its laptop takes fleet jobs only
+            raise CqError("where 'laptop' is refused here: this Mac runs laptop work as fleet jobs (CPU slots, a memory "
+                          "cap, low priority); use where 'fleet' with candidates ['laptop'] and platform 'macos' (or "
+                          "'portable'), with slots of at least 1, no split and no self_heavy")
         raise CqError(f"where 'laptop' is refused: the laptop is {LAPTOP_NOT_EXECUTOR} (only a Windows controller runs "
                       "laptop jobs); use where 'host' or 'fleet' to run it on a remote Linux device")
     sandbox, network = sandbox_request(req)
@@ -2276,7 +2326,24 @@ def probe(ctx, snap=None, err="", attempted=True):
         host.update(down_since=hs["down_since"], down_reason=hs.get("down_reason", err), name=HOST_NAME, slot_vcpu=SLOT_VCPU,
                     slot_ram_gb=SLOT_RAM_GB, ram_floor_gb=HOST_RAM_FLOOR_GB, load_cap=LOAD_CAP)  # load_cap None: plan.ts uses nproc
     save_host_state(ctx, hs)
-    if laptop_executes():
+    if laptop_executes() and laptop_platform() == "macos":
+        # a Mac's laptop takes fleet jobs: real numbers, but the ordinary queue's laptop path is off (`legacy: False`)
+        ram = ctx.laptop.free_ram_gb()
+        laptop = {"legacy": False, "platform": "macos", "heavy_busy": bool(ctx.laptop.heavy_lock_held()), "free_ram_gb": ram,
+                  "ram_ok": ram >= LAPTOP_RAM_MIN_GB}
+        battery = _laptop_call(ctx.laptop, "on_battery")
+        if battery is not None:
+            laptop["on_battery"] = bool(battery)
+        level = _laptop_call(ctx.laptop, "memory_pressure")
+        if level in (1, 2, 4):
+            laptop["memory_pressure"] = {1: "normal", 2: "warn", 4: "critical"}[level]
+        try:  # slots used of total, the RAM floor and the battery rule, as the fleet admission has them
+            import fleet_queue
+            fleet_queue.bind(sys.modules[__name__])
+            laptop.update(fleet_queue.laptop_figures(ctx))
+        except Exception:
+            pass
+    elif laptop_executes():
         ram = ctx.laptop.free_ram_gb()
         heavy_jobs = [j for j in all_jobs(ctx) if j.get("placed_where") == "laptop" and j.get("status") in ("launching", "running")
                       and j.get("slots_eff", j.get("slots", 0)) > 0]
@@ -2434,7 +2501,8 @@ def caps_override(job, cap):
 
 def _laptop_off(cap):
     """True when the capacity sample says the laptop is not an executor on the machine that took it (a controller-only Mac)."""
-    return (cap.get("laptop") or {}).get("executor") is False
+    lp = cap.get("laptop") or {}
+    return lp.get("executor") is False or lp.get("legacy") is False
 
 
 def _light_room(cap):
@@ -2462,7 +2530,7 @@ def _fits(job, cap, free_host, laptop_free, light=None):
 
 def _laptop_heavy_free(cap):
     lp = cap.get("laptop") or {}
-    return (lp.get("executor") is not False and not lp.get("heavy_busy")
+    return (not _laptop_off(cap) and not lp.get("heavy_busy")
             and (lp.get("free_ram_gb") or 0) >= LAPTOP_RAM_MIN_GB)
 
 
@@ -2925,7 +2993,7 @@ def dispatch(ctx, a):
             return {"ok": False, "error": f"{a['job']} is not queued"}
         if a.get("where") == "host" and HOST_PAUSED:
             return {"ok": False, "error": "host paused (host.conf.json)"}
-        if a.get("where") == "laptop" and not laptop_executes():
+        if a.get("where") == "laptop" and not legacy_laptop_executes():
             return {"ok": False, "error": f"the laptop is {LAPTOP_NOT_EXECUTOR}: {a['job']} stays queued"}
         if a.get("where") == "host" and job.get("host_config") and not binding_matches_current(job):
             return {"ok": False, "error": "previous launch is bound to another host/configuration; reconcile it before retrying"}
@@ -3237,7 +3305,7 @@ def launch(ctx, job_id, family=None):
         touch_launch(ctx, family or [job_id])
         if job["placed_where"] == "host":
             launch_host(ctx, job, family or [job_id])
-        elif not laptop_executes():
+        elif not legacy_laptop_executes():
             raise CqError(f"the laptop is {LAPTOP_NOT_EXECUTOR}: a laptop job is never started here")
         else:
             launch_laptop(ctx, job)
@@ -5012,6 +5080,16 @@ def _laptop_line(lp):
     if lp.get("executor") is False:
         return LAPTOP_NOT_EXECUTOR
     parts = []
+    if lp.get("legacy") is False and lp.get("free_ram_gb") is not None:  # a Mac: fleet jobs only
+        if lp.get("slots_total") is not None:
+            parts.append(f"{lp.get('slots_used', 0)}/{lp['slots_total']} fleet slots")
+        parts.append(f"{_n(lp['free_ram_gb'])} GB free")   # information: a Mac reserves no RAM and has no floor
+        if lp.get("memory_pressure"):
+            parts.append(f"memory pressure {lp['memory_pressure']}")
+        if lp.get("on_battery"):
+            parts.append("on battery" + (", no new fleet work" if lp.get("needs_ac") else ""))
+        parts.append("fleet jobs only")
+        return ", ".join(parts)
     if lp.get("free_ram_gb") is not None:
         parts.append(f"{_n(lp['free_ram_gb'])} GB free (heavy jobs need {LAPTOP_RAM_MIN_GB:g})")
     if lp.get("commit_gb") is not None and lp.get("commit_limit_gb") is not None:

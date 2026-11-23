@@ -16,7 +16,7 @@ function world(on: On, env: Record<string, string> = {}, existingFiles: string[]
     models: [] as { prompt: string; system: unknown }[],
     submitted: [] as string[],
     statuses: [] as (string | undefined)[],
-    registered: [] as { name: string; isDeferred?: boolean; inputSchema?: Record<string, unknown> }[],
+    registered: [] as { name: string; description?: string; isDeferred?: boolean; inputSchema?: Record<string, unknown> }[],
     commands: [] as string[],
     answers: {} as Record<string, (p: Record<string, unknown>) => object>,
     latestJobs: [] as Array<{ id: string }>,
@@ -36,7 +36,7 @@ function world(on: On, env: Record<string, string> = {}, existingFiles: string[]
   on('session.root', () => ({ value: 'C:/Work/wt/lane_t' }))
   on('fs.exists', ($, e) => ({ value: existingFiles.includes(e.path.replace(/\\/g, '/')) }))
   on('tool.register', ($, e) => {
-    w.registered.push({ name: e.name, isDeferred: e.isDeferred as boolean | undefined, inputSchema: e.inputSchema as Record<string, unknown> })
+    w.registered.push({ name: e.name, description: e.description as string | undefined, isDeferred: e.isDeferred as boolean | undefined, inputSchema: e.inputSchema as Record<string, unknown> })
     return { value: { tool: `mcp__compute-queue__${e.name}` } }
   })
   on('command.register', ($, e) => {
@@ -186,6 +186,11 @@ describe('the tools', () => {
     const slots = (w.registered[0]?.inputSchema as { properties: { slots: { maximum: number; description: string } } }).properties.slots
     expect(slots.maximum).toBe(32)
     expect(slots.description).toContain('Fleet RAM uses memory_gb independently')
+    const run = w.registered[0] as { description: string; inputSchema: { properties: { platform: { enum: string[] } } } }
+    expect(run.inputSchema.properties.platform.enum).toEqual(['linux', 'windows', 'macos', 'portable'])
+    expect(run.description).toContain('run directly in the session')
+    expect(run.description).toContain('macOS or Windows')   // neutral: the same text in a session on either laptop
+    expect(run.description).not.toContain('portable or macos')
     const props = (w.registered[0]?.inputSchema as { properties: Record<string, any> }).properties
     expect(props.artifact_max_mb.maximum).toBe(1024)
     expect(props.artifact_total_mb.maximum).toBe(4096)

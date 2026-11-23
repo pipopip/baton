@@ -44,7 +44,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import config
+from . import config, iterm
 
 OSASCRIPT_TIMEOUT = 20
 SETTING = "terminal"
@@ -280,26 +280,46 @@ def encode(text: str) -> str:
 
 
 # One constant script per application; the variable strings come in after `--` (`on run argv`), never inside it.
-# argv: "current" or "new", then (command, title) pairs. Result: the new sessions' ids, one per line.
+# argv: "current" or "new"; the profile name ("" = the default profile; see [policy] iterm_profile); then (command, title)
+# pairs. Result: the new sessions' ids, one per line. A tab or window is created `with profile` inside `try`: when that
+# fails (no profile of that name, say) the same tab is created `with default profile`, so a missing profile never stops
+# a tab from opening.
 # iTerm2 is named by its bundle id: the application file is iTerm.app, and `tell application "iTerm2"` compiles only
 # while iTerm2 is running (measured on macOS 15: installed but not started, the name is not found and its terms do not
 # parse, registered with Launch Services or not). The id finds it either way and starts it when it is not running.
-ITERM_BUNDLE_ID = "com.googlecode.iterm2"
+ITERM_BUNDLE_ID = iterm.ITERM_BUNDLE_ID
 ITERM_SCRIPT = (
     "on run argv",
     "set theIds to {}",
+    "set theProfile to item 2 of argv",
     f'tell application id "{ITERM_BUNDLE_ID}"',
     "set theWindow to missing value",
     'if (item 1 of argv) is "current" and (count of windows) > 0 then set theWindow to current window',
-    "repeat with i from 2 to (count of argv) by 2",
+    "repeat with i from 3 to (count of argv) by 2",
     "set theCommand to item i of argv",
     "set theTitle to item (i + 1) of argv",
     "if theWindow is missing value then",
+    'if theProfile is "" then',
     "set theWindow to (create window with default profile command theCommand)",
+    "else",
+    "try",
+    "set theWindow to (create window with profile theProfile command theCommand)",
+    "on error",
+    "set theWindow to (create window with default profile command theCommand)",
+    "end try",
+    "end if",
     "set theSession to current session of current tab of theWindow",
     "else",
     "tell theWindow",
+    'if theProfile is "" then',
     "set theTab to (create tab with default profile command theCommand)",
+    "else",
+    "try",
+    "set theTab to (create tab with profile theProfile command theCommand)",
+    "on error",
+    "set theTab to (create tab with default profile command theCommand)",
+    "end try",
+    "end if",
     "end tell",
     "set theSession to current session of theTab",
     "end if",
@@ -339,7 +359,7 @@ def osascript_argv(script, args) -> list[str]:
 
 def run_osascript(script, args, env: dict | None = None) -> tuple[str | None, tuple[str, ...]]:
     """(error text, session ids). An error is the stderr text plus a one-line remedy; never an exception."""
-    app = "iTerm2" if script is ITERM_SCRIPT else "Terminal"
+    app = "iTerm2" if ITERM_BUNDLE_ID in " ".join(script) else "Terminal"      # every iTerm2 script names the bundle id
     try:
         cp = subprocess.run(osascript_argv(script, args), capture_output=True, text=True, encoding="utf-8",
                             errors="replace", timeout=OSASCRIPT_TIMEOUT, stdin=subprocess.DEVNULL,
@@ -378,7 +398,7 @@ class ITerm2(_Osascript):
     script = ITERM_SCRIPT
 
     def _args(self, tabs, new_window: bool) -> list[str]:
-        out = ["new" if new_window else "current"]
+        out = ["new" if new_window else "current", config.policy_text(iterm.PROFILE_SETTING, iterm.PROFILE_DEFAULT)]
         for tab in tabs:
             out += [zsh_command(tab), tab.title]
         return out

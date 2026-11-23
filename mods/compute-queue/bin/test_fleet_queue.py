@@ -19,6 +19,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # these tests place work on the Windows laptop device on any OS (cq.laptop_executes is off elsewhere than Windows by default)
 os.environ.setdefault('CQ_LAPTOP_EXECUTOR', '1')
+os.environ.setdefault('CQ_LAPTOP_PLATFORM', 'windows')   # the fake laptop here is the Windows one, whatever OS runs the tests
 import cq
 import fleet_queue as fq
 import fleet_telemetry as telemetry
@@ -2838,6 +2839,28 @@ class FleetTests(unittest.TestCase):
             self.submit(requires=['blender', 'python'])
         self.assertEqual(str(raised.exception), 'no candidate can ever run this job: ember: lacks the tools blender; hearth: lacks the tools blender')
         self.no_job_left_behind()
+
+    def test_a_default_job_spread_by_queue_generations_is_stored_with_both_candidates_and_its_requires(self):
+        import queue_generations as generations
+        cq.write_json(str(self.state / 'hosts/hearth/host.conf.json'), {'address': 'hearth', 'host_id': 'hearth', 'default_jobs': ['go', 'bash']})
+        v2 = generations.context(cq, self.ctx, 2)
+        with patch.object(v2.laptop, 'heavy_lock_held', return_value=False):
+            fq._capacity(v2, dict(ember=self.remote(caps=['linux', 'python', 'bash']),
+                                  hearth=self.remote('hearth', caps=['linux', 'python', 'bash', 'go'])), [])
+        request = lambda **fields: dict(dict(root=str(self.root), command='go test ./...', session='s1', slots=2), **fields)
+        # a tool on hearth's list: ember and hearth, with `requires` kept; ember lacks go, so only hearth could place it
+        result = generations.execute(cq, self.ctx, 'submit', request(requires=['go', 'bash']), fq.execute)
+        job = fq._get(v2, result['job'])
+        self.assertEqual((job['candidates'], job['requires']), (['ember', 'hearth'], ['go', 'bash']))
+        self.assertIn('fleet job on ember or hearth: CPU held to 2 slots', result['note'])
+        # a tool outside the list: no spreading, ember alone and `requires` dropped, as before the setting existed
+        result = generations.execute(cq, self.ctx, 'submit', request(requires=['go', 'node']), fq.execute)
+        job = fq._get(v2, result['job'])
+        self.assertEqual((job['candidates'], job['requires']), (['ember'], []))
+        self.assertIn('fleet job on ember: CPU held to 2 slots', result['note'])
+        # the host that was asked for by name is a pin
+        result = generations.execute(cq, self.ctx, 'submit', request(requires=['go'], host_id='ember'), fq.execute)
+        self.assertEqual(fq._get(v2, result['job'])['candidates'], ['ember'])
 
     def test_a_memory_refusal_names_the_remedy_only_when_the_cap_was_not_stated(self):
         tiny_ember, tiny_hearth = self.remote(), self.remote('hearth')

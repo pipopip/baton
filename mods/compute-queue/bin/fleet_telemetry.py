@@ -122,6 +122,10 @@ def _reason_word(reason):
         return 'DOWN'
     if 'stale' in r:
         return 'STALE'
+    if 'battery' in r:
+        return 'battery'
+    if 'pressure' in r:
+        return 'pressure'
     if 'legacy' in r or 'draining' in r:
         return 'legacy busy'
     if 'ram' in r or 'memory' in r or 'commit' in r:
@@ -248,6 +252,10 @@ def summarize(state, now=None, _collect=None):
         for key in ('memory_available_gb', 'memory_reserved_gb', 'memory_held_gb', 'memory_floor_gb', 'commit_free_gb', 'load', 'load_cap'):
             value = raw.get(key)
             devices[host][key] = value if _number(value) and value >= 0 else None
+        if raw.get('memory_pressure') in ('normal', 'warn', 'critical'):
+            devices[host]['memory_pressure'] = raw['memory_pressure']
+        if isinstance(raw.get('on_battery'), bool):
+            devices[host]['on_battery'] = raw['on_battery']
         reason = raw.get('reason')
         devices[host]['reason'] = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', reason)[:160] if isinstance(reason, str) else ''
         if devices[host]['eligible'] is False and up is True and not stale:

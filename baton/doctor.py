@@ -184,11 +184,14 @@ def check_hooks() -> list[Check]:
         if handlers is None:
             out.append(Check(name, FAIL if main else WARN, f"{path} is missing or not valid JSON", fix))
             continue
-        missing = [e for e in HOOK_EVENTS if e not in handlers]
+        events = HOOK_EVENTS                                  # then, on macOS, the events of the iTerm2 tab state
+        if config.MACOS:
+            events += ("Notification",) if vendor == "claude" else ("Stop", "PermissionRequest", "PostToolUse", "Interrupt")
+        missing = [e for e in events if e not in handlers]
         if missing:
             out.append(Check(name, FAIL if main else WARN, f"no baton handler for {', '.join(missing)} in {path}", fix))
         else:
-            out.append(Check(name, OK, f"{len(HOOK_EVENTS)} events in {path}"))
+            out.append(Check(name, OK, f"{len(events)} events in {path}"))
     return out
 
 
@@ -280,6 +283,23 @@ def check_posix_install() -> list[Check]:
     else:
         out.append(Check("bt-sh", OK, f"{install.BT_SH} has LF endings"))
     return out
+
+
+def check_iterm_profile() -> list[Check]:
+    """macOS, iTerm2 backend with a profile name set: the dynamic profile file `bt install` writes exists, parses and
+    carries Baton's Guid under the name ``[policy] iterm_profile`` gives. Nothing is checked (and nothing reported)
+    elsewhere."""
+    if not config.MACOS:
+        return []
+    from . import iterm, terminal
+    name = iterm.profile_name()
+    if terminal.backend().name != "iterm2" or not name:
+        return []
+    problem = iterm.profile_problem(iterm.profile_path(), name)
+    if problem:
+        return [Check("iterm-profile", WARN, f"tabs ask for the iTerm2 profile {name!r}, but {problem}: they open with the "
+                                             "default profile and do not close with their session", "run `bt install`")]
+    return [Check("iterm-profile", OK, f"{iterm.profile_path()} provides the iTerm2 profile {name!r}")]
 
 
 def _session_workflow_entries(path: Path) -> list[tuple[str, str | None, list[str]]] | None:
@@ -658,7 +678,9 @@ def check_accounts() -> list[Check]:
                 continue
             problems, notes = [], []
             if not accounts.logged_in(vendor, account):
-                notes.append(f"not logged in ({accounts.CREDENTIAL_FILE[vendor]} missing)")
+                where = (f"no Keychain item {accounts.keychain_service(account)!r} and no {accounts.CREDENTIAL_FILE[vendor]}"
+                         if vendor == "claude" and config.MACOS else f"{accounts.CREDENTIAL_FILE[vendor]} missing")
+                notes.append(f"not logged in ({where})")
             if not main:
                 expected = [n for n in names if (primary / n).exists()]
                 for n in expected:
@@ -692,7 +714,10 @@ def check_logins(now: float | None = None) -> list[Check]:
             continue
         name = f"login:claude:{account}"
         refresh, access = accounts.login_expiry("claude", account)
-        if refresh is None:
+        if refresh is None and not accounts.has_credential_file("claude", account):
+            out.append(Check(name, OK, "login in the macOS Keychain: expiry unknown (the item is never read), "
+                                       "so baton neither refreshes nor switches to it automatically"))
+        elif refresh is None:
             out.append(Check(name, OK, "no refresh-token expiry recorded"))
         elif refresh <= now:
             out.append(Check(name, FAIL, f"refresh token expired {accounts.fmt_date(refresh)}", accounts.login_remedy("claude", account)))
@@ -1114,7 +1139,8 @@ def run_checks(live: bool = False, *, cheap: bool = False) -> list[Check]:
     """All checks in order. ``cheap`` restricts to a, b, d, g, g2, h, i and the cheap part of l (worktrees); ``live`` adds the self-test (e)."""
     versions = cli_versions()
     plan = [("python", check_python), ("hooks", check_hooks), ("hook-forms", check_hook_forms), ("cmd-wrappers", check_wrappers),
-            ("posix-install", check_posix_install), ("session-workflow", check_session_workflow),
+            ("posix-install", check_posix_install), ("iterm-profile", check_iterm_profile),
+            ("session-workflow", check_session_workflow),
             ("plugin-env", check_plugin_env)]
     if not cheap:
         plan += [("tools", check_tools), ("codex-trust", check_codex_trust)]

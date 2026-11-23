@@ -145,6 +145,12 @@ describe('the lead alert and the status line', () => {
     expect(statusLine(cap(), w, 1_000_000)).toBe('ember 2/4 · laptop free · 5 queued · mine 2/1')
     expect(statusLine(cap({}, true), w, 1_000_000)).toContain('laptop busy')
     expect(statusLine(cap({ up: false }), w, 1_000_000)).toContain('ember DOWN')
+    // a Mac's laptop: its fleet slots and the battery, never "busy" because its own pool holds the lock
+    const mac = (laptop: Capacity['laptop']): Capacity => ({ ...cap(), laptop })
+    expect(statusLine(mac({ heavy_busy: true, free_ram_gb: 30, legacy: false, slots_used: 2, slots_total: 12 }), w, 1_000_000)).toBe('ember 2/4 · laptop 2/12 · 5 queued · mine 2/1')
+    expect(statusLine(mac({ heavy_busy: true, free_ram_gb: 30, legacy: false, slots_used: 0, slots_total: 12, on_battery: true }), w, 1_000_000)).toContain('laptop 0/12 ·')   // battery is not in the line
+    expect(statusLine(mac({ heavy_busy: false, free_ram_gb: 3, legacy: false, slots_used: 1, slots_total: 18, memory_pressure: 'critical' }), w, 1_000_000)).toContain('laptop 1/18 critical pressure')
+    expect(statusLine(mac({ heavy_busy: true, free_ram_gb: 30, legacy: false }), w, 1_000_000)).toContain('laptop fleet')
     expect(statusLine(cap({ paused: true }), w, 1_000_000)).toContain('ember PAUSED')
     expect(statusLine(cap({ paused: true, pause: 'host.conf.json' }), w, 1_000_000)).toContain('ember PAUSED (host.conf.json)')
     expect(statusLine(cap(), w, 1_000_000 + 200_000)).toContain('ember STALE') // the leader has not written for 90 s

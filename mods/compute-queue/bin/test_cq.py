@@ -30,6 +30,7 @@ atexit.register(shutil.rmtree, STATE_DIR, True)
 os.environ["CQ_STATE"] = STATE_DIR
 # these tests run the laptop executor on any OS (cq.laptop_executes is off elsewhere than Windows by default)
 os.environ.setdefault("CQ_LAPTOP_EXECUTOR", "1")
+os.environ.setdefault("CQ_LAPTOP_PLATFORM", "windows")  # the fake laptop here is the Windows one, whatever OS runs the tests
 for _name in ("CQ_HOST", "LANE_HOST", "CQ_LOAD_CAP", "CQ_HOST_RAM_FLOOR_GB"):
     os.environ.pop(_name, None)
 import cq  # noqa: E402

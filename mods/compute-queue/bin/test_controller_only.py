@@ -22,10 +22,26 @@ class ExecutesTests(unittest.TestCase):
         self.assertTrue(cq.laptop_executes(name="nt", environ={}))
 
     def test_elsewhere_it_does_not_unless_opted_in(self):
-        for name in ("posix", "darwin"):
-            self.assertFalse(cq.laptop_executes(name=name, environ={}))
-            self.assertFalse(cq.laptop_executes(name=name, environ={"CQ_LAPTOP_EXECUTOR": ""}))
-            self.assertTrue(cq.laptop_executes(name=name, environ={"CQ_LAPTOP_EXECUTOR": "1"}))
+        for name in ("posix", "java"):
+            self.assertFalse(cq.laptop_executes(name=name, platform="linux", environ={}))
+            self.assertFalse(cq.laptop_executes(name=name, platform="linux", environ={"CQ_LAPTOP_EXECUTOR": ""}))
+            self.assertTrue(cq.laptop_executes(name=name, platform="linux", environ={"CQ_LAPTOP_EXECUTOR": "1"}))
+
+    def test_a_mac_executes_and_its_laptop_is_a_macos_one(self):
+        self.assertTrue(cq.laptop_executes(name="posix", platform="darwin", environ={}))
+        self.assertEqual(cq.laptop_platform(platform="darwin", environ={}), "macos")
+        self.assertEqual(cq.laptop_platform(platform="linux", environ={}), "windows")
+        self.assertEqual(cq.laptop_platform(platform="darwin", environ={"CQ_LAPTOP_PLATFORM": "windows"}), "windows")
+        self.assertEqual(cq.laptop_platform(platform="linux", environ={"CQ_LAPTOP_PLATFORM": "macos"}), "macos")
+
+    def test_the_ordinary_queues_laptop_path_is_windows_only(self):
+        self.assertTrue(cq.legacy_laptop_executes(name="nt", platform="win32", environ={}))
+        self.assertFalse(cq.legacy_laptop_executes(name="posix", platform="darwin", environ={}))
+        self.assertTrue(cq.legacy_laptop_executes(name="posix", platform="linux", environ={"CQ_LAPTOP_EXECUTOR": "1"}))
+        self.assertFalse(cq.legacy_laptop_executes(name="posix", platform="darwin", environ={"CQ_LAPTOP_EXECUTOR": "0"}))
+
+    def test_a_mac_turns_its_executor_off_with_an_explicit_zero(self):
+        self.assertFalse(cq.laptop_executes(name="posix", platform="darwin", environ={"CQ_LAPTOP_EXECUTOR": "0"}))
 
     def test_an_explicit_zero_turns_it_off_anywhere(self):
         self.assertFalse(cq.laptop_executes(name="nt", environ={"CQ_LAPTOP_EXECUTOR": "0"}))
@@ -101,6 +117,53 @@ class CapacityTests(ControllerOnly):
         lp = self.tick()["capacity"]["laptop"]
         self.assertNotIn("executor", lp)
         self.assertEqual((lp["free_ram_gb"], lp["heavy_busy"], lp["ram_ok"]), (16.0, False, True))
+
+
+class MacExecutorCapacityTests(ControllerOnly):
+    """A Mac whose laptop runs fleet jobs: real numbers in the capacity, but the ordinary queue's laptop path stays off."""
+
+    def setUp(self):
+        super().setUp()
+        self.executes.return_value = True
+        patch = mock.patch.dict(os.environ, {"CQ_LAPTOP_PLATFORM": "macos"})
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.laptop.on_battery = lambda: True
+
+    def test_capacity_has_the_figures_the_battery_and_no_legacy_laptop(self):
+        lp = self.tick()["capacity"]["laptop"]
+        self.assertIs(lp["legacy"], False)
+        self.assertNotIn("executor", lp)
+        self.assertEqual((lp["free_ram_gb"], lp["heavy_busy"], lp["ram_ok"], lp["on_battery"]), (16.0, False, True, True))
+        self.assertTrue(cq._laptop_off({"laptop": lp}))
+        self.assertFalse(cq._laptop_heavy_free({"laptop": lp}))
+        self.assertEqual(cq._light_room({"laptop": lp, "host": {}})["laptop"], 0)
+
+    def test_the_status_line_is_the_numbers_not_the_refusal(self):
+        figures = dict(slots_total=18, slots_used=2, ram_floor_gb=0, needs_ac=False)
+        self.laptop.memory_pressure = lambda: 2
+        with mock.patch.object(fq, "laptop_figures", return_value=figures):
+            self.tick()
+            line = cq.cmd_status(self.ctx, {})["summary"]["laptop"]
+        self.assertEqual(line, "2/18 fleet slots, 16 GB free, memory pressure warn, on battery, fleet jobs only")
+        self.assertNotEqual(line, "not an executor on this machine")
+
+    def test_the_capacity_carries_the_admission_figures(self):
+        figures = dict(slots_total=12, slots_used=2, ram_floor_gb=0, needs_ac=True)
+        self.laptop.memory_pressure = lambda: 4
+        with mock.patch.object(fq, "laptop_figures", return_value=figures):
+            lp = self.tick()["capacity"]["laptop"]
+        self.assertEqual((lp["slots_total"], lp["slots_used"], lp["needs_ac"], lp["memory_pressure"]), (12, 2, True, "critical"))
+        with mock.patch.object(fq, "laptop_figures", side_effect=RuntimeError("no")):    # a failure never stops the sample
+            self.assertIs(self.tick()["capacity"]["laptop"]["legacy"], False)
+
+    def test_where_any_goes_to_a_host_only(self):
+        lp = self.tick()["capacity"]["laptop"]
+        c = cap(free=0)
+        c["laptop"] = lp
+        job = J("a", where="any", slots=1)
+        self.assertEqual(cq._fits(job, cap(free=4), 4, cq._laptop_heavy_free(c), cq._light_room(c)), ["host"])
+        self.assertEqual(cq._fits(J("l", where="laptop", slots=1), c, 0, cq._laptop_heavy_free(c), cq._light_room(c)), [])
 
 
 def off(**kw):

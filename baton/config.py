@@ -53,6 +53,7 @@ SESSION_ENV = (
     "CLAUDE_CODE_EXECPATH", "CLAUDE_PID", "CLAUDE_EFFORT",
     "CODEX_THREAD_ID", "CODEX_SESSION_ID", "CODEX_CI",
     "BATON_SESSION_NAME", "BATON_LAUNCH_CWD", "BATON_TERMINAL_TOKEN",
+    "BATON_ITERM_SESSION", "BATON_TTY",    # the iTerm2 session and tty a session was started in (see baton/iterm.py)
 )
 
 
@@ -148,6 +149,27 @@ def policy_str(name: str, default: str) -> str:
     return value.strip() if isinstance(value, str) and value.strip() else default
 
 
+def policy_text(name: str, default: str) -> str:
+    """String ``[policy] <name>`` where the empty string is a value of its own (``policy_str`` would answer ``default``
+    for it); ``default`` only when absent or not a string."""
+    try:
+        value = accounts_config().get("policy", {}).get(name)
+    except Exception:  # noqa: BLE001 - a broken accounts.toml must not break a hook
+        return default
+    return value.strip() if isinstance(value, str) else default
+
+
+def policy_on(name: str, default: bool = True) -> bool:
+    """On/off ``[policy] <name>``: ``"off"`` (any case) or ``false`` is off, any other value is on, absent is ``default``."""
+    try:
+        value = accounts_config().get("policy", {}).get(name)
+    except Exception:  # noqa: BLE001 - a broken accounts.toml must not break a hook
+        return default
+    if value is None:
+        return default
+    return not (value is False or (isinstance(value, str) and value.strip().lower() == "off"))
+
+
 def _rotate_table() -> int | dict:
     """``[policy] rotate_context_tokens`` as a positive int, a dict of limits, or ROTATE_TOKENS when absent or invalid."""
     try:
@@ -237,7 +259,10 @@ def account_dir(vendor: str, account: str) -> Path:
 
 
 def account_names(vendor: str) -> list[str]:
-    names = [k for k, v in accounts_config().get(vendor, {}).items() if isinstance(v, dict)]
+    """The vendor's configured accounts. One whose table sets ``enabled = false`` (in .state/accounts.local.toml on a
+    machine that does not use it) is left out, so nothing lists it, launches it or reports it as logged out."""
+    names = [k for k, v in accounts_config().get(vendor, {}).items()
+             if isinstance(v, dict) and v.get("enabled", True) is not False]
     return names or ["main"]
 
 

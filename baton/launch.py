@@ -198,8 +198,10 @@ def other_account(vendor: str, current: str) -> str:
 
 
 def _usable(vendor: str, account: str) -> bool:
-    """Logged in, and (Claude) the refresh token has not expired: safe to switch to automatically."""
-    return accounts.logged_in(vendor, account) and not accounts.login_expired(vendor, account)
+    """A readable login whose (Claude) refresh token has not expired: safe to switch to automatically."""
+    # A credential file, not just a login: a Claude login kept only in the macOS Keychain has no expiry baton can
+    # read, so it is never picked automatically (an explicit `bt switch` still falls back to it in other_account).
+    return accounts.has_credential_file(vendor, account) and not accounts.login_expired(vendor, account)
 
 
 def _safe_utilisation(vendor: str, account: str) -> int | None:
@@ -684,8 +686,9 @@ def live_owner_message(worktree: Path, now: float | None = None) -> str:
     name = Path(worktree).name
     vendor = str(owner.get("vendor") or "")
     who = ", ".join([f"{vendor.capitalize() or 'A'} session {sid}", *_owner_facts(owner, worktree, now)])
+    where = " The session runs in an iTerm2 tab." if owner.get("iterm_session") else ""
     return (f"{name} is still open in another terminal: {who}. Switch to that tab, ask it to update .baton/now.md, "
-            f"/exit it, then run `bt {name} -Fresh`. If that session has crashed, add -Force.")
+            f"/exit it, then run `bt {name} -Fresh`. If that session has crashed, add -Force.{where}")
 
 
 def _cmd_plan(args) -> int:

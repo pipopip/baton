@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import importlib
 import datetime
 import json
 import math
@@ -43,8 +44,9 @@ CAPACITY_ROW_MAX_AGE_S = 600  # _submit: a cached capacity row older than this i
 SLOTS_NEVER = 'CPU slots exceed host pool'
 MEMORY_NEVER = 'RAM cap and floor exceed host memory'
 LOAD_NEVER = 'slot load exceeds host load cap'
-NO_LAPTOP = 'the laptop is not an executor on this machine'  # _reserve: the Windows laptop is no candidate off Windows, and never will be
+NO_LAPTOP = 'the laptop is not an executor on this machine'  # _reserve: the laptop is no candidate on a machine that is neither the Windows laptop nor the Mac (or is switched off there)
 NEVER_FITS = (SLOTS_NEVER, MEMORY_NEVER, LOAD_NEVER, NO_LAPTOP)
+LAPTOP_LONG = 'job runs longer than laptop_max_minutes'  # _fit: the laptop's reason for leaving a long job to the hosts; _reserve overrides it when no host can ever take the job
 OVERCOMMIT_WAIT = 'fleet memory caps exceed the overcommit bound'  # _fit: a temporary reason, never a never-fits one
 CPU_OVERCOMMIT_WAIT = queue_policy.CPU_QUOTA_WAIT  # _fit: temporary too (the host's fleet_reason says the same)
 # _reserve: the reasons a host gives for want of room only. A job kept out by one of these can wait on that host itself
@@ -77,8 +79,16 @@ PROBE_REUSE_S = 10         # _probes: a host's probe is read again when this old
                            # result and a freed slot from the controller for 15 s on average; _fit still takes a probe up to 30 s old
 TERMINAL = ('done', 'failed', 'cancelled', 'timeout')
 RUNTIME_FILES = ('artifact_transfer.py', 'host_stop.py', 'queue_generations.py', 'queue_paths.py', 'cq.py', 'multi_host.py', 'remote_stage.py', 'quiet_helper.py',
-                 'fleet_queue.py', 'fleet_telemetry.py', 'windows_pool.py', 'windows_broker.py', 'queue_policy.py')
+                 'fleet_queue.py', 'fleet_telemetry.py', 'windows_pool.py', 'windows_broker.py', 'mac_pool.py', 'mac_broker.py', 'queue_policy.py')
 GIB = 1024 ** 3
+PLATFORMS = ('linux', 'windows', 'macos', 'portable')
+# _submit: what can run a job of a platform no candidate on this controller can take
+PLATFORM_REFUSALS = {
+    'windows': 'platform windows runs only on the Windows laptop (candidate laptop, with a Windows controller); remote hosts run '
+               'linux or portable work and a Mac runs macos or portable work',
+    'macos': 'platform macos runs only on the Mac laptop (candidate laptop, with the queue controlled from that Mac); remote '
+             'hosts run linux or portable work',
+}
 
 
 def bind(engine):
@@ -105,6 +115,19 @@ def _num(value, lo=0, hi=1e12):
 
 def _legacy_state(ctx):
     return getattr(ctx, 'legacy_state', ctx.state)
+
+
+def _local(kind):
+    """The laptop's pool ('pool') or broker ('broker') module: mac_* on a Mac, windows_* otherwise."""
+    return importlib.import_module(('mac_' if _engine().laptop_platform() == 'macos' else 'windows_') + kind)
+
+
+def _local_script():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), ('mac_' if _engine().laptop_platform() == 'macos' else 'windows_') + 'pool.py')
+
+
+def _worker_label():
+    return 'macOS' if _engine().laptop_platform() == 'macos' else 'Windows'
 
 
 def _legacy_context(ctx):
@@ -245,8 +268,8 @@ def _submit(ctx, req):
     if type(slots) is not int or not 1 <= slots <= 32:
         _error('slots must be an integer in 1..32')
     platform = req.get('platform', 'linux')
-    if platform not in ('linux', 'windows', 'portable'):
-        _error('platform must be linux, windows or portable')
+    if platform not in PLATFORMS:
+        _error('platform must be linux, windows, macos or portable')
     aliases = {}
     registry = e.multi_host._registry(e, _legacy_context(ctx), aliases)
     allowed = {'ember', 'laptop'} | {h for h, (_, enabled) in registry.items() if enabled}
@@ -256,10 +279,13 @@ def _submit(ctx, req):
     candidates = list(dict.fromkeys(aliases.get(x, x) for x in candidates))
     if any(x not in allowed for x in candidates):
         _error('unknown or disabled fleet candidate')
-    candidates = [h for h in candidates if (h == 'laptop' and platform in ('windows', 'portable')) or (h != 'laptop' and platform in ('linux', 'portable'))]
+    # The laptop runs the platform it is (macos on the Mac, windows on the Windows laptop) and portable work; a switched-off
+    # laptop (CQ_LAPTOP_EXECUTOR=0) still has its older meaning, the Windows laptop. Remote hosts are Linux.
+    laptop_kind = e.laptop_platform() if e.laptop_executes() else 'windows'
+    candidates = [h for h in candidates if (h == 'laptop' and platform in (laptop_kind, 'portable')) or (h != 'laptop' and platform in ('linux', 'portable'))]
     laptop_dropped = False
     if 'laptop' in candidates and not e.laptop_executes():
-        # a controller that is not the Windows laptop (a Mac) has no Windows device: portable work goes to the other candidates
+        # a controller that is not the laptop (a Mac with its executor off) has no laptop device: portable work goes to the other candidates
         candidates = [h for h in candidates if h != 'laptop']
         laptop_dropped = True
     defer = req.get('defer')
@@ -274,9 +300,12 @@ def _submit(ctx, req):
     if sandbox is True and platform != 'linux':
         _error(e.SANDBOX_LINUX_ONLY)
     if not candidates:
+        if platform in PLATFORM_REFUSALS and platform != laptop_kind:
+            _error(PLATFORM_REFUSALS[platform] + ('' if e.laptop_executes() else ' (the laptop executor is off here: CQ_LAPTOP_EXECUTOR=0)'))
         if laptop_dropped:
-            _error(f'no configured device can run this job: the Windows laptop is {e.LAPTOP_NOT_EXECUTOR} (this queue controls '
-                   'remote Linux devices only); use platform linux or portable with candidates that are remote hosts')
+            _error(f'no configured device can run this job: the laptop is {e.LAPTOP_NOT_EXECUTOR} (CQ_LAPTOP_EXECUTOR=0 or a machine '
+                   'that is neither the Windows laptop nor the Mac; this queue controls remote Linux devices only); use platform '
+                   'linux or portable with candidates that are remote hosts')
         _error(e.SANDBOX_LINUX_ONLY if sandbox is True else 'no candidates match platform and deferral')
     # keep the hosts whose setting takes the request (a host with an invalid setting takes none); a host not configured
     # here is checked at placement
@@ -361,10 +390,10 @@ def _submit(ctx, req):
         script_key = _script_key(top, sha, subdir, command)
         job = dict(id=jid, fleet=True, status='queued', command=command, subdir=subdir, source=req.get('source') or 'worktree',
                    sha=sha, base=base, snapshot=snap, where='fleet', slots=slots, self_heavy=False,
-                   est_minutes=est, timeout_minutes=timeout, priority=priority, label=(str(req.get('label') or 'fleet job')[:60]),
+                   est_minutes=est, est_stated=req.get('est_minutes') is not None, timeout_minutes=timeout, priority=priority, label=(str(req.get('label') or 'fleet job')[:60]),
                    gets=gets, temp_storage='disk', sandbox=sandbox, network=network, defer=defer or 'immediate', requested_defer=defer,
                    deferred_registered=False, deferred_phase='staging_pending', memory_gb=float(memory), memory_max_gb=float(cap),
-                   profile_key=profile_key, command_key=command_key, platform=platform, candidates=candidates, requires=requires,
+                   profile_key=profile_key, command_key=command_key, platform=platform, candidates=candidates, candidates_submitted=list(candidates), memory_max_declared=req.get('memory_max_gb') is not None, requires=requires,
                    script_key=script_key,
                    memory_expected_gb=_expected_gb(history, dict(id=jid, profile_key=profile_key, command=command, subdir=subdir,
                                                                  platform=platform, memory_max_gb=float(cap), script_key=script_key)),
@@ -593,13 +622,40 @@ def _laptop_config(ctx, probe):
     cpus = probe.get('logical_cpus')
     if type(cpus) is not int or cpus < 1:
         return None
-    slots = raw.get('laptop_slots', min(4, cpus // 4))
-    ram_floor = raw.get('ram_floor_gb', 6)
-    commit_floor = raw.get('commit_floor_gb', 6)
+    mac = _engine().laptop_platform() == 'macos'
+    # The Mac's policy: every core, no AC requirement, and no RAM floor or reservation; new work is admitted on the
+    # kernel's memory pressure level instead (_fit). Windows keeps its four slots and its floors.
+    default_slots = cpus if mac else min(4, cpus // 4)
+    slots = raw.get('laptop_slots', default_slots)
+    ram_floor = 0 if mac else raw.get('ram_floor_gb', 6)
+    commit_floor = 0 if mac else raw.get('commit_floor_gb', 6)
     enabled = raw.get('enabled', True)
-    if type(slots) is not int or not 0 <= slots <= cpus or not _num(ram_floor, 0, 1024) or not _num(commit_floor, 0, 1024) or type(enabled) is not bool:
+    # a job estimated (else limited) to run longer than this is not placed on the laptop unless it is the only candidate;
+    # on the Mac 20 minutes, none on Windows; null or 0 for no limit
+    max_minutes = raw.get('laptop_max_minutes', 20 if mac else None)
+    max_minutes = None if max_minutes == 0 else max_minutes
+    needs_ac = raw.get('laptop_needs_ac', False)    # off on both; a Mac's battery is information unless this is set
+    if (type(slots) is not int or not 0 <= slots <= cpus or not _num(ram_floor, 0, 1024) or not _num(commit_floor, 0, 1024)
+            or type(enabled) is not bool or type(needs_ac) is not bool or not (max_minutes is None or _num(max_minutes, 1, 100000))):
         return None
-    return dict(slots=slots, ram_floor_gb=ram_floor, commit_floor_gb=commit_floor, enabled=enabled)
+    return dict(slots=slots, ram_floor_gb=ram_floor, commit_floor_gb=commit_floor, enabled=enabled,
+                max_minutes=max_minutes, needs_ac=needs_ac, pressure_gated=mac)
+
+
+def laptop_figures(ctx):
+    """The laptop's slots used and total, RAM floor (0 on a Mac, which gates on memory pressure instead) and battery
+    rule as admission reads them (the fleet config and the fleet jobs on the laptop), for the ordinary capacity sample
+    and the lead's text; {} when they cannot be told."""
+    try:
+        raw = _local('pool').probe()
+        config = _laptop_config(ctx, raw) if isinstance(raw, dict) else None
+        if not config or raw.get('supported') is not True:
+            return {}
+        live = _pending(all_jobs(ctx), 'laptop', set())
+        return dict(slots_total=config['slots'], slots_used=sum(j['slots'] for j in live),
+                    ram_floor_gb=config['ram_floor_gb'], needs_ac=config['needs_ac'])
+    except Exception:
+        return {}
 
 
 def _remote_probe(ctx, host, state, conf):
@@ -701,10 +757,10 @@ def _probes(ctx):
         ctx._fleet_remote_signature = signature
     probes = dict(cached)
     try:
-        import windows_pool
-        raw = windows_pool.probe()
+        local = _local('pool')
+        raw = local.probe()
         config = _laptop_config(ctx, raw) if isinstance(raw, dict) else None
-        ready = all(hasattr(windows_pool, name) for name in ('process_identity', 'observe', 'read_claim', 'claim_path', 'boot_identity'))
+        ready = all(hasattr(local, name) for name in ('process_identity', 'observe', 'read_claim', 'claim_path', 'boot_identity'))
         if (config and ready and raw.get('supported') is True and _boot_valid(raw.get('boot_identity')) and
                 all(_num(raw.get(k), 0, 1e6) for k in ('available_gb', 'commit_free_gb', 'total_gb'))):
             probes['laptop'] = dict(host='laptop', data=raw, config=config, at=ctx.now())
@@ -841,7 +897,16 @@ def _overcommitted(probe, caps_gb):
     return caps_gb > queue_policy.POOL_OVERCOMMIT * max(0, data['total_bytes'] / GIB - data['policy']['ram_floor_gb'])
 
 
-def _fit(ctx, job, probe, jobs, now, explain=False, queue=False):
+def _job_minutes(job):
+    """How long a job is expected to take: its estimate when the submitter gave one, else its timeout (the default
+    estimate is a placeholder, not a statement)."""
+    est, timeout = job.get('est_minutes'), job.get('timeout_minutes')
+    if job.get('est_stated', True) and _num(est, 0):
+        return est
+    return timeout if _num(timeout, 0) else (est if _num(est, 0) else 0)
+
+
+def _fit(ctx, job, probe, jobs, now, explain=False, queue=False, ignore_limit=False):
     """Whether `job` fits the host of `probe` now. With `queue` (a remote host only) the question is whether it may be
     registered there to wait for room, as deferred work is: what never fits, the tools, the disk and the probe's age
     still decide, the room that is free at this moment does not."""
@@ -865,18 +930,29 @@ def _fit(ctx, job, probe, jobs, now, explain=False, queue=False):
         if not cfg['enabled'] or job.get('requested_defer'):
             return no('disabled, deferred, or legacy work active')
         # said before the legacy-lock check below, which would hide it until the laptop is idle
-        verdict = _size_never_fits(job['slots'], job['memory_max_gb'], cfg['slots'], cfg['ram_floor_gb'], data['total_gb'])
+        gated = cfg.get('pressure_gated') is True    # a Mac: no memory is reserved, so no size can be too big for it
+        verdict = (SLOTS_NEVER if job['slots'] > cfg['slots'] else None if gated else
+                   _size_never_fits(job['slots'], job['memory_max_gb'], cfg['slots'], cfg['ram_floor_gb'], data['total_gb']))
         if verdict:
             return no(verdict)
+        if gated and data.get('pressure') in (2, 4):
+            return no(f"memory pressure is {'warn' if data['pressure'] == 2 else 'critical'}: no new laptop work until it is normal")
+        if cfg.get('needs_ac') and data.get('on_battery') is True:
+            return no('on battery power (laptop_needs_ac): no new fleet work until AC')
+        limit = cfg.get('max_minutes')
+        # exempt only when the laptop was the job's only candidate as submitted (a recall can shrink `candidates` later)
+        if (limit and not ignore_limit and job.get('candidates_submitted', job.get('candidates')) != ['laptop']
+                and _job_minutes(job) > limit):
+            return no(f'{LAPTOP_LONG} ({limit:g}): left to ember and hestia')
         if (not live and not getattr(getattr(ctx, '_fleet_local_pool', None), 'gate_held', False)
                 and ctx.laptop.heavy_lock_held()):
             return no('disabled, deferred, or legacy work active')
         slots_used = sum(j['slots'] for j in live)
-        reserved = sum(j['memory_max_gb'] for j in live)
+        reserved = 0 if gated else sum(j['memory_max_gb'] for j in live)
         if slots_used + job['slots'] > cfg['slots']:
             return no('CPU slots unavailable')
-        if (data['available_gb'] - reserved - job['memory_max_gb'] < cfg['ram_floor_gb'] or
-                data['commit_free_gb'] - reserved - job['memory_max_gb'] < cfg['commit_floor_gb']):
+        if not gated and (data['available_gb'] - reserved - job['memory_max_gb'] < cfg['ram_floor_gb'] or
+                          data['commit_free_gb'] - reserved - job['memory_max_gb'] < cfg['commit_floor_gb']):
             return no('physical or commit RAM floor')
         return yes(dict(slots_total=cfg['slots'], slots_used=slots_used, reserved=reserved,
                         total_gb=data['total_gb'], available_gb=data['available_gb'], floor=cfg['ram_floor_gb']))
@@ -1339,6 +1415,16 @@ def _reserve(ctx, probes, limit=3, recalls=None, asking=()):
                                   'legacy work active or waiting', 'disabled, deferred, or legacy work active',
                                   'host load cap', 'stale capacity', OVERCOMMIT_WAIT, CPU_OVERCOMMIT_WAIT) and _fits_idle(job, probes.get(host)):
                         temporarily_blocked.add(host)
+            if (not options and str(reasons.get('laptop', '')).startswith(LAPTOP_LONG) and probes.get('laptop')
+                    and all(reasons.get(h) in NEVER_FITS for h in job.get('candidates', []) if h != 'laptop')):
+                # No other candidate can ever run it, so waiting for one is waiting for nothing: the laptop takes the job
+                # despite its time limit, if it can otherwise. If it cannot ever either, the never-fits rule below ends it.
+                fit, reason = _fit(ctx, job, probes['laptop'], jobs, ctx.now(), explain=True, ignore_limit=True)
+                if fit:
+                    options.append((_score(job, 'laptop', fit, jobs), 'laptop', fit))
+                    reasons.pop('laptop')
+                else:
+                    reasons['laptop'] = reason
             if not options and job.get('candidates') and all(reasons.get(h) in NEVER_FITS for h in job['candidates']):
                 # Every candidate gave a never-fits reason from a fresh probe (_fit checks freshness first): waiting
                 # cannot help. It holds no host and takes none of this pass's placements. Ended as _cancel ends a
@@ -1565,14 +1651,14 @@ def _stage_laptop(ctx, job):
     e = _engine()
     jid = job['id']
     try:
-        import windows_pool
+        local = _local('pool')
         # Without process creation identity, a controller crash between spawn
         # and receipt cannot safely distinguish a live launcher from PID reuse.
-        if not all(hasattr(windows_pool, name) for name in ('process_identity', 'observe', 'read_claim', 'claim_path', 'boot_identity')):
-            raise RuntimeError('Windows worker identity support unavailable')
-        boot = windows_pool.boot_identity()
+        if not all(hasattr(local, name) for name in ('process_identity', 'observe', 'read_claim', 'claim_path', 'boot_identity')):
+            raise RuntimeError(_worker_label() + ' worker identity support unavailable')
+        boot = local.boot_identity()
         if not _boot_valid(boot):
-            raise RuntimeError('Windows boot identity unavailable')
+            raise RuntimeError(_worker_label() + ' boot identity unavailable')
         if e.worktree_identity(job['top']) != job['worktree_identity']:
             raise RuntimeError('submitting worktree identity changed')
         descriptor_path = job.get('prepared_descriptor') if job.get('prepared_boot') == boot else None
@@ -1605,8 +1691,11 @@ def _stage_laptop(ctx, job):
                               result_path=os.path.join(run, 'result.json'), cancel_path=os.path.join(run, 'cancel'),
                               ram_floor_gb=max(job['laptop_config']['ram_floor_gb'], job['laptop_config']['commit_floor_gb']),
                               pending_reserved_gb=job['laptop_pending_gb'])
+            if _engine().laptop_platform() == 'macos':
+                # only a cap the submitter stated is enforced, and only under memory pressure (mac_pool)
+                descriptor['memory_cap_declared'] = bool(job.get('memory_max_declared', True))
             e.write_json(descriptor_path, descriptor)
-        probe_data = windows_pool.probe()
+        probe_data = local.probe()
         with ctx.qlock():
             current = e.load_job(ctx, jid)
             if (not current or current.get('status') != 'launching' or current.get('cancel_requested')
@@ -1654,7 +1743,7 @@ def _stage_laptop(ctx, job):
                            laptop_spawn_attempts=1)
             e.save_job(ctx, current)
             if getattr(ctx, 'generation', 1) == 2:
-                import windows_broker
+                broker = _local('broker')
                 pool = getattr(ctx, '_fleet_local_pool', None)
                 if pool is None:
                     current.update(stage_attempted=False, stage_resume_after=ctx.now()+5,
@@ -1663,19 +1752,19 @@ def _stage_laptop(ctx, job):
                     return
                 try:
                     receipt = pool.submit(launch_path)
-                except windows_broker.BusyError:
+                except broker.BusyError:
                     # BusyError guarantees the descriptor was not claimed.
                     current.update(stage_attempted=False, stage_resume_after=ctx.now()+5,
                                    reason='local pool admission pending')
                     e.save_job(ctx, current)
                     return
                 current.update(launcher_pid=receipt['pid'], launcher_start_identity=receipt['process_start_identity'],
-                               reason='Windows worker confirmation pending')
+                               reason=_worker_label() + ' worker confirmation pending')
             else:
-                process = e.spawn_detached([sys.executable, os.path.join(os.path.dirname(__file__), 'windows_pool.py'), launch_path])
-                identity = windows_pool.process_identity(process.pid)
+                process = e.spawn_detached([sys.executable, _local_script(), launch_path])
+                identity = local.process_identity(process.pid)
                 current.update(launcher_pid=process.pid, launcher_start_identity=identity,
-                               reason='Windows worker confirmation pending')
+                               reason=_worker_label() + ' worker confirmation pending')
             e.save_job(ctx, current)
     except Exception as exc:
         _stage_error(ctx, jid, exc)
@@ -2090,7 +2179,7 @@ def _claim_or_restart(ctx, job, worker):
                     (current.get('worker_pid') and (current['worker_pid'], current.get('worker_start_identity')) != (pid, identity))):
                 return None
             current.update(worker_pid=pid, worker_start_identity=identity, launch_uncertain=False,
-                           reason='Windows worker claim confirmed')
+                           reason=_worker_label() + ' worker claim confirmed')
             e.save_job(ctx, current)
             return current
         boot = current.get('boot_identity')
@@ -2104,7 +2193,7 @@ def _claim_or_restart(ctx, job, worker):
         if not _boot_valid(current_boot):
             return None
         if current_boot != boot:
-            current['reason'] = 'Windows rebooted before worker outcome was confirmed'
+            current['reason'] = _worker_label() + ' rebooted before worker outcome was confirmed'
             e.save_job(ctx, current)
             reboot_job = current
         else:
@@ -2122,24 +2211,24 @@ def _claim_or_restart(ctx, job, worker):
             if not _num(last) or ctx.now() - last < delay:
                 return None
             current.update(last_laptop_spawn=ctx.now(), laptop_spawn_attempts=attempts + 1,
-                           reason='waiting for Windows worker claim')
+                           reason='waiting for ' + _worker_label() + ' worker claim')
             e.save_job(ctx, current)
             try:
                 if getattr(ctx, 'generation', 1) == 2:
-                    import windows_broker
+                    broker = _local('broker')
                     pool = getattr(ctx, '_fleet_local_pool', None)
                     if pool is None:
                         return None
                     receipt = pool.submit(desc)
                     current.update(launcher_pid=receipt['pid'], launcher_start_identity=receipt['process_start_identity'])
                 else:
-                    process = e.spawn_detached([sys.executable, os.path.join(os.path.dirname(__file__), 'windows_pool.py'), desc])
+                    process = e.spawn_detached([sys.executable, _local_script(), desc])
                     current.update(launcher_pid=process.pid, launcher_start_identity=worker.process_identity(process.pid))
                 e.save_job(ctx, current)
             except (OSError, RuntimeError):
                 pass  # claim-guarded descriptor can be retried after backoff
     if reboot_job:
-        missing = [dict(path=rel, reason='Windows rebooted before artifact capture') for rel in reboot_job.get('gets') or []]
+        missing = [dict(path=rel, reason=_worker_label() + ' rebooted before artifact capture') for rel in reboot_job.get('gets') or []]
         final = e.finish(ctx, reboot_job['id'], 'cancelled' if reboot_job.get('cancel_requested') else 'failed', None,
                          reason=reboot_job['reason'], tail=_local_tail(os.path.dirname(desc)), artifact_missing=missing)
         if final:
@@ -2149,16 +2238,16 @@ def _claim_or_restart(ctx, job, worker):
 
 def _local_reconcile(ctx, job):
     e = _engine()
-    import windows_pool
+    local = _local('pool')
     if job.get('worker_claim_protocol') in ('v1', 'v2'):
-        job = _claim_or_restart(ctx, job, windows_pool)
+        job = _claim_or_restart(ctx, job, local)
         if not job:
             return
     desc_path = job.get('descriptor_path')
-    if not desc_path or not job.get('worker_pid') or not job.get('worker_start_identity') or not hasattr(windows_pool, 'observe'):
+    if not desc_path or not job.get('worker_pid') or not job.get('worker_start_identity') or not hasattr(local, 'observe'):
         return
     pool = getattr(ctx, '_fleet_local_pool', None) if getattr(ctx, 'generation', 1) == 2 else None
-    observer = pool if pool is not None else windows_pool
+    observer = pool if pool is not None else local
     obs = observer.observe(desc_path, job['worker_pid'], job['worker_start_identity'])
     if not isinstance(obs, dict):
         return
@@ -2183,7 +2272,7 @@ def _local_reconcile(ctx, job):
             if current and current.get('status') in ('launching', 'running'):
                 if phase == 'running':
                     current.update(status='running', t_started=result.get('started') or ctx.now(), launch_uncertain=False)
-                current['reason'] = 'Windows worker ' + phase
+                current['reason'] = _worker_label() + ' worker ' + phase
                 e.save_job(ctx, current)
         return
     if phase not in TERMINAL or result.get('active_processes') != 0 or obs.get('empty_confirmed') is not True:
@@ -2202,7 +2291,7 @@ def _local_reconcile(ctx, job):
                     (proof.get('worker_pid'), proof.get('worker_start_identity')) ==
                     (current.get('worker_pid'), current.get('worker_start_identity')) and
                     proof.get('claim_fingerprint') is not None and
-                    windows_pool.claim_fingerprint(desc_path) == proof['claim_fingerprint']):
+                    local.claim_fingerprint(desc_path) == proof['claim_fingerprint']):
                 current['pool_completion_proof'] = proof
                 e.save_job(ctx, current)
     try:
@@ -2213,7 +2302,7 @@ def _local_reconcile(ctx, job):
     with ctx.qlock():
         current = e.load_job(ctx, job['id'])
         if current and current.get('status') in ACTIVE and _num(peak, 1):
-            current['metrics'] = dict(peak_memory_bytes=peak, memory_kind='windows-job-private')
+            current['metrics'] = dict(peak_memory_bytes=peak, memory_kind=getattr(local, 'MEMORY_KIND', 'windows-job-private'))
             e.save_job(ctx, current)
     tail = _local_tail(os.path.dirname(desc_path))
     final = e.finish(ctx, job['id'], phase, result.get('exit'), reason=result.get('reason') or '', tail=tail, out_paths=paths,
@@ -2225,7 +2314,7 @@ def _local_reconcile(ctx, job):
 def _recover_local(ctx, job):
     """Retry only missing artifacts, after confirming the original worker is empty."""
     e = _engine()
-    import windows_pool
+    local = _local('pool')
     desc = job.get('descriptor_path')
     if not desc or not job.get('worker_pid') or not job.get('worker_start_identity'):
         return {'ok': False, 'cached': True, 'error': 'worker identity unavailable'}
@@ -2235,14 +2324,14 @@ def _recover_local(ctx, job):
                 (current.get('worker_pid'), current.get('worker_start_identity')) !=
                 (job.get('worker_pid'), job.get('worker_start_identity'))):
             return {'ok': False, 'cached': True, 'error': 'worker identity changed'}
-        obs = windows_pool.observe(desc, current['worker_pid'], current['worker_start_identity'])
+        obs = local.observe(desc, current['worker_pid'], current['worker_start_identity'])
         if not isinstance(obs, dict):
             return {'ok': False, 'cached': True, 'error': 'worker shutdown not confirmed'}
         if obs.get('empty_confirmed') is not True:
             proof = current.get('pool_completion_proof')
             descriptor = e.read_json(desc)
-            claim = windows_pool.read_claim(desc) if hasattr(windows_pool, 'read_claim') else None
-            fingerprint = windows_pool.claim_fingerprint(desc) if hasattr(windows_pool, 'claim_fingerprint') else None
+            claim = local.read_claim(desc) if hasattr(local, 'read_claim') else None
+            fingerprint = local.claim_fingerprint(desc) if hasattr(local, 'claim_fingerprint') else None
             try:
                 valid = (current.get('status') in TERMINAL and isinstance(proof, dict) and
                          proof.get('version') == 1 and proof.get('id') == current['id'] and
@@ -2312,7 +2401,8 @@ def _capacity(ctx, probes, jobs, cache_only=False):
             cfg = probe['config']
             pending = _pending(jobs, host, set())
             used = sum(j['slots'] for j in pending)
-            reserved = sum(j['memory_max_gb'] for j in pending)
+            gated = cfg.get('pressure_gated') is True
+            reserved = 0 if gated else sum(j['memory_max_gb'] for j in pending)
             if cache_only:
                 # No new lock, load, RAM, or cohort probe during finalization.
                 # Keep prior eligibility conservative; the sample timestamp
@@ -2327,8 +2417,14 @@ def _capacity(ctx, probes, jobs, cache_only=False):
                                  slots_configured=cfg['slots'], slots_reserved=0,
                                  slots_used=used, memory_available_gb=data['available_gb'], memory_reserved_gb=reserved,
                                  commit_free_gb=data['commit_free_gb'],
-                                 memory_floor_gb=cfg['ram_floor_gb'], memory_total_gb=data['total_gb'], load=None, load_cap=None,
+                                 memory_floor_gb=None if gated else cfg['ram_floor_gb'], memory_total_gb=data['total_gb'], load=None, load_cap=None,
                                  reason=reason or '', capabilities=data.get('capabilities', []))
+            if gated:   # information, not a floor: the memory pressure level and the battery
+                level = {1: 'normal', 2: 'warn', 4: 'critical'}.get(data.get('pressure'))
+                if level:
+                    devices[host]['memory_pressure'] = level
+                if isinstance(data.get('on_battery'), bool):
+                    devices[host]['on_battery'] = data['on_battery']
         else:
             known = {x.get('id') for x in data['active_fleet'] if isinstance(x, dict)}
             # The row says what is occupied. A job registered on the host and not yet started is charged by
@@ -2805,12 +2901,12 @@ def controller(ctx):
     try:
         if getattr(ctx, 'generation', 1) == 2:
             try:
-                import windows_pool
-                import windows_broker
-                sample = windows_pool.probe()
+                local = _local('pool')
+                broker = _local('broker')
+                sample = local.probe()
                 cfg = _laptop_config(ctx, sample) if isinstance(sample, dict) else None
                 if cfg and cfg['enabled'] and cfg['slots'] > 0:
-                    ctx._fleet_local_pool = windows_broker.LocalPool(
+                    ctx._fleet_local_pool = broker.LocalPool(
                         queue_paths.runtime_paths(_legacy_state(ctx))[2], max_cpu_slots=cfg['slots'])
             except (ImportError, OSError, ValueError):
                 pass  # host-only execution remains available

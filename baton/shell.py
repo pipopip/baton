@@ -25,7 +25,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import launch, terminal
+from . import config, iterm, launch, paths, terminal
 
 EXIT_FILE_ENV = "BATON_SHELL_EXIT_FILE"
 RETIRED_WORD = "retired"
@@ -42,6 +42,10 @@ _VALUE_OPTIONS = (("vendor", re.compile(r"--?vendor", re.I)), ("account", re.com
 _FLAG_OPTIONS = (("fresh", re.compile(r"--?fresh", re.I)), ("resume", re.compile(r"--?resume", re.I)),
                  ("new_tab", re.compile(r"--?new-?tab", re.I)), ("dry_run", re.compile(r"--?dry-?run", re.I)),
                  ("force", re.compile(r"--?force", re.I)))
+
+
+class Switched(Exception):
+    """The workstream is open in another iTerm2 tab and that tab was selected: nothing is to be launched."""
 
 
 class OptionError(ValueError):
@@ -153,6 +157,15 @@ def terminal_retired(root, token: str, *, timeout: float = RETIRE_WAIT_SECONDS, 
 
 # ----------------------------------------------------------------- running the agent CLI
 
+def _group_of(cwd) -> str:
+    """The tab group of the launch directory (``iterm.group_of``: by default its repository), for the tab's colour; ""
+    when it cannot be told."""
+    try:
+        return iterm.group_of(Path(cwd))[0]
+    except Exception:  # noqa: BLE001 - a tab's colour never stops a launch
+        return ""
+
+
 def build_env(plan, token: str, environ=None) -> dict:
     """The agent CLI's environment: ours plus the plan's ``env_set`` minus its ``env_unset``, plus the terminal
     token. The exit-file variable is never passed on."""
@@ -164,6 +177,7 @@ def build_env(plan, token: str, environ=None) -> dict:
         env.pop(norm(name), None)
     env.pop(EXIT_FILE_ENV, None)
     env[TOKEN_ENV] = token
+    env.update(iterm.session_env(env))   # the iTerm2 session and tty this agent runs in, for the hooks and `bt <ws>`
     return env
 
 
@@ -229,12 +243,38 @@ def open_new_tab(plan, opt: LaunchOptions, title: str) -> bool:
 
 # ----------------------------------------------------------------- the launch
 
+def _plain_open(opt: LaunchOptions) -> bool:
+    """A plain ``bt <ws>`` (``-Resume`` allowed): no prompt, role, model, vendor, account, new tab, fresh session, switch,
+    forced launch or dry run. Only that asks "take me to the session that is already open"."""
+    return not (opt.fresh or opt.switch or opt.dry_run or opt.force or opt.new_tab
+                or opt.prompt or opt.role or opt.model or opt.vendor or opt.account)
+
+
+def _switch_to_open_tab(wt) -> bool:
+    """When the session holding ``wt`` runs in an iTerm2 tab (``iterm_session`` in owner.json) and iTerm2 is the terminal
+    backend, select that tab and say so. False (the refusal stands) when anything is missing or fails."""
+    try:
+        session = (config.read_json(launch.baton_dir(wt) / "owner.json") or {}).get("iterm_session")
+        if not (isinstance(session, str) and session and terminal.backend().name == "iterm2"):
+            return False
+        selected, error = iterm.select_session(session)
+        if selected:
+            _say(f"[baton] {Path(wt).name} is open in another tab; switched to it")
+        elif error:
+            _say(f"[baton] could not switch to the open tab: {error}", "yellow")
+        return selected
+    except Exception:  # noqa: BLE001 - the refusal is the fallback for anything
+        return False
+
+
 def _plan_for(opt: LaunchOptions):
     """The same plan ``bt plan --json`` prints, computed in-process."""
     wt = launch.resolve_worktree(opt.query)
     if not opt.force:
         blocked = launch.live_owner_message(wt)   # a second session would be a second writer
         if blocked:
+            if _plain_open(opt) and _switch_to_open_tab(wt):
+                raise Switched(wt)
             raise LookupError(blocked)
     mode = "fresh" if opt.fresh else "resume" if opt.resume else "auto"
     # Dry runs and new tabs must not sync the second account here (the tab's own launch does).
@@ -246,6 +286,8 @@ def invoke_launch(opt: LaunchOptions, *, retire_timeout: float = RETIRE_WAIT_SEC
     """Returns (exit code, True when a confirmed context retirement says the shell should end)."""
     try:
         plan = _plan_for(opt)
+    except Switched:
+        return 0, False
     except (LookupError, ValueError) as exc:
         _say(f"bt: {exc}", err=True)
         return 2, False
@@ -266,7 +308,9 @@ def invoke_launch(opt: LaunchOptions, *, retire_timeout: float = RETIRE_WAIT_SEC
         print(f"run:   {format_command(argv)}")
         return 0, False
     token = uuid.uuid4().hex
-    code = run_foreground(argv, str(plan.cwd), build_env(plan, token))
+    env = build_env(plan, token)
+    iterm.safe_tab_state("start", env.get("BATON_SESSION_NAME") or Path(plan.cwd).name, env, repo=_group_of(plan.cwd))
+    code = run_foreground(argv, str(plan.cwd), env)
     if terminal_retired(plan.cwd, token, timeout=retire_timeout):
         return 0, True   # a confirmed retirement is a success even when the old CLI was killed
     return code, False
@@ -338,7 +382,6 @@ def entry_refusal(argv, environ=None, windows: bool | None = None) -> str | None
     """Why the process entry (``bt.py``) must not run ``bt.py shell ...``: on Windows it would start the POSIX launcher
     path without the retire-and-exit of bt.ps1. None otherwise, and whenever bt.sh's exit-file variable is set (what
     the POSIX launcher always passes). Checked by ``bt.py`` itself, not by ``run_tokens``, which tests call directly."""
-    from . import config
     environ = os.environ if environ is None else environ
     if (config.WINDOWS if windows is None else windows) and argv[:1] == ["shell"] and not environ.get(EXIT_FILE_ENV):
         return WINDOWS_REFUSAL

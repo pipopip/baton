@@ -32,6 +32,8 @@ SEE WHAT IS GOING ON
   bt fleet                    compute fleet: slots, RAM, running and queued jobs (--details, --watch)
   bt compute                  this workstream's deferred jobs (--refresh; --reviewed <id> --resolution ...)
   bt doctor                   check hooks, formats, accounts and routing for drift (--fix)
+  bt img <path> [<path> ...]  show images in a pane beside this iTerm2 session (macOS; --close-after <seconds>)
+  bt iterm prefs              iTerm2's application settings that suit many agent tabs (macOS; --apply writes them)
 
 WORKTREES
   bt wt new <name> --exit pr|merge:<branch>|discard

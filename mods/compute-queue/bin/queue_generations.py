@@ -181,6 +181,7 @@ def _apply_v2(engine, ctx, req, result, leaf):
 
 HOST_JOB_CAP_FLOOR_GB = 8      # a where: host job that becomes a fleet job without a stated memory cap gets the larger
 HOST_JOB_CAP_PER_SLOT_GB = 4   # of this floor and this much per slot (50 at most): above what fleet submitters state today
+DEFAULT_JOB_BASE_TOOLS = ('bash', 'python')   # on every host: a job that declares only these says nothing about what it needs
 
 
 def host_job_for_fleet(engine, ctx, req):
@@ -205,7 +206,8 @@ def host_job_for_fleet(engine, ctx, req):
 
     Returns None, or (host, cap): the host the fleet job is pinned to (canonical id) and the default memory cap in
     GB for a job that states none: the larger of HOST_JOB_CAP_FLOOR_GB and HOST_JOB_CAP_PER_SLOT_GB a slot, at most
-    the host's memory budget (and 50)."""
+    the host's memory budget (and 50). "Pinned" is the rule for a submission that names a host. A default-host job
+    that declares its tools may also run elsewhere: see default_job_hosts, which `execute` asks after this."""
     slots, est, timeout = req.get('slots', 1), req.get('est_minutes'), req.get('timeout_minutes')
     named = req.get('host_id')
     if named == '':
@@ -256,6 +258,77 @@ def host_job_for_fleet(engine, ctx, req):
         return None  # whatever is wrong with the settings, the request keeps the path it always had
 
 
+def default_job_hosts(engine, ctx, req, selected, cap):
+    """The other hosts a converted default-host job may also run on, as host ids in sorted order; [] for none. The
+    queue cannot know what a job needs from a host, so only a job that says so spreads, and only to a host that says
+    it is qualified: the submission named no host at all (naming `ember` or an alias of it is a pin, an empty host_id
+    is none), it went to the default host (ember), and its `requires` is a list of tool names (the fleet backend's
+    own rules: at most 32, each of letters, digits and _.+- up to 64) naming at least one tool beyond
+    DEFAULT_JOB_BASE_TOOLS. A registry host joins when it is enabled, the fleet backend can use it (its settings,
+    read as the fleet backend reads them with the engine's host_conf, hold an `address`, a `host_id` equal to its
+    registry id and no `paused`), its `default_jobs` list holds every name in `requires`, the job's slots fit its
+    fleet pool (its slots less the foreground reserve) and its `memory_budget_gb`, when it states one, is not below
+    `cap` (the default memory cap, which is ember's and does not change). A host that cannot be read or judged is
+    left out, as is every host when the registry cannot be read: the job then stays on `selected` alone, as it did
+    before this setting existed. `requires` stays in the request when a host joins: every kept name is on that
+    host's own list, so the fleet backend can place the job there, and a name outside every list means no spreading,
+    the ember-only path on which `requires` is dropped, so the job cannot be stranded by it."""
+    requires, slots = req.get('requires'), req.get('slots', 1)
+    if (req.get('host_id') or None) is not None or selected != 'ember' or type(slots) is not int or slots < 1:
+        return []
+    if not (isinstance(requires, list) and 1 <= len(requires) <= 32 and all(
+            isinstance(x, str) and re.fullmatch(r'[a-zA-Z0-9_.+-]{1,64}', x) for x in requires)):
+        return []
+    if all(name in DEFAULT_JOB_BASE_TOOLS for name in requires):
+        return []
+    try:
+        registry = multi_host._registry(engine, ctx, {})
+    except Exception:
+        return []
+    found = []
+    for host in sorted(registry):
+        try:
+            state, enabled = registry[host]
+            if not enabled:
+                continue
+            conf = engine.host_conf(state)
+            if not (conf.get('address') and conf.get('host_id') == host and not conf.get('paused')
+                    and set(requires) <= set(conf.get('default_jobs', ()))):
+                continue
+            pool = conf.get('slots', 8)
+            if type(pool) is not int or slots > pool - queue_policy.policy_fields(conf, pool)['foreground_slots']:
+                continue
+            if conf.get('memory_budget_gb', cap) < cap:
+                continue  # the fleet backend's own admission keeps a job off a host without a budget that cannot fit
+            found.append(host)
+        except Exception:
+            continue  # unreadable or senseless settings: this host stays out
+    return found
+
+
+LAPTOP_FLEET_FORM = ("where: \"fleet\", candidates: [\"laptop\"], platform: \"macos\" or \"portable\", slots of at least 1, "
+                     "no split, self_heavy, RAM scratch or defer")
+
+
+def laptop_job_for_fleet(engine, req):
+    """A Mac's `where: laptop` submission as the fleet job it can only be: the ordinary queue's laptop path is Windows',
+    and the Mac's laptop runs contained fleet jobs (mac_pool). The job is pinned to the laptop, so the laptop's
+    time limit (laptop_max_minutes) does not apply to it. What the fleet backend does not do is refused with the form
+    that does it."""
+    slots, platform = req.get('slots', 1), req.get('platform') or 'macos'
+    if (type(slots) is not int or slots < 1 or req.get('self_heavy') or req.get('split') is not None
+            or req.get('temp_storage', 'disk') != 'disk' or req.get('defer') or platform not in ('macos', 'portable')
+            or req.get('host_id') not in (None, '', 'laptop') or req.get('candidates') not in (None, ['laptop'])):
+        raise engine.CqError("where 'laptop' on this Mac runs as a fleet job on the laptop; this submission cannot: use "
+                             + LAPTOP_FLEET_FORM)
+    req.pop('host_id', None)
+    req.update(where='fleet', candidates=['laptop'], platform=platform, slots=slots)
+    if not req.get('label'):
+        words = [w for w in str(req.get('command') or '').split() if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', w)]
+        req['label'] = ' '.join(words[:6])[:60] or None
+    return req
+
+
 def execute(engine, ctx, command, request, leaf):
     # One refusal for every route (single host, shard, generation, fleet): who submits or cancels is always named.
     if command in ('submit', 'cancel'):
@@ -266,6 +339,9 @@ def execute(engine, ctx, command, request, leaf):
     req = dict(request)
     if command == 'submit':
         req.pop('_default_memory_max_gb', None)  # set here only, for a converted where: host job
+        laptop_fleet = req.get('where') == 'laptop' and engine.laptop_executes() and engine.laptop_platform() == 'macos'
+        if laptop_fleet:
+            laptop_job_for_fleet(engine, req)
         v2 = req.get('where') == 'fleet' or req.get('gets') is not None or any(
             req.get(key) is not None for key in ('artifact_max_mb', 'artifact_total_mb'))
         if v2 and req.get('where') != 'fleet':
@@ -286,29 +362,41 @@ def execute(engine, ctx, command, request, leaf):
                 fleet = None  # generation two cannot be opened: the request keeps the path it always had
         if fleet is not None:
             selected, default_cap = plan
+            extras = default_job_hosts(engine, ctx, req, selected, default_cap)  # asks the submission's host_id: before it is dropped
             req.pop('host_id', None)  # the fleet backend takes candidates, not a host_id
             slots, text = req.get('slots', 1), req['command']
-            # The ordinary backend ignored `requires` and named a job after its command: both stay so.
-            req.pop('requires', None)
+            candidates = [selected, *extras]
+            if not extras:
+                # The ordinary backend ignored `requires` and named a job after its command: both stay so. (With extras
+                # `requires` stays: each name is on the extra host's own list, and the fleet backend places by it.)
+                req.pop('requires', None)
             if not req.get('label'):
                 words = [w for w in text.split() if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', w)]
                 req['label'] = (' '.join(words[:6]) or ' '.join(text.split()[:6]))[:60] or None
-            req.update(where='fleet', candidates=[selected], platform='linux', slots=slots, _default_memory_max_gb=default_cap)
+            req.update(where='fleet', candidates=candidates, platform='linux', slots=slots, _default_memory_max_gb=default_cap)
             try:
                 result = leaf(fleet, command, req)
             except engine.CqError as exc:
                 raise engine.CqError(f'{exc} (a heavy where: host job now runs as a contained fleet job '
-                                     f'on {selected}, so the host can share its capacity)') from exc
+                                     f'on {selected}{"" if len(candidates) == 1 else ", or another host that takes default jobs"}, '
+                                     f'so {"the host" if len(candidates) == 1 else "a host"} can share its capacity)') from exc
             if isinstance(result, dict) and result.get('ok') and isinstance(result.get('job'), str):
                 try:
-                    cap = engine.load_job(fleet, result['job'])['memory_max_gb']
+                    job = engine.load_job(fleet, result['job'])
+                    cap = job['memory_max_gb']
+                    stored = job.get('candidates')  # what the fleet backend kept: a sandbox job loses a host without one
+                    where_text = ' or '.join(stored if isinstance(stored, list) and stored and all(
+                        isinstance(h, str) and h for h in stored) else candidates)
                     result['note'] = (f"{result.get('note') or 'accepted'}; this where: host job runs as a contained fleet job on "
-                                      f"{selected}: CPU held to {slots} slot{'s' if slots != 1 else ''}, memory capped at {cap:g} GB "
+                                      f"{where_text}: CPU held to {slots} slot{'s' if slots != 1 else ''}, memory capped at {cap:g} GB "
                                       f"(state memory_max_gb to change it)")
                 except Exception:
                     pass  # the note is a courtesy; the job is accepted
             return result
-        return leaf(context(engine, ctx, 2 if v2 else 1), command, req)
+        result = leaf(context(engine, ctx, 2 if v2 else 1), command, req)
+        if laptop_fleet and isinstance(result, dict) and result.get('ok'):
+            result['note'] = (result.get('note') or 'accepted') + '; this where: laptop job runs as a contained fleet job on the Mac'
+        return result
     if command in ('notified', 'notice_authorize') and (req.get('ids') or req.get('job')):
         return _notices(engine, ctx, command, req, leaf)
     if req.get('job') and command in ('get', 'status', 'cancel', 'wait', 'note'):

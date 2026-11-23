@@ -27,7 +27,18 @@ EVENTS = {
     "postcompact": "PostCompact",
     "sessionend": "SessionEnd",
     "userpromptsubmit": "UserPromptSubmit",
+    "notification": "Notification",
+    "stop": "Stop",
+    "permissionrequest": "PermissionRequest",
+    "posttooluse": "PostToolUse",
+    "interrupt": "Interrupt",
 }
+# Codex only, macOS only (see install._codex_handlers): the events that move a tab's state and do nothing else. Claude's
+# Stop goes to cycle_hook.py and its permission prompts arrive as Notification.
+TAB_EVENTS = {"Stop": "ready", "PermissionRequest": "input", "PostToolUse": "working", "Interrupt": "idle"}
+# Notification types that mean "needs you". Not idle_prompt: Claude sends it about a minute after every finished turn,
+# which would turn each green tab amber.
+INPUT_NOTIFICATIONS = ("permission_prompt", "elicitation_dialog")
 
 
 # --------------------------------------------------------------------------- logging
@@ -294,7 +305,7 @@ def _claim_owner_locked(root: Path, vendor: str, account: str, session_id: str |
     terminal_root = marked if valid_terminal else owner.get("terminal_root") if same_owner else None
     if not valid_terminal:
         token = owner.get("terminal_token") if same_owner else None
-    _write_json(path, {
+    claim = {
         "terminal_token": token,
         "terminal_root": terminal_root,
         "vendor": vendor,
@@ -303,7 +314,13 @@ def _claim_owner_locked(root: Path, vendor: str, account: str, session_id: str |
         "transcript": transcript,
         "claimed_at": harvest.iso_now(now),  # every claim (start, resume, compact) refreshes liveness
         "process_pid": _claude_process_id(session_id) if vendor == "claude" else None,
-    })
+    }
+    # the iTerm2 session this agent runs in (`bt <ws>` records it); `bt <ws>` from another tab selects that tab. Taken from
+    # this process's environment only: an earlier owner's value names another tab.
+    iterm_session = os.environ.get("BATON_ITERM_SESSION")
+    if isinstance(iterm_session, str) and iterm_session:
+        claim["iterm_session"] = iterm_session
+    _write_json(path, claim)
     return ""
 
 
@@ -476,6 +493,7 @@ def _on_session_start_locked(vendor: str, data: dict, root: Path) -> dict | None
     if not _may_record(root, session_id, transcript, vendor, account):
         warning = "WARNING: worktree ownership changed. Do not edit files here; tell the user."
         return _output("SessionStart", warning, warning)
+    _tab_state("start", root, data, vendor)    # again at every start: the badge is gone after /clear and has to return on a resume
     _guard(vendor, "SessionStart", lambda: capsule.rotate_log(root))
 
     fields = dict(session_id=session_id, transcript=transcript, account=account, source=source, last_seen=now)
@@ -548,7 +566,124 @@ def _on_post_compact_locked(vendor: str, data: dict, root: Path) -> None:
         vendor, root, data.get("session_id") or None, data.get("transcript_path") or None, time.time()))
 
 
+def _is_lead(root: Path, data: dict) -> bool:
+    """False when the hook payload's session is not the one ``owner.json`` names: a nested headless ``claude -p``
+    started from the agent's shell inherits ``BATON_TTY`` but is not the tab's session."""
+    mine = data.get("session_id")
+    theirs = config.read_json(paths.baton_dir(root) / "owner.json").get("session_id")
+    return not (mine and theirs and mine != theirs)
+
+
+def _tab_state(state: str, root: Path, data: dict, vendor: str = "", detail: str = "") -> None:
+    """Badge, colour, status and notification of this session's iTerm2 tab (``baton.iterm``), for the lead session of
+    the worktree only; a no-op outside iTerm2, imported only when a hook needs it, and never a reason for a hook to fail
+    or print."""
+    try:
+        if not _is_lead(root, data):
+            return
+        from . import iterm
+        iterm.tab_state(state, iterm.label_for(None, root), vendor=vendor, repo=iterm.group_of(root)[0], detail=detail)
+        if state == "start":
+            iterm.arrange_soon()
+    except Exception:
+        pass
+
+
+def _blocked_marker() -> Path | None:
+    """Where a Codex permission request leaves its mark for this tab (one small file per tty under the state
+    directory); None when this session has no recorded tty."""
+    name = os.path.basename(str(os.environ.get("BATON_TTY") or ""))
+    name = "".join(ch for ch in name if ch.isascii() and ch.isalnum())
+    return config.STATE_DIR / "tab-blocked" / name if name else None
+
+
+def _command_of(data: dict) -> str:
+    """The command of a tool call as one string ("" when it has none), to tell one call from another."""
+    asked = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
+    what = asked.get("command") or ""
+    return " ".join(str(part) for part in what) if isinstance(what, (list, tuple)) else str(what)
+
+
+def _blocked_by(marker: Path, data: dict, call: bool = True) -> bool:
+    """True when ``marker`` records a permission request of this payload's session and, with ``call``, of this very
+    tool call as far as both sides say: the same turn, tool name and command. Codex may run tools side by side, and a
+    tool that needed no approval must not end another one's wait."""
+    try:
+        seen = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(seen, dict) or seen.get("session_id") != data.get("session_id"):
+        return False
+    if not call:
+        return True
+    mine = {"turn_id": data.get("turn_id"), "tool_name": data.get("tool_name"), "command": _command_of(data)}
+    return all(not seen.get(key) or not mine[key] or seen[key] == mine[key] for key in mine)
+
+
+def _clear_blocked(data: dict) -> None:
+    """Remove this tab's mark when it is this session's (a nested agent started from the tab shares the tty)."""
+    try:
+        marker = _blocked_marker()
+        if marker is not None and _blocked_by(marker, data, call=False):
+            marker.unlink()
+    except OSError:
+        pass
+
+
+def _permission_detail(data: dict) -> str:
+    """One line naming what a Codex permission request wants: the tool and its reason, or its command."""
+    tool = data.get("tool_name") if isinstance(data.get("tool_name"), str) else ""
+    asked = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
+    what = asked.get("description") or asked.get("command") or ""
+    if isinstance(what, (list, tuple)):
+        what = " ".join(str(part) for part in what)
+    return ": ".join(part for part in (tool, str(what).strip()) if part)
+
+
+def on_tab_event(event: str, data: dict) -> None:
+    """A Codex ``Stop``, ``PermissionRequest``, ``PostToolUse`` or ``Interrupt``: the tab's state, nothing else, and
+    nothing is ever printed (Codex then goes on as if there were no hook: a permission request still asks the user).
+    Codex has no event for an answered permission request, so the request leaves a mark and the tab goes back to
+    working when that tool call finishes; without a mark ``PostToolUse`` costs one failed open."""
+    try:
+        marker = _blocked_marker()
+        if marker is None:                   # not a tab `bt <ws>` started in iTerm2
+            return
+        if event == "PostToolUse" and not _blocked_by(marker, data):
+            return
+        if _codex_child(data.get("transcript_path")):
+            return
+        cwd = data.get("cwd") if isinstance(data.get("cwd"), str) and data.get("cwd") else os.getcwd()
+        root, _ = resolve_root("codex", cwd, data.get("session_id") or None, data.get("transcript_path") or None)
+        if root is None or not _is_lead(root, data):
+            return
+        detail = ""
+        if event == "PermissionRequest":
+            detail = _permission_detail(data)
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(json.dumps({"session_id": data.get("session_id"), "turn_id": data.get("turn_id"),
+                                          "tool_name": data.get("tool_name"), "command": _command_of(data)}), encoding="utf-8")
+        else:
+            _clear_blocked(data)
+        _tab_state(TAB_EVENTS[event], root, data, "codex", detail)
+    except Exception:  # noqa: BLE001 - a tab's state is never a reason for a hook to fail
+        pass
+
+
+def on_notification(data: dict, root: Path) -> None:
+    """A Claude ``Notification`` hook (the installed matcher is ``permission_prompt|elicitation_dialog``): the tab asks
+    for the user. Other notification types are ignored. The tab stays amber after the permission is granted until the
+    turn ends (green) or the next prompt is sent."""
+    kind = data.get("notification_type")
+    if kind is None or kind in INPUT_NOTIFICATIONS:
+        _tab_state("input", root, data, "claude")
+
+
 def on_session_end(vendor: str, data: dict, root: Path) -> None:
+    if data.get("reason") != "clear":      # /clear keeps the tab and the workstream: SessionStart starts it again
+        _tab_state("end", root, data, vendor)
+    if vendor == "codex":
+        _clear_blocked(data)
     now = time.time()
     session_id = data.get("session_id") or None
     transcript = data.get("transcript_path") or None
@@ -731,11 +866,18 @@ def handle(vendor: str, data: dict) -> dict | None:
         return None
     if os.environ.get(config.FOLLOWER_ENV) or data.get("agent_id"):
         return None
+    if event in TAB_EVENTS:
+        if vendor == "codex":
+            on_tab_event(event, data)
+        return None
     if vendor == "codex" and _codex_child(data.get("transcript_path")):
         return None
     cwd = data.get("cwd") if isinstance(data.get("cwd"), str) and data.get("cwd") else os.getcwd()
     root, _ = resolve_root(vendor, cwd, data.get("session_id") or None, data.get("transcript_path") or None)
     if root is None:
+        return None
+    if event == "Notification":
+        on_notification(data, root)
         return None
     if event == "SessionStart":
         return on_session_start(vendor, data, root)
@@ -744,6 +886,9 @@ def handle(vendor: str, data: dict) -> dict | None:
     elif event == "SessionEnd":
         on_session_end(vendor, data, root)
     elif event == "UserPromptSubmit":
+        if vendor == "codex":
+            _clear_blocked(data)
+        _tab_state("working", root, data, vendor)
         return on_user_prompt(vendor, data, root)
     return None
 

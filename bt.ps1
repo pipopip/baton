@@ -10,7 +10,7 @@
 # Keep this file ASCII: Windows PowerShell 5.1 reads BOM-less files as ANSI.
 
 $script:BatonHome = $PSScriptRoot
-$script:BatonSubcommands = @('status', 'accounts', 'account', 'plan', 'routing', 'follow', 'merge', 'inbox', 'install', 'now', 'close', 'doctor', 'attach', 'keepalive', 'list', 'wt', 'backup', 'startup', 'cycle', 'compute', 'fleet', 'night', 'migrate', 'shell', 'help')
+$script:BatonSubcommands = @('status', 'accounts', 'account', 'plan', 'routing', 'follow', 'merge', 'inbox', 'install', 'now', 'close', 'doctor', 'attach', 'keepalive', 'list', 'wt', 'backup', 'startup', 'cycle', 'compute', 'fleet', 'night', 'migrate', 'shell', 'img', 'iterm', 'help')
 
 function Invoke-BatonPython {
     # Runs bt.py with UTF-8 console decoding. Output goes to the pipeline; exit code is in $LASTEXITCODE.
